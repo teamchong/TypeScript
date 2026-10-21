@@ -3,6 +3,7 @@ package ast
 import (
 	"strings"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
@@ -15,17 +16,19 @@ import (
 type Symbol struct {
 	flags      SymbolFlags
 	checkFlags CheckFlags // Non-zero only in transient symbols created by Checker
-	id         atomic.Uint64
+	id         atomic.Uint32
 	data       *symbolData
 }
 
 // Every symbol references a symbolData structure that may be shared with other symbols.
 type symbolData struct {
 	name             string
-	declarations     []*Node
+	declPtr          *Node
 	valueDeclaration *Node
 	parent           *Symbol
 	extra            *symbolExtra
+	declLen          uint16
+	declCap          uint16
 }
 
 type symbolExtra struct {
@@ -40,10 +43,64 @@ type SymbolExtraArena struct {
 	arena core.Arena[symbolExtra]
 }
 
-func (s *Symbol) Flags() SymbolFlags      { return s.flags }
-func (s *Symbol) CheckFlags() CheckFlags  { return s.checkFlags }
-func (s *Symbol) Name() string            { return s.data.name }
-func (s *Symbol) Declarations() []*Node   { return s.data.declarations }
+const (
+	checkFlagsReferencedAny           CheckFlags = 1 << 28
+	checkFlagsReferencedVariable      CheckFlags = 1 << 29
+	checkFlagsReferencedTypeParameter CheckFlags = 1 << 30
+	checkFlagsReferencedMask          CheckFlags = checkFlagsReferencedAny | checkFlagsReferencedVariable | checkFlagsReferencedTypeParameter
+)
+
+func (s *Symbol) Flags() SymbolFlags { return s.flags }
+func (s *Symbol) CheckFlags() CheckFlags {
+	return CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags))) &^ checkFlagsReferencedMask
+}
+
+func (s *Symbol) AddReference(meaning SymbolFlags) {
+	if s == nil {
+		return
+	}
+	flags := uint32(checkFlagsReferencedAny)
+	if meaning&SymbolFlagsVariable != 0 {
+		flags |= uint32(checkFlagsReferencedVariable)
+	}
+	if meaning&SymbolFlagsTypeParameter != 0 {
+		flags |= uint32(checkFlagsReferencedTypeParameter)
+	}
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		if old&flags == flags || atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, old|flags) {
+			break
+		}
+	}
+}
+
+func (s *Symbol) ReferenceKinds() SymbolFlags {
+	if s == nil {
+		return 0
+	}
+	cf := CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags)))
+	if cf&checkFlagsReferencedMask == 0 {
+		return 0
+	}
+	res := SymbolFlagsAll &^ (SymbolFlagsVariable | SymbolFlagsTypeParameter)
+	if cf&checkFlagsReferencedVariable != 0 {
+		res |= SymbolFlagsVariable
+	}
+	if cf&checkFlagsReferencedTypeParameter != 0 {
+		res |= SymbolFlagsTypeParameter
+	}
+	return res
+}
+func (s *Symbol) Name() string { return s.data.name }
+func (s *Symbol) Declarations() []*Node {
+	if s.data.declLen == 0 {
+		return nil
+	}
+	if s.data.declCap == 0 {
+		return unsafe.Slice(&s.data.declPtr, 1)
+	}
+	return unsafe.Slice((**Node)(unsafe.Pointer(s.data.declPtr)), s.data.declCap)[:s.data.declLen]
+}
 func (s *Symbol) ValueDeclaration() *Node { return s.data.valueDeclaration }
 func (s *Symbol) Parent() *Symbol         { return s.data.parent }
 
@@ -68,10 +125,34 @@ func (s *Symbol) ExportSymbol() *Symbol {
 	return s.data.extra.exportSymbol
 }
 
-func (s *Symbol) SetFlags(value SymbolFlags)      { s.flags = value }
-func (s *Symbol) SetCheckFlags(value CheckFlags)  { s.checkFlags = value }
-func (s *Symbol) SetName(value string)            { s.data.name = value }
-func (s *Symbol) SetDeclarations(value []*Node)   { s.data.declarations = value }
+func (s *Symbol) SetFlags(value SymbolFlags) { s.flags = value }
+func (s *Symbol) SetCheckFlags(value CheckFlags) {
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		next := (old & uint32(checkFlagsReferencedMask)) | (uint32(value) &^ uint32(checkFlagsReferencedMask))
+		if atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, next) {
+			break
+		}
+	}
+}
+func (s *Symbol) SetName(value string) { s.data.name = value }
+func (s *Symbol) SetSingleDeclaration(node *Node) {
+	s.data.declPtr = node
+	s.data.declLen = 1
+	s.data.declCap = 0
+}
+
+func (s *Symbol) SetDeclarations(value []*Node) {
+	if len(value) == 0 {
+		s.data.declPtr = nil
+		s.data.declLen = 0
+		s.data.declCap = 0
+		return
+	}
+	s.data.declPtr = (*Node)(unsafe.Pointer(unsafe.SliceData(value)))
+	s.data.declLen = uint16(len(value))
+	s.data.declCap = uint16(max(cap(value), len(value)))
+}
 func (s *Symbol) SetValueDeclaration(value *Node) { s.data.valueDeclaration = value }
 func (s *Symbol) SetParent(value *Symbol)         { s.data.parent = value }
 

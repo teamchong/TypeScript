@@ -146,9 +146,7 @@ type FlowNodeBase struct {
 	FlowNode *FlowNode
 }
 
-type CompositeBase struct {
-	facts atomic.Uint32
-}
+type CompositeBase struct{}
 
 type TypeSyntaxBase struct{}
 
@@ -172,10 +170,10 @@ type FunctionLikeWithBodyBase struct {
 }
 
 type ClassLikeBase struct {
+	CompositeBase
 	ExportableBase
 	ModifiersBase
 	LocalsContainerBase
-	CompositeBase
 	name            *IdentifierNode     // Optional
 	TypeParameters  *TypeParameterList  // Optional
 	HeritageClauses *HeritageClauseList // Optional
@@ -214,12 +212,12 @@ type AccessorDeclarationBase struct {
 	TypeElementBase
 	ClassElementBase
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 }
 
 type FunctionOrConstructorTypeNodeBase struct {
@@ -714,9 +712,9 @@ func IsPrivateIdentifier(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type QualifiedName struct {
+	CompositeBase
 	NodeBase
 	FlowNodeBase
-	CompositeBase
 	Left  *EntityName
 	Right *MemberName
 }
@@ -761,8 +759,8 @@ func IsQualifiedName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ComputedPropertyName struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Expression *Expression
 }
 
@@ -804,8 +802,8 @@ func IsComputedPropertyName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type Decorator struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Expression *LeftHandSideExpression
 }
 
@@ -864,8 +862,8 @@ func IsEmptyStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type IfStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression    *Expression
 	ThenStatement *Statement
 	ElseStatement *Statement // Optional
@@ -913,8 +911,8 @@ func IsIfStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type DoStatement struct {
-	IterationStatementBase
 	CompositeBase
+	IterationStatementBase
 	Expression *Expression
 }
 
@@ -958,8 +956,8 @@ func IsDoStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type WhileStatement struct {
-	IterationStatementBase
 	CompositeBase
+	IterationStatementBase
 	Expression *Expression
 }
 
@@ -1003,9 +1001,9 @@ func IsWhileStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ForStatement struct {
+	CompositeBase
 	IterationStatementBase
 	LocalsContainerBase
-	CompositeBase
 	Initializer *ForInitializer // Optional
 	Condition   *Expression     // Optional
 	Incrementor *Expression     // Optional
@@ -1058,9 +1056,9 @@ func IsForStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ForInOrOfStatement struct {
+	CompositeBase
 	StatementBase
 	LocalsContainerBase
-	CompositeBase
 	AwaitModifier *AwaitKeyword // Optional
 	Initializer   *ForInitializer
 	Expression    *Expression
@@ -1192,8 +1190,8 @@ func IsContinueStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ReturnStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression // Optional
 }
 
@@ -1231,8 +1229,8 @@ func IsReturnStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type WithStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 	Statement  *Statement
 }
@@ -1277,8 +1275,8 @@ func IsWithStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type SwitchStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 	CaseBlock  *CaseBlockNode
 }
@@ -1323,9 +1321,9 @@ func IsSwitchStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CaseBlock struct {
+	CompositeBase
 	NodeBase
 	LocalsContainerBase
-	CompositeBase
 	Clauses *CaseClausesList
 }
 
@@ -1367,8 +1365,8 @@ func IsCaseBlock(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CaseOrDefaultClause struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Expression          *Expression
 	Statements          *StatementList
 	FallthroughFlowNode *FlowNode
@@ -1423,8 +1421,8 @@ func IsDefaultClause(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ThrowStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 }
 
@@ -1466,8 +1464,8 @@ func IsThrowStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TryStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	TryBlock     *BlockNode
 	CatchClause  *CatchClauseNode // Optional
 	FinallyBlock *BlockNode       // Optional
@@ -1515,9 +1513,9 @@ func IsTryStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CatchClause struct {
+	CompositeBase
 	NodeBase
 	LocalsContainerBase
-	CompositeBase
 	VariableDeclaration *VariableDeclarationNode // Optional
 	Block               *BlockNode
 }
@@ -1665,9 +1663,9 @@ func IsExpressionStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type Block struct {
+	CompositeBase
 	StatementBase
 	LocalsContainerBase
-	CompositeBase
 	Statements *StatementList
 	MultiLine  bool
 }
@@ -1711,9 +1709,9 @@ func IsBlock(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableStatement struct {
+	CompositeBase
 	StatementBase
 	ModifiersBase
-	CompositeBase
 	DeclarationList *VariableDeclarationListNode
 }
 
@@ -1752,10 +1750,10 @@ func IsVariableStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableDeclaration struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	name             *BindingName
 	ExclamationToken *ExclamationToken // Optional
 	Type             *TypeNode         // Optional
@@ -1806,8 +1804,8 @@ func IsVariableDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableDeclarationList struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Declarations *VariableDeclarationNodeList
 }
 
@@ -1847,8 +1845,8 @@ func IsVariableDeclarationList(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BindingPattern struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *BindingElementList
 }
 
@@ -1895,10 +1893,10 @@ func IsArrayBindingPattern(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ParameterDeclaration struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	DotDotDotToken *DotDotDotToken // Optional
 	name           *BindingName
 	QuestionToken  *QuestionToken // Optional
@@ -1954,11 +1952,11 @@ func IsParameterDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BindingElement struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
 	FlowNodeBase
-	CompositeBase
 	DotDotDotToken *DotDotDotToken // Optional
 	PropertyName   *PropertyName   // Optional
 	name           *BindingName    // Optional
@@ -2048,12 +2046,12 @@ func IsMissingDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type FunctionDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
-	CompositeBase
 	name           *IdentifierNode // Optional
 	ReturnFlowNode *FlowNode
 }
@@ -2212,8 +2210,8 @@ func IsClassExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type HeritageClause struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Token Kind
 	Types *HeritageClauseElementList
 }
@@ -2392,10 +2390,10 @@ func IsJSTypeAliasDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type EnumMember struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Initializer *Expression // Optional
 }
 
@@ -2438,11 +2436,11 @@ func IsEnumMember(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type EnumDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
-	CompositeBase
 	name    *IdentifierNode
 	Members *EnumMemberList
 }
@@ -2487,8 +2485,8 @@ func IsEnumDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ModuleBlock struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Statements *StatementList
 }
 
@@ -2574,9 +2572,9 @@ func IsNotEmittedTypeElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportDeclaration struct {
+	CompositeBase
 	StatementBase
 	ModifiersBase
-	CompositeBase
 	DeclarationBase
 	ImportClause    *ImportClauseNode // Optional
 	ModuleSpecifier *Expression
@@ -2747,8 +2745,8 @@ func IsNamespaceImport(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NamedImports struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *ImportSpecifierList
 }
 
@@ -2790,10 +2788,10 @@ func IsNamedImports(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportAssignment struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	IsExportEquals bool
 	Type           *TypeNode
 	Expression     *Expression
@@ -2929,8 +2927,8 @@ func IsNamespaceExport(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NamedExports struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *ExportSpecifierList
 }
 
@@ -2972,10 +2970,10 @@ func IsNamedExports(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportSpecifier struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	IsTypeOnly   bool
 	PropertyName *ModuleExportName // Optional
 	name         *ModuleExportName
@@ -3108,11 +3106,11 @@ func IsConstructSignatureDeclaration(node *Node) bool {
 
 type ConstructorDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
-	CompositeBase
 	ReturnFlowNode *FlowNode
 }
 
@@ -3369,12 +3367,12 @@ func IsMethodSignatureDeclaration(node *Node) bool {
 type MethodDeclaration struct {
 	ClassElementBase
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 }
 
 func (f *NodeFactory) NewMethodDeclaration(modifiers *ModifierList, asteriskToken *AsteriskToken, name *PropertyName, postfixToken *TokenNode, typeParameters *TypeParameterList, parameters *ParameterList, typeNode *TypeNode, fullSignature *TypeNode, body *FunctionBody) *Node {
@@ -3487,10 +3485,10 @@ func IsPropertySignatureDeclaration(node *Node) bool {
 
 type PropertyDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Type        *TypeNode   // Optional
 	Initializer *Expression // Optional
 }
@@ -3565,11 +3563,11 @@ func IsSemicolonClassElement(node *Node) bool {
 
 type ClassStaticBlockDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
 	LocalsContainerBase
-	CompositeBase
 	Body           *BlockNode
 	ReturnFlowNode *FlowNode
 }
@@ -3783,10 +3781,10 @@ func IsNoSubstitutionTemplateLiteral(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BinaryExpression struct {
+	CompositeBase
 	ExpressionBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	Left          *Expression
 	Type          *TypeNode // Optional
 	OperatorToken *BinaryOperatorToken
@@ -3963,12 +3961,12 @@ func IsYieldExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ArrowFunction struct {
+	CompositeBase
 	ExpressionBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 	EqualsGreaterThanToken *EqualsGreaterThanToken
 }
 
@@ -4018,12 +4016,12 @@ func IsArrowFunction(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type FunctionExpression struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 	name           *IdentifierNode // Optional
 	ReturnFlowNode *FlowNode
 }
@@ -4160,8 +4158,8 @@ func IsSatisfiesExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ConditionalExpression struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	Condition     *Expression
 	QuestionToken *QuestionToken
 	WhenTrue      *Expression
@@ -4219,9 +4217,9 @@ func IsConditionalExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type PropertyAccessExpression struct {
+	CompositeBase
 	MemberExpressionBase
 	FlowNodeBase
-	CompositeBase
 	Expression       *Expression
 	QuestionDotToken *QuestionDotToken // Optional
 	name             *MemberName
@@ -4269,9 +4267,9 @@ func IsPropertyAccessExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ElementAccessExpression struct {
+	CompositeBase
 	MemberExpressionBase
 	FlowNodeBase
-	CompositeBase
 	Expression         *Expression
 	QuestionDotToken   *QuestionDotToken // Optional
 	ArgumentExpression *Expression
@@ -4321,9 +4319,9 @@ func IsElementAccessExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CallExpression struct {
+	CompositeBase
 	LeftHandSideExpressionBase
 	DeclarationBase
-	CompositeBase
 	Expression       *Expression
 	QuestionDotToken *QuestionDotToken // Optional
 	TypeArguments    *TypeList         // Optional
@@ -4372,8 +4370,8 @@ func IsCallExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NewExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Expression    *Expression
 	TypeArguments *TypeList    // Optional
 	Arguments     *ElementList // Optional
@@ -4415,9 +4413,9 @@ func IsNewExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type MetaProperty struct {
+	CompositeBase
 	PrimaryExpressionBase
 	FlowNodeBase
-	CompositeBase
 	KeywordToken Kind
 	name         *IdentifierNode
 }
@@ -4539,8 +4537,8 @@ func IsSpreadElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TemplateExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Head          *TemplateHeadNode
 	TemplateSpans *TemplateSpanList
 }
@@ -4630,8 +4628,8 @@ func IsTemplateSpan(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TaggedTemplateExpression struct {
-	MemberExpressionBase
 	CompositeBase
+	MemberExpressionBase
 	Tag              *Expression
 	QuestionDotToken *QuestionDotToken
 	TypeArguments    *TypeList // Optional
@@ -4722,8 +4720,8 @@ func IsParenthesizedExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ArrayLiteralExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Elements  *ElementList
 	MultiLine bool
 }
@@ -4767,9 +4765,9 @@ func IsArrayLiteralExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ObjectLiteralExpression struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
-	CompositeBase
 	Properties *NodeList
 	MultiLine  bool
 }
@@ -4854,10 +4852,10 @@ func IsSpreadAssignment(node *Node) bool {
 
 type PropertyAssignment struct {
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Type        *TypeNode
 	Initializer *Expression
 }
@@ -4909,10 +4907,10 @@ func IsPropertyAssignment(node *Node) bool {
 
 type ShorthandPropertyAssignment struct {
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Type                        *TypeNode
 	EqualsToken                 *EqualsToken // Optional
 	ObjectAssignmentInitializer *Expression  // Optional
@@ -5517,8 +5515,8 @@ func IsTypeReferenceNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExpressionWithTypeArguments struct {
-	MemberExpressionBase
 	CompositeBase
+	MemberExpressionBase
 	Expression    *Expression
 	TypeArguments *TypeList // Optional
 }
@@ -5659,8 +5657,8 @@ func IsTypePredicateNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportAttribute struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	name  *ImportAttributeName
 	Value *Expression
 }
@@ -5709,8 +5707,8 @@ func IsImportAttribute(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportAttributes struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Token      Kind
 	Attributes *ImportAttributeList
 	MultiLine  bool
@@ -6417,8 +6415,8 @@ func IsPartiallyEmittedExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxElement struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	OpeningElement *JsxOpeningElementNode
 	Children       *JsxChildList
 	ClosingElement *JsxClosingElementNode
@@ -6460,9 +6458,9 @@ func IsJsxElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxAttributes struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
-	CompositeBase
 	Properties *JsxAttributeList
 }
 
@@ -6500,8 +6498,8 @@ func IsJsxAttributes(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxNamespacedName struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	Namespace *IdentifierNode
 	name      *IdentifierNode
 }
@@ -6545,8 +6543,8 @@ func IsJsxNamespacedName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxOpeningElement struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	TagName       *JsxTagNameExpression
 	TypeArguments *TypeList // Optional
 	Attributes    *JsxAttributesNode
@@ -6588,8 +6586,8 @@ func IsJsxOpeningElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxSelfClosingElement struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	TagName       *JsxTagNameExpression
 	TypeArguments *TypeList // Optional
 	Attributes    *JsxAttributesNode
@@ -6631,8 +6629,8 @@ func IsJsxSelfClosingElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxFragment struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	OpeningFragment *JsxOpeningFragmentNode
 	Children        *JsxChildList
 	ClosingFragment *JsxClosingFragmentNode
@@ -6716,9 +6714,9 @@ func IsJsxClosingFragment(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxAttribute struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
-	CompositeBase
 	name        *JsxAttributeName
 	Initializer *JsxAttributeValue // Optional
 }
@@ -8105,13 +8103,13 @@ func IsSourceFile(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ModuleDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
 	LocalsContainerBase
 	BodyBase
-	CompositeBase
 	Keyword    Kind
 	name       *ModuleName
 	Attributes *TypeLiteralNodeNode // Optional
@@ -8162,11 +8160,11 @@ func IsModuleDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportEqualsDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
-	CompositeBase
 	IsTypeOnly      bool
 	name            *IdentifierNode
 	ModuleReference *ModuleReference
@@ -8213,10 +8211,10 @@ func IsImportEqualsDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	IsTypeOnly      bool
 	ExportClause    *NamedExportBindings  // Optional
 	ModuleSpecifier *Expression           // Optional
@@ -8312,10 +8310,10 @@ func IsImportTypeNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportClause struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	PhaseModifier ImportPhaseModifierSyntaxKind // Optional
 	name          *IdentifierNode               // Optional
 	NamedBindings *NamedImportBindings          // Optional
@@ -8361,10 +8359,10 @@ func IsImportClause(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportSpecifier struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	IsTypeOnly   bool
 	PropertyName *ModuleExportName // Optional
 	name         *IdentifierNode

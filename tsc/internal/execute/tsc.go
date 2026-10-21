@@ -378,6 +378,17 @@ func performCompilation(
 
 	tr := startTracingIfNeeded(sys, config, testing)
 
+	var resumeGC func()
+	if testing == nil && config.CompilerOptions().MaxMemory == nil {
+		resumeGC = core.SuspendGC()
+		if resumeGC != nil {
+			defer func() {
+				if resumeGC != nil {
+					resumeGC()
+				}
+			}()
+		}
+	}
 	parseStart := sys.Now()
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		Config:  config,
@@ -389,6 +400,7 @@ func performCompilation(
 		compileTimes.ContentMapperTimes = contentMapperHost.Timings()
 	}
 	result, _ := tsc.EmitAndReportStatistics(tsc.EmitInput{
+		ResumeGC:           &resumeGC,
 		Sys:                sys,
 		ProgramLike:        program,
 		Program:            program,

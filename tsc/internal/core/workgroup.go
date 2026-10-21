@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -18,7 +19,7 @@ type WorkGroup interface {
 }
 
 func NewWorkGroup(singleThreaded bool) WorkGroup {
-	if singleThreaded {
+	if singleThreaded || runtime.GOARCH == "wasm" {
 		return &singleThreadedWorkGroup{}
 	}
 	return &parallelWorkGroup{}
@@ -34,6 +35,10 @@ var _ WorkGroup = (*parallelWorkGroup)(nil)
 func (w *parallelWorkGroup) Queue(fn func()) {
 	if w.done.Load() {
 		panic("Queue called after RunAndWait returned")
+	}
+	if runtime.GOARCH == "wasm" {
+		fn()
+		return
 	}
 
 	w.wg.Go(func() {
@@ -106,6 +111,10 @@ func NewThrottleGroup(ctx context.Context, semaphore chan struct{}) *ThrottleGro
 // Go runs the given function in a new goroutine, but first acquires a slot from the semaphore.
 // The semaphore slot is released when the function completes.
 func (tg *ThrottleGroup) Go(fn func() error) {
+	if runtime.GOARCH == "wasm" {
+		_ = fn()
+		return
+	}
 	tg.group.Go(func() error {
 		// Acquire semaphore slot - this will block until a slot is available
 		tg.semaphore <- struct{}{}

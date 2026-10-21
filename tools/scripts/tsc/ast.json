@@ -945,12 +945,6 @@
             "extends": []
         },
         "CompositeBase": {
-            "fields": {
-                "facts": {
-                    "type": "atomic.Uint32",
-                    "goOnly": true
-                }
-            },
             "extends": []
         },
         "TypeSyntaxBase": {

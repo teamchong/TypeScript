@@ -95,6 +95,11 @@ func (f *NodeFactory) TextCount() int {
 	return f.textCount
 }
 
+func (f *NodeFactory) ResetCounts() {
+	f.nodeCount = 0
+	f.textCount = 0
+}
+
 func (f *NodeFactory) AsNodeFactory() *NodeFactory {
 	return f
 }
@@ -174,12 +179,14 @@ func (list *ModifierList) Clone(f *NodeFactory) *ModifierList {
 
 // Every concrete AST node embeds Node at offset zero. Kind identifies the
 // enclosing allocation, which generated accessors recover without a data pointer.
+// Initialize Kind only in newNode; transformations must construct a new node
+// rather than retagging one. The unsafelayout linter enforces this boundary.
 
 type Node struct {
 	Kind   Kind
 	Flags  NodeFlags
 	Loc    core.TextRange
-	id     atomic.Uint64
+	id     atomic.Uint32
 	Parent *Node
 }
 
@@ -1524,12 +1531,25 @@ func (node *Node) EagerJSDoc(file *SourceFile) []*Node {
 
 // CompositeBase
 
+var subtreeFactsShards [64]struct {
+	mu sync.RWMutex
+	m  map[*Node]SubtreeFacts
+}
+
 func (node *CompositeBase) subtreeFactsWorker(self *Node) SubtreeFacts {
 	// computeSubtreeFacts() is expected to be idempotent, so races will only impact time, not correctness.
-	facts := SubtreeFacts(node.facts.Load())
+	shard := &subtreeFactsShards[(uintptr(unsafe.Pointer(self))>>4)&63]
+	shard.mu.RLock()
+	facts := shard.m[self]
+	shard.mu.RUnlock()
 	if facts&SubtreeFactsComputed == 0 {
-		facts |= self.computeSubtreeFacts() | SubtreeFactsComputed
-		node.facts.Store(uint32(facts))
+		facts = self.computeSubtreeFacts() | SubtreeFactsComputed
+		shard.mu.Lock()
+		if shard.m == nil {
+			shard.m = make(map[*Node]SubtreeFacts)
+		}
+		shard.m[self] = facts
+		shard.mu.Unlock()
 	}
 	return facts &^ SubtreeFactsComputed
 }
@@ -2317,9 +2337,9 @@ type sourceFileDataKey uint64
 
 var sourceFileDataKeyCounter atomic.Uint64
 
-type sourceFileDataCell[T any] struct {
+type sourceFileDataCell struct {
 	once  sync.Once
-	value T
+	value unsafe.Pointer
 }
 
 func NewSourceFileDataKey[T any]() *SourceFileDataKey[T] {
@@ -2327,15 +2347,16 @@ func NewSourceFileDataKey[T any]() *SourceFileDataKey[T] {
 }
 
 func (file *SourceFile) GetOrComputeData[T any](key *SourceFileDataKey[T], compute func(*SourceFile) T) T {
-	cell := file.getDataCell(key)
+	cell := file.getDataCell(key.key)
 	cell.once.Do(func() {
-		cell.value = compute(file)
+		v := compute(file)
+		cell.value = unsafe.Pointer(&v)
 	})
-	return cell.value
+	return *(*T)(cell.value)
 }
 
-func (file *SourceFile) getDataCell[T any](key *SourceFileDataKey[T]) *sourceFileDataCell[T] {
-	if key == nil || key.key == 0 {
+func (file *SourceFile) getDataCell(key sourceFileDataKey) *sourceFileDataCell {
+	if key == 0 {
 		panic("invalid SourceFileDataKey; use NewSourceFileDataKey")
 	}
 
@@ -2343,13 +2364,13 @@ func (file *SourceFile) getDataCell[T any](key *SourceFileDataKey[T]) *sourceFil
 	defer file.dataMu.Unlock()
 
 	if file.data == nil {
-		file.data = make(map[sourceFileDataKey]any)
+		file.data = make(map[sourceFileDataKey]*sourceFileDataCell)
 	}
-	if cell, ok := file.data[key.key]; ok {
-		return cell.(*sourceFileDataCell[T])
+	if cell, ok := file.data[key]; ok {
+		return cell
 	}
-	cell := &sourceFileDataCell[T]{}
-	file.data[key.key] = cell
+	cell := &sourceFileDataCell{}
+	file.data[key] = cell
 	return cell
 }
 
@@ -2384,7 +2405,7 @@ type SourceFile struct {
 
 	// Fields for lazily-computed data owned by packages outside ast.
 	dataMu sync.Mutex
-	data   map[sourceFileDataKey]any
+	data   map[sourceFileDataKey]*sourceFileDataCell
 
 	// Fields set by parser
 	diagnostics                 []*Diagnostic

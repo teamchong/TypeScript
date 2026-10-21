@@ -98,6 +98,7 @@ type Parser struct {
 	currentParent        *ast.Node
 	setParentFromContext ast.Visitor
 	reparsedClones       []*ast.Node
+	freeNodeLists        [][]*ast.Node
 }
 
 func newParser() *Parser {
@@ -127,8 +128,32 @@ func getParser() *Parser {
 }
 
 func putParser(p *Parser) {
-	*p = Parser{scanner: p.scanner, setParentFromContext: p.setParentFromContext}
+	p.factory.ResetCounts()
+	*p = Parser{
+		scanner:              p.scanner,
+		factory:              p.factory,
+		nodeSliceArena:       p.nodeSliceArena,
+		stringSliceArena:     p.stringSliceArena,
+		setParentFromContext: p.setParentFromContext,
+		freeNodeLists:        p.freeNodeLists,
+	}
 	parserPool.Put(p)
+}
+
+func (p *Parser) allocNodeList() []*ast.Node {
+	if n := len(p.freeNodeLists); n > 0 {
+		list := p.freeNodeLists[n-1]
+		p.freeNodeLists = p.freeNodeLists[:n-1]
+		return list[:0]
+	}
+	return make([]*ast.Node, 0, 16)
+}
+
+func (p *Parser) freeNodeList(list []*ast.Node) {
+	if list != nil {
+		clear(list)
+		p.freeNodeLists = append(p.freeNodeLists, list[:0])
+	}
 }
 
 func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
@@ -610,14 +635,23 @@ func (p *Parser) reparseTopLevelAwait(sourceFile *ast.SourceFile) *ast.Node {
 }
 
 func (p *Parser) parseListIndex(kind ParsingContext, parseElement func(p *Parser, index int) *ast.Node) []*ast.Node {
+	return p.parseListWorker(kind, nil, parseElement)
+}
+
+func (p *Parser) parseListWorker(kind ParsingContext, parseElement func(p *Parser) *ast.Node, parseElementIndex func(p *Parser, index int) *ast.Node) []*ast.Node {
 	saveParsingContexts := p.parsingContexts
 	p.parsingContexts |= 1 << kind
 	outerReparseList := p.reparseList
 	p.reparseList = nil
-	list := make([]*ast.Node, 0, 16)
+	list := p.allocNodeList()
 	for i := 0; !p.isListTerminator(kind); i++ {
 		if p.isListElement(kind, false /*inErrorRecovery*/) {
-			elt := parseElement(p, len(list))
+			var elt *ast.Node
+			if parseElement != nil {
+				elt = parseElement(p)
+			} else {
+				elt = parseElementIndex(p, len(list))
+			}
 			if len(p.reparseList) != 0 {
 				for _, e := range p.reparseList {
 					// Propagate @typedef type alias declarations outwards to a context that permits them.
@@ -638,12 +672,14 @@ func (p *Parser) parseListIndex(kind ParsingContext, parseElement func(p *Parser
 	}
 	p.reparseList = outerReparseList
 	p.parsingContexts = saveParsingContexts
-	return p.nodeSliceArena.Clone(list)
+	res := p.nodeSliceArena.Clone(list)
+	p.freeNodeList(list)
+	return res
 }
 
 func (p *Parser) parseList(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
 	pos := p.nodePos()
-	nodes := p.parseListIndex(kind, func(p *Parser, _ int) *ast.Node { return parseElement(p) })
+	nodes := p.parseListWorker(kind, parseElement, nil)
 	return p.newNodeList(core.NewTextRange(pos, p.nodePos()), nodes)
 }
 
@@ -652,13 +688,14 @@ func (p *Parser) parseDelimitedList(kind ParsingContext, parseElement func(p *Pa
 	pos := p.nodePos()
 	saveParsingContexts := p.parsingContexts
 	p.parsingContexts |= 1 << kind
-	list := make([]*ast.Node, 0, 16)
+	list := p.allocNodeList()
 	for {
 		if p.isListElement(kind, false /*inErrorRecovery*/) {
 			startPos := p.nodePos()
 			element := parseElement(p)
 			if element == nil {
 				p.parsingContexts = saveParsingContexts
+				p.freeNodeList(list)
 				// Return nil to indicate parseElement failed
 				return nil
 			}
@@ -702,7 +739,9 @@ func (p *Parser) parseDelimitedList(kind ParsingContext, parseElement func(p *Pa
 		}
 	}
 	p.parsingContexts = saveParsingContexts
-	return p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+	res := p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+	p.freeNodeList(list)
+	return res
 }
 
 // Return a non-nil (but possibly empty) NodeList if parsing was successful, a missing NodeList if the opening
@@ -2721,12 +2760,13 @@ func (p *Parser) parseUnionOrIntersectionType(operator ast.Kind, parseConstituen
 		typeNode = parseConstituentType(p)
 	}
 	if p.token == operator || hasLeadingOperator {
-		types := make([]*ast.Node, 1, 8)
-		types[0] = typeNode
+		types := append(p.allocNodeList(), typeNode)
 		for p.parseOptional(operator) {
 			types = append(types, p.parseFunctionOrConstructorTypeToError(isUnionType, parseConstituentType))
 		}
-		typeNode = p.createUnionOrIntersectionTypeNode(operator, p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(types)))
+		cloned := p.nodeSliceArena.Clone(types)
+		p.freeNodeList(types)
+		typeNode = p.createUnionOrIntersectionTypeNode(operator, p.newNodeList(core.NewTextRange(pos, p.nodePos()), cloned))
 		p.finishNode(typeNode, pos)
 	}
 	return typeNode
@@ -3940,10 +3980,13 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 	// It is illegal to have both leadingDecorators and trailingDecorators, but we will report that as a grammar check in the checker.
 	// parse leading decorators
 	pos := p.nodePos()
-	list := make([]*ast.Node, 0, 16)
+	var list []*ast.Node
 	for {
 		if allowDecorators && p.token == ast.KindAtToken && !hasTrailingModifier {
 			decorator := p.parseDecorator()
+			if list == nil {
+				list = p.allocNodeList()
+			}
 			list = append(list, decorator)
 			if hasLeadingModifier {
 				hasTrailingDecorator = true
@@ -3956,6 +3999,9 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 			if modifier.Kind == ast.KindStaticKeyword {
 				hasStaticModifier = true
 			}
+			if list == nil {
+				list = p.allocNodeList()
+			}
 			list = append(list, modifier)
 			if hasTrailingDecorator {
 				hasTrailingModifier = true
@@ -3965,7 +4011,9 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 		}
 	}
 	if len(list) != 0 {
-		return p.newModifierList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+		res := p.newModifierList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+		p.freeNodeList(list)
+		return res
 	}
 	return nil
 }

@@ -7,6 +7,8 @@ import (
 	"iter"
 	"maps"
 	"math"
+	"math/bits"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -690,8 +692,32 @@ type Checker struct {
 	outerTypeParameterListArena                 core.Arena[[]*Type]
 	valueSymbolExtraArena                       core.Arena[valueSymbolExtra]
 	structuredTypeExtraArena                    core.Arena[structuredTypeExtra]
+	memberIndexArena                            core.Arena[memberIndex]
+	memberIndexSlotsArena                       core.Arena[uint32]
+	lazyMemberTableArena                        core.Arena[lazyMemberTable]
+	lazyMappedTableArena                        core.Arena[lazyMappedTable]
+	simpleMapperArena                           core.Arena[SimpleTypeMapper]
+	arrayMapperArena                            core.Arena[ArrayTypeMapper]
+	mergedMapperArena                           core.Arena[MergedTypeMapper]
+	compositeMapperArena                        core.Arena[CompositeTypeMapper]
+	typeAliasArena                              core.Arena[TypeAlias]
+	freeTypeArgLists                            [][]*Type
+	unionFrontCache                             map[CacheHashKey]*Type
+	unionImpureCount                            uint32
+	diagnosticCount                             uint32
+	indexedAccessUnionMemo                      map[indexedAccessUnionKey]*Type
+	globalObjectAugmentFilter                   [4]uint64
+	globalObjectFilterReady                     bool
 	freeTypeSets                                *temporaryTypeSet
 	freePropertyCounts                          *temporaryPropertyCounts
+	freeNameSets                                []map[string]struct{}
+	namedUnionMemberSet                         map[*Type]struct{}
+	unionRunStarts                              []int
+	unionRunBounds                              []int
+	unionRunNext                                []int
+	unionMergeBuf                               []*Type
+	symbolSortBuf                               []symbolSortEntry
+	nodeFileIndexCache                          *[4096]nodeFileIndexEntry
 	mergedSymbols                               map[*ast.Symbol]*ast.Symbol
 	mergedExportsChecked                        collections.Set[*ast.Symbol]
 	factory                                     ast.NodeFactory
@@ -705,7 +731,6 @@ type Checker struct {
 	switchStatementLinks                        core.LinkStore[*ast.Node, SwitchStatementLinks]
 	jsxElementLinks                             core.LinkStore[*ast.Node, JsxElementLinks]
 	computedNameLinks                           core.LinkStore[*ast.Node, ComputedNameNodeLinks]
-	symbolReferenceLinks                        core.LinkStore[*ast.Symbol, SymbolReferenceLinks]
 	valueSymbolLinks                            symbolLinkStore[ValueSymbolLinks]
 	mappedSymbolLinks                           core.LinkStore[*ast.Symbol, MappedSymbolLinks]
 	deferredSymbolLinks                         core.LinkStore[*ast.Symbol, DeferredSymbolLinks]
@@ -921,6 +946,10 @@ type Checker struct {
 	packagesMap                                 map[string]bool
 	activeMappers                               []*TypeMapper
 	activeTypeMappersCaches                     []map[CacheHashKey]*Type
+	freeObjectLiteralSeen                       []map[string]DeclarationMeaning
+	freeSymbolTables                            []ast.SymbolTable
+	freeCallStates                              []*CallState
+	freeLazyMemberTables                        []*lazyMemberTable
 	ambientModulesOnce                          sync.Once
 	ambientModules                              []*ast.Symbol
 	withinUnreachableCode                       bool
@@ -1087,11 +1116,7 @@ func NewChecker(program Program, tracer *Tracer) (*Checker, *sync.Mutex) {
 	c.flowLoopCache = make(map[FlowLoopKey]*Type)
 	c.flowNodeReachable = make(map[*ast.FlowNode]bool)
 	c.flowNodePostSuper = make(map[*ast.FlowNode]bool)
-	c.subtypeRelation = &Relation{}
-	c.strictSubtypeRelation = &Relation{}
-	c.assignableRelation = &Relation{}
-	c.comparableRelation = &Relation{}
-	c.identityRelation = &Relation{}
+	c.subtypeRelation, c.strictSubtypeRelation, c.assignableRelation, c.comparableRelation, c.identityRelation = newRelations()
 	c.enumRelation = make(map[EnumRelationKey]RelationComparisonResult)
 	c.moduleImportAttributesTypes = make(map[*ast.Symbol]*Type)
 	c.getGlobalESSymbolType = c.getGlobalTypeResolver("Symbol", 0 /*arity*/, false /*reportErrors*/)
@@ -1564,7 +1589,38 @@ func (c *Checker) createNameResolverForSuggestion() *binder.NameResolver {
 }
 
 func (c *Checker) symbolReferenced(symbol *ast.Symbol, meaning ast.SymbolFlags) {
-	c.symbolReferenceLinks.Get(symbol).referenceKinds |= meaning
+	symbol.AddReference(meaning)
+}
+
+func (c *Checker) acquireSymbolTable() ast.SymbolTable {
+	if n := len(c.freeSymbolTables); n > 0 {
+		m := c.freeSymbolTables[n-1]
+		c.freeSymbolTables = c.freeSymbolTables[:n-1]
+		return m
+	}
+	return make(ast.SymbolTable)
+}
+
+func (c *Checker) releaseSymbolTable(m ast.SymbolTable) {
+	if m != nil {
+		if len(m) > 64 {
+			return
+		}
+		if len(m) != 0 {
+			clear(m)
+		}
+		c.freeSymbolTables = append(c.freeSymbolTables, m)
+	}
+}
+
+func (c *Checker) releaseSymbolTableIfUnused(t *Type, m ast.SymbolTable) {
+	if m == nil {
+		return
+	}
+	data := t.AsStructuredType()
+	if data.members == nil || data.members.fallback == nil {
+		c.releaseSymbolTable(m)
+	}
 }
 
 func (c *Checker) getRequiresScopeChangeCache(node *ast.Node) core.Tristate {
@@ -4583,8 +4639,8 @@ func (c *Checker) issueMemberSpecificError(node *ast.Node, typeWithThis *Type, b
 func (c *Checker) getTypeWithoutSignatures(t *Type) *Type {
 	switch {
 	case t.flags&TypeFlagsObject != 0:
-		resolved := c.resolveStructuredTypeMembers(t)
-		if len(resolved.getSignatures()) != 0 {
+		if c.typeHasCallOrConstructSignatures(t) {
+			resolved := c.resolveStructuredTypeMembers(t)
 			result := c.newObjectType(ObjectFlagsAnonymous, t.symbol)
 			result.objectFlags |= ObjectFlagsMembersResolved
 			result.AsObjectType().members = resolved.members
@@ -7268,8 +7324,12 @@ func (c *Checker) checkUnusedIdentifiers(potentiallyUnusedIdentifiers []*ast.Nod
 	}
 }
 
+func (c *Checker) getReferenceKinds(symbol *ast.Symbol) ast.SymbolFlags {
+	return symbol.ReferenceKinds()
+}
+
 func (c *Checker) isReferenced(symbol *ast.Symbol) bool {
-	return c.symbolReferenceLinks.Get(symbol).referenceKinds != 0
+	return c.getReferenceKinds(symbol) != 0
 }
 
 type UnusedKind int32
@@ -7339,7 +7399,7 @@ func (c *Checker) checkUnusedLocalsAndParameters(node *ast.Node) {
 	var variableParents collections.Set[*ast.Node]
 	var importClauses map[*ast.Node][]*ast.Node
 	for _, local := range node.Locals() {
-		referenceKinds := c.symbolReferenceLinks.Get(local).referenceKinds
+		referenceKinds := c.getReferenceKinds(local)
 		if local.Flags()&ast.SymbolFlagsTypeParameter != 0 && (local.Flags()&ast.SymbolFlagsVariable == 0 || referenceKinds&ast.SymbolFlagsVariable != 0) ||
 			local.Flags()&ast.SymbolFlagsTypeParameter == 0 && (referenceKinds != 0 || local.ExportSymbol() != nil ||
 				local.Flags()&ast.SymbolFlagsModuleExports != 0) {
@@ -7424,7 +7484,7 @@ func (c *Checker) isUnreferencedVariableDeclaration(node *ast.Node) bool {
 	if ast.IsBindingPattern(name) {
 		return core.Every(node.Name().Elements(), c.isUnreferencedVariableDeclaration)
 	}
-	if c.symbolReferenceLinks.Get(c.getSymbolOfDeclaration(node)).referenceKinds&ast.SymbolFlagsVariable != 0 {
+	if c.getReferenceKinds(c.getSymbolOfDeclaration(node))&ast.SymbolFlagsVariable != 0 {
 		return false
 	}
 	if ast.IsBindingElement(node) && ast.IsObjectBindingPattern(node.Parent) {
@@ -7506,12 +7566,12 @@ func (c *Checker) checkUnusedTypeParameters(node *ast.Node) {
 }
 
 func (c *Checker) isUnreferencedTypeParameter(typeParameter *ast.Node) bool {
-	return c.symbolReferenceLinks.Get(c.getMergedSymbol(typeParameter.Symbol())).referenceKinds&ast.SymbolFlagsTypeParameter == 0 && !isIdentifierThatStartsWithUnderscore(typeParameter.Name())
+	return c.getReferenceKinds(c.getMergedSymbol(typeParameter.Symbol()))&ast.SymbolFlagsTypeParameter == 0 && !isIdentifierThatStartsWithUnderscore(typeParameter.Name())
 }
 
 func (c *Checker) checkUnusedRenamedBindingElements() {
 	for _, node := range c.renamedBindingElementsInTypes {
-		if c.symbolReferenceLinks.Get(c.getSymbolOfDeclaration(node)).referenceKinds == 0 {
+		if c.getReferenceKinds(c.getSymbolOfDeclaration(node)) == 0 {
 			wrappingDeclaration := ast.WalkUpBindingElementsAndPatterns(node)
 			debug.Assert(ast.IsPartOfParameterDeclaration(wrappingDeclaration), "Only parameter declaration should be checked here")
 			diagnostic := NewDiagnosticForNode(node.Name(), diagnostics.X_0_is_an_unused_renaming_of_1_Did_you_intend_to_use_it_as_a_type_annotation, scanner.DeclarationNameToString(node.Name()), scanner.DeclarationNameToString(node.PropertyName()))
@@ -7816,6 +7876,10 @@ func (c *Checker) instantiateTypeWithSingleGenericCallSignature(node *ast.Node, 
 		c.skippedGenericFunction(node, checkMode)
 		return c.anyFunctionType
 	}
+	return c.instantiateTypeWithSingleGenericCallSignatureWorker(node, t, signature, contextualSignature)
+}
+
+func (c *Checker) instantiateTypeWithSingleGenericCallSignatureWorker(node *ast.Node, t *Type, signature *Signature, contextualSignature *Signature) *Type {
 	context := c.getInferenceContext(node)
 	// We have an expression that is an argument of a generic function for which we are performing
 	// type argument inference. The expression is of a function type with a single generic call
@@ -7824,7 +7888,7 @@ func (c *Checker) instantiateTypeWithSingleGenericCallSignature(node *ast.Node, 
 	// if some of the outer function type parameters have no inferences so far. If so, we can
 	// potentially add inferred type parameters to the outer function return type.
 	var returnSignature *Signature
-	if context.signature != nil {
+	if context != nil && context.signature != nil {
 		returnType := c.getReturnTypeOfSignature(context.signature)
 		if returnType != nil {
 			returnSignature = c.getSingleCallOrConstructSignature(returnType)
@@ -7837,9 +7901,10 @@ func (c *Checker) instantiateTypeWithSingleGenericCallSignature(node *ast.Node, 
 		instantiatedSignature := c.getSignatureInstantiationWithoutFillingInTypeArguments(signature, uniqueTypeParameters)
 		// Infer from the parameters of the instantiated signature to the parameters of the
 		// contextual signature starting with an empty set of inference candidates.
-		inferences := core.Map(context.inferences, func(info *InferenceInfo) *InferenceInfo {
-			return newInferenceInfo(info.typeParameter)
-		})
+		inferences := make([]*InferenceInfo, len(context.inferences))
+		for i, info := range context.inferences {
+			inferences[i] = newInferenceInfo(info.typeParameter)
+		}
 		c.applyToParameterTypes(instantiatedSignature, contextualSignature, func(source *Type, target *Type) {
 			c.inferTypes(inferences, source, target, InferencePriorityNone, true /*contravariant*/)
 		})
@@ -9055,13 +9120,37 @@ type CallState struct {
 	candidateForTypeArgumentError  *Signature
 }
 
+func (c *Checker) acquireCallState() *CallState {
+	if n := len(c.freeCallStates); n > 0 {
+		s := c.freeCallStates[n-1]
+		c.freeCallStates = c.freeCallStates[:n-1]
+		*s = CallState{}
+		return s
+	}
+	return &CallState{}
+}
+
+func (c *Checker) releaseCallState(s *CallState) {
+	*s = CallState{}
+	c.freeCallStates = append(c.freeCallStates, s)
+}
+
+func (c *Checker) someContextSensitive(args []*ast.Node) bool {
+	for _, arg := range args {
+		if c.isContextSensitive(arg) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidatesOutArray *[]*Signature, checkMode CheckMode, callChainFlags SignatureFlags, headMessage *diagnostics.Message) *Signature {
 	isTaggedTemplate := node.Kind == ast.KindTaggedTemplateExpression
 	isDecorator := node.Kind == ast.KindDecorator
 	isJsxOpeningOrSelfClosingElement := ast.IsJsxOpeningLikeElement(node)
 	isInstanceof := node.Kind == ast.KindBinaryExpression
 	reportErrors := !c.isInferencePartiallyBlocked && candidatesOutArray == nil
-	var s CallState
+	s := c.acquireCallState()
 	s.node = node
 	if !isDecorator && !isInstanceof && !isSuperCall(node) && !ast.IsJsxOpeningFragment(node) {
 		s.typeArguments = node.TypeArguments()
@@ -9078,6 +9167,7 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 	if len(s.candidates) == 0 {
 		// In Strada we would error here, but no known repro doesn't have at least
 		// one other error in this codepath. Just return instead. See #54442
+		c.releaseCallState(s)
 		return c.unknownSignature
 	}
 
@@ -9095,7 +9185,7 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 	// For a decorator, no arguments are susceptible to contextual typing due to the fact
 	// decorators are applied to a declaration by the emitter, and not to an expression.
 	s.isSingleNonGenericCandidate = len(s.candidates) == 1 && len(s.candidates[0].TypeParameters()) == 0
-	if !isDecorator && !s.isSingleNonGenericCandidate && core.Some(s.args, c.isContextSensitive) {
+	if !isDecorator && !s.isSingleNonGenericCandidate && c.someContextSensitive(s.args) {
 		s.argCheckMode = CheckModeSkipContextSensitive
 	} else {
 		s.argCheckMode = CheckModeNormal
@@ -9138,13 +9228,14 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 	s.recursiveResolution = slices.Contains(c.callResolutionStack, s.node)
 	c.callResolutionStack = append(c.callResolutionStack, s.node)
 	if len(s.candidates) > 1 {
-		result = c.chooseOverload(&s, c.subtypeRelation)
+		result = c.chooseOverload(s, c.subtypeRelation)
 	}
 	if result == nil {
-		result = c.chooseOverload(&s, c.assignableRelation)
+		result = c.chooseOverload(s, c.assignableRelation)
 	}
 	c.callResolutionStack = c.callResolutionStack[:len(c.callResolutionStack)-1]
 	if result != nil {
+		c.releaseCallState(s)
 		return result
 	}
 	result = c.getCandidateForOverloadFailure(s.node, s.candidates, s.args, candidatesOutArray != nil, checkMode)
@@ -9167,8 +9258,9 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 		if headMessage == nil && isInstanceof {
 			headMessage = diagnostics.The_left_hand_side_of_an_instanceof_expression_must_be_assignable_to_the_first_argument_of_the_right_hand_side_s_Symbol_hasInstance_method
 		}
-		c.reportCallResolutionErrors(node, &s, signatures, headMessage)
+		c.reportCallResolutionErrors(node, s, signatures, headMessage)
 	}
+	c.releaseCallState(s)
 	return result
 }
 
@@ -10925,7 +11017,7 @@ func (c *Checker) getInstantiationExpressionType(exprType *Type, node *ast.Node)
 					debug.Assert(t.symbol != nil, "Instantiation expression source type must have a symbol")
 					symbol.SetDeclarations(t.symbol.Declarations())
 					result := c.newObjectType(ObjectFlagsAnonymous|ObjectFlagsInstantiationExpressionType, symbol)
-					c.setStructuredTypeMembers(result, resolved.members, callSignatures, constructSignatures, resolved.getIndexInfos())
+					c.setStructuredTypeMembers(result, resolved.getMembers(), callSignatures, constructSignatures, resolved.getIndexInfos())
 					result.AsInstantiationExpressionType().node = node
 					return result
 				}
@@ -12143,7 +12235,7 @@ func (c *Checker) forEachProperty(prop *ast.Symbol, callback func(p *ast.Symbol)
 	if prop.CheckFlags()&ast.CheckFlagsSynthetic == 0 {
 		return callback(prop)
 	}
-	for _, t := range c.valueSymbolLinks.Get(prop).getContainingType().Types() {
+	for _, t := range c.valueSymbolLinks.TryGet(prop).getContainingType().Types() {
 		p := c.getPropertyOfType(t, prop.Name())
 		if p != nil && c.forEachProperty(p, callback) {
 			return true
@@ -12999,7 +13091,7 @@ func (c *Checker) checkAssignmentOperator(left *ast.Node, operator ast.Kind, rig
 	if ast.IsAssignmentOperator(operator) {
 		// We ignore assignments of undefined to CommonJS exports when there are multiple assignment declarations
 		if ast.IsDeclarationNode(left.Parent) && ast.GetAssignmentDeclarationKind(left.Parent) == ast.JSDeclarationKindExportsProperty {
-			if symbol := c.symbolNodeLinks.Get(left).resolvedSymbol; symbol != nil && len(symbol.Declarations()) > 1 && rightType.flags&TypeFlagsUndefined != 0 {
+			if links := c.symbolNodeLinks.TryGet(left); links != nil && links.resolvedSymbol != nil && len(links.resolvedSymbol.Declarations()) > 1 && rightType.flags&TypeFlagsUndefined != 0 {
 				return
 			}
 		}
@@ -13327,7 +13419,7 @@ func (c *Checker) checkInExpression(left *ast.Expression, right *ast.Expression,
 		}
 		// Unlike in 'checkPrivateIdentifierExpression' we now have access to the RHS type
 		// which provides us with the opportunity to emit more detailed errors
-		if c.symbolNodeLinks.Get(left).resolvedSymbol == nil && ast.GetContainingClass(left) != nil {
+		if c.getResolvedSymbolOrNil(left) == nil && ast.GetContainingClass(left) != nil {
 			isUncheckedJS := c.isUncheckedJSSuggestion(left, rightType.symbol, true /*excludeClasses*/)
 			c.reportNonexistentProperty(left, rightType, isUncheckedJS)
 		}
@@ -13398,10 +13490,7 @@ func (c *Checker) checkObjectLiteral(node *ast.Node, checkMode CheckMode) *Type 
 	// Grammar checking
 	c.checkGrammarObjectLiteralExpression(node.AsObjectLiteralExpression(), inDestructuringPattern)
 	var allPropertiesTable ast.SymbolTable
-	if c.strictNullChecks {
-		allPropertiesTable = make(ast.SymbolTable)
-	}
-	propertiesTable := make(ast.SymbolTable)
+	propertiesTable := c.acquireSymbolTable()
 	var propertiesArray []*ast.Symbol
 	spread := c.emptyObjectType
 	c.pushCachedContextualType(node)
@@ -13426,36 +13515,14 @@ func (c *Checker) checkObjectLiteral(node *ast.Node, checkMode CheckMode) *Type 
 	// As otherwise they may not be checked until exports for the type at this position are retrieved,
 	// which may never occur.
 	for _, elem := range node.Properties() {
+		if elem.Kind == ast.KindSpreadAssignment && c.strictNullChecks && allPropertiesTable == nil {
+			allPropertiesTable = make(ast.SymbolTable)
+		}
 		if elem.Name() != nil && ast.IsComputedPropertyName(elem.Name()) {
 			c.checkComputedPropertyName(elem.Name())
 		}
 	}
 	offset := 0
-	createObjectLiteralType := func() *Type {
-		var indexInfos []*IndexInfo
-		isReadonly := c.isConstContext(node)
-		if hasComputedStringProperty {
-			indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.stringType))
-		}
-		if hasComputedNumberProperty {
-			indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.numberType))
-		}
-		if hasComputedSymbolProperty {
-			indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.esSymbolType))
-		}
-		result := c.newAnonymousType(node.Symbol(), propertiesTable, nil, nil, indexInfos)
-		result.objectFlags |= objectFlags | ObjectFlagsObjectLiteral | ObjectFlagsContainsObjectOrArrayLiteral
-		if contextualType == nil && ast.IsInJSFile(node) && !ast.IsInJsonFile(node) {
-			result.objectFlags |= ObjectFlagsJSLiteral
-		}
-		if patternWithComputedProperties {
-			result.objectFlags |= ObjectFlagsObjectLiteralPatternWithComputedProperties
-		}
-		if inDestructuringPattern {
-			c.patternForType[result] = node
-		}
-		return result
-	}
 	for _, memberDecl := range node.Properties() {
 		member := c.getSymbolOfDeclaration(memberDecl)
 		var computedNameType *Type
@@ -13521,9 +13588,11 @@ func (c *Checker) checkObjectLiteral(node *ast.Node, checkMode CheckMode) *Type 
 			}
 		} else if memberDecl.Kind == ast.KindSpreadAssignment {
 			if len(propertiesArray) > 0 {
-				spread = c.getSpreadType(spread, createObjectLiteralType(), node.Symbol(), objectFlags, inConstContext)
+				objLitType := c.createObjectLiteralType(node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
+				c.releaseSymbolTableIfUnused(objLitType, propertiesTable)
+				spread = c.getSpreadType(spread, objLitType, node.Symbol(), objectFlags, inConstContext)
 				propertiesArray = nil
-				propertiesTable = make(ast.SymbolTable)
+				propertiesTable = c.acquireSymbolTable()
 				hasComputedStringProperty = false
 				hasComputedNumberProperty = false
 				hasComputedSymbolProperty = false
@@ -13573,25 +13642,75 @@ func (c *Checker) checkObjectLiteral(node *ast.Node, checkMode CheckMode) *Type 
 	}
 	c.popContextualType()
 	if c.isErrorType(spread) {
+		c.releaseSymbolTable(propertiesTable)
 		return c.errorType
 	}
 	if spread != c.emptyObjectType {
 		if len(propertiesArray) > 0 {
-			spread = c.getSpreadType(spread, createObjectLiteralType(), node.Symbol(), objectFlags, inConstContext)
+			objLitType := c.createObjectLiteralType(node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
+			c.releaseSymbolTableIfUnused(objLitType, propertiesTable)
+			spread = c.getSpreadType(spread, objLitType, node.Symbol(), objectFlags, inConstContext)
 			propertiesArray = nil
-			propertiesTable = make(ast.SymbolTable)
+			propertiesTable = nil
 			hasComputedStringProperty = false
 			hasComputedNumberProperty = false
+			hasComputedSymbolProperty = false
+		} else {
+			c.releaseSymbolTable(propertiesTable)
+			propertiesTable = nil
 		}
 		// remap the raw emptyObjectType fed in at the top into a fresh empty object literal type, unique to this use site
-		return c.mapType(spread, func(t *Type) *Type {
-			if t == c.emptyObjectType {
-				return createObjectLiteralType()
-			}
-			return t
-		})
+		return c.remapSpreadEmptyObjectType(spread, node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
 	}
-	return createObjectLiteralType()
+	res := c.createObjectLiteralType(node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
+	c.releaseSymbolTableIfUnused(res, propertiesTable)
+	return res
+}
+
+func (c *Checker) createObjectLiteralType(node *ast.Node, objectFlags ObjectFlags, propertiesTable ast.SymbolTable, propertiesArray []*ast.Symbol, offset int, contextualType *Type, inConstContext bool, hasComputedStringProperty bool, hasComputedNumberProperty bool, hasComputedSymbolProperty bool, patternWithComputedProperties bool, inDestructuringPattern bool) *Type {
+	var indexInfos []*IndexInfo
+	isReadonly := c.isConstContext(node)
+	if hasComputedStringProperty {
+		indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.stringType))
+	}
+	if hasComputedNumberProperty {
+		indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.numberType))
+	}
+	if hasComputedSymbolProperty {
+		indexInfos = append(indexInfos, c.getObjectLiteralIndexInfo(isReadonly, propertiesArray[offset:], c.esSymbolType))
+	}
+	var result *Type
+	if len(propertiesTable) == 0 {
+		result = c.newAnonymousType(node.Symbol(), nil, nil, nil, indexInfos)
+	} else {
+		result = c.newAnonymousType(node.Symbol(), propertiesTable, nil, nil, indexInfos)
+	}
+	result.objectFlags |= objectFlags | ObjectFlagsObjectLiteral | ObjectFlagsContainsObjectOrArrayLiteral
+	if contextualType == nil && ast.IsInJSFile(node) && !ast.IsInJsonFile(node) {
+		result.objectFlags |= ObjectFlagsJSLiteral
+	}
+	if patternWithComputedProperties {
+		result.objectFlags |= ObjectFlagsObjectLiteralPatternWithComputedProperties
+	}
+	if inDestructuringPattern {
+		c.patternForType[result] = node
+	}
+	return result
+}
+
+func (c *Checker) remapSpreadEmptyObjectType(spread *Type, node *ast.Node, objectFlags ObjectFlags, propertiesTable ast.SymbolTable, propertiesArray []*ast.Symbol, offset int, contextualType *Type, inConstContext bool, hasComputedStringProperty bool, hasComputedNumberProperty bool, hasComputedSymbolProperty bool, patternWithComputedProperties bool, inDestructuringPattern bool) *Type {
+	if spread.flags&TypeFlagsUnion == 0 {
+		if spread == c.emptyObjectType {
+			return c.createObjectLiteralType(node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
+		}
+		return spread
+	}
+	return c.mapType(spread, func(t *Type) *Type {
+		if t == c.emptyObjectType {
+			return c.createObjectLiteralType(node, objectFlags, propertiesTable, propertiesArray, offset, contextualType, inConstContext, hasComputedStringProperty, hasComputedNumberProperty, hasComputedSymbolProperty, patternWithComputedProperties, inDestructuringPattern)
+		}
+		return t
+	})
 }
 
 func (c *Checker) checkContextualDeprecations(node *ast.Node) {
@@ -13730,7 +13849,7 @@ func (c *Checker) getSpreadType(left *Type, right *Type, symbol *ast.Symbol, obj
 				c.spreadLinks.Get(result).leftSpread = leftProp
 				c.spreadLinks.Get(result).rightSpread = rightProp
 				result.SetDeclarations(declarations)
-				links.setNameType(c, c.valueSymbolLinks.Get(leftProp).getNameType())
+				links.setNameType(c, c.valueSymbolLinks.TryGet(leftProp).getNameType())
 				members[leftProp.Name()] = result
 			}
 		} else {
@@ -13817,7 +13936,7 @@ func (c *Checker) tryMergeUnionOfObjectTypeAndEmptyObject(t *Type, readonly bool
 				links.resolvedType = c.addOptionalityEx(c.getTypeOfSymbol(prop), true /*isProperty*/, true /*isOptional*/)
 			}
 			result.SetDeclarations(prop.Declarations())
-			links.setNameType(c, c.valueSymbolLinks.Get(prop).getNameType())
+			links.setNameType(c, c.valueSymbolLinks.TryGet(prop).getNameType())
 			c.mappedSymbolLinks.Get(result).syntheticOrigin = prop
 			members[prop.Name()] = result
 		}
@@ -13847,7 +13966,7 @@ func (c *Checker) getSpreadSymbol(prop *ast.Symbol, readonly bool) *ast.Symbol {
 		links.resolvedType = c.getTypeOfSymbol(prop)
 	}
 	result.SetDeclarations(prop.Declarations())
-	links.setNameType(c, c.valueSymbolLinks.Get(prop).getNameType())
+	links.setNameType(c, c.valueSymbolLinks.TryGet(prop).getNameType())
 	c.mappedSymbolLinks.Get(result).syntheticOrigin = prop
 	return result
 }
@@ -13864,12 +13983,37 @@ func (c *Checker) hasDefaultValue(node *ast.Node) bool {
 }
 
 func (c *Checker) isConstContext(node *ast.Node) bool {
+	return c.isConstContextEx(node, nil, nil)
+}
+
+func (c *Checker) isConstContextEx(node *ast.Node, contextualTypeOut **Type, hasContextualTypeOut *bool) bool {
 	parent := node.Parent
-	return ast.IsConstAssertion(parent) ||
-		c.isInlineImportAttributes(node) ||
-		c.isValidConstAssertionArgument(node) && c.isConstTypeVariable(c.getContextualType(node, ContextFlagsNone), 0) ||
-		(ast.IsParenthesizedExpression(parent) || ast.IsArrayLiteralExpression(parent) || ast.IsSpreadElement(parent)) && c.isConstContext(parent) ||
-		(ast.IsPropertyAssignment(parent) || ast.IsShorthandPropertyAssignment(parent) || ast.IsTemplateSpan(parent)) && c.isConstContext(parent.Parent)
+	if ast.IsConstAssertion(parent) || c.isInlineImportAttributes(node) {
+		return true
+	}
+	if c.isValidConstAssertionArgument(node) {
+		ct := c.getContextualType(node, ContextFlagsNone)
+		if contextualTypeOut != nil {
+			*contextualTypeOut = ct
+			*hasContextualTypeOut = true
+		}
+		if c.isConstTypeVariable(ct, 0) {
+			return true
+		}
+	}
+	if ast.IsParenthesizedExpression(parent) || ast.IsArrayLiteralExpression(parent) || ast.IsSpreadElement(parent) {
+		if hasContextualTypeOut != nil {
+			*hasContextualTypeOut = false
+		}
+		return c.isConstContext(parent)
+	}
+	if ast.IsPropertyAssignment(parent) || ast.IsShorthandPropertyAssignment(parent) || ast.IsTemplateSpan(parent) {
+		if hasContextualTypeOut != nil {
+			*hasContextualTypeOut = false
+		}
+		return c.isConstContext(parent.Parent)
+	}
+	return false
 }
 
 func (c *Checker) isInlineImportAttributes(node *ast.Node) bool {
@@ -13914,11 +14058,37 @@ func (c *Checker) isConstTypeVariable(t *Type, depth int) bool {
 	if depth >= 5 || t == nil {
 		return false
 	}
+	if t.flags&(TypeFlagsTypeParameter|TypeFlagsUnionOrIntersection|TypeFlagsIndexedAccess|TypeFlagsConditional|TypeFlagsSubstitution|TypeFlagsObject) == 0 {
+		return false
+	}
+	if t.flags&TypeFlagsObjectFlagsType != 0 {
+		if t.objectFlags&ObjectFlagsPrimitiveUnion != 0 {
+			return false
+		}
+		if t.objectFlags&(ObjectFlagsCouldContainTypeVariablesComputed|ObjectFlagsCouldContainTypeVariables) == ObjectFlagsCouldContainTypeVariablesComputed {
+			return false
+		}
+		if t.flags&TypeFlagsObject != 0 && t.objectFlags&(ObjectFlagsMapped|ObjectFlagsReference) == 0 {
+			return false
+		}
+	}
 	switch {
 	case t.flags&TypeFlagsTypeParameter != 0:
-		return t.symbol != nil && core.Some(t.symbol.Declarations(), func(d *ast.Node) bool { return ast.HasSyntacticModifier(d, ast.ModifierFlagsConst) })
+		if t.symbol != nil {
+			for _, d := range t.symbol.Declarations() {
+				if ast.HasSyntacticModifier(d, ast.ModifierFlagsConst) {
+					return true
+				}
+			}
+		}
+		return false
 	case t.flags&TypeFlagsUnionOrIntersection != 0:
-		return core.Some(t.Types(), func(s *Type) bool { return c.isConstTypeVariable(s, depth) })
+		for _, s := range t.Types() {
+			if c.isConstTypeVariable(s, depth+1) {
+				return true
+			}
+		}
+		return false
 	case t.flags&TypeFlagsIndexedAccess != 0:
 		return c.isConstTypeVariable(t.AsIndexedAccessType().objectType, depth+1)
 	case t.flags&TypeFlagsConditional != 0:
@@ -14145,14 +14315,18 @@ func (c *Checker) checkObjectLiteralMethod(node *ast.Node, checkMode CheckMode) 
 
 func (c *Checker) checkExpressionForMutableLocation(node *ast.Node, checkMode CheckMode) *Type {
 	t := c.checkExpressionEx(node, checkMode)
-	switch {
-	case c.isConstContext(node):
+	var contextualType *Type
+	var hasContextualType bool
+	if c.isConstContextEx(node, &contextualType, &hasContextualType) {
 		return c.getRegularTypeOfLiteralType(t)
-	case isTypeAssertion(node):
-		return t
-	default:
-		return c.getWidenedLiteralLikeTypeForContextualType(t, c.instantiateContextualType(c.getContextualType(node, ContextFlagsNone), node, ContextFlagsNone))
 	}
+	if isTypeAssertion(node) {
+		return t
+	}
+	if !hasContextualType {
+		contextualType = c.getContextualType(node, ContextFlagsNone)
+	}
+	return c.getWidenedLiteralLikeTypeForContextualType(t, c.instantiateContextualType(contextualType, node, ContextFlagsNone))
 }
 
 func (c *Checker) getResolvedSymbol(node *ast.Node) *ast.Symbol {
@@ -14169,11 +14343,14 @@ func (c *Checker) getResolvedSymbol(node *ast.Node) *ast.Symbol {
 }
 
 func (c *Checker) getResolvedSymbolOrNil(node *ast.Node) *ast.Symbol {
-	return c.symbolNodeLinks.Get(node).resolvedSymbol
+	if links := c.symbolNodeLinks.TryGet(node); links != nil {
+		return links.resolvedSymbol
+	}
+	return nil
 }
 
 func (c *Checker) getReferencedValueOrAliasSymbol(reference *ast.Node) *ast.Symbol {
-	resolvedSymbol := c.symbolNodeLinks.Get(reference).resolvedSymbol
+	resolvedSymbol := c.getResolvedSymbolOrNil(reference)
 	if resolvedSymbol != nil && resolvedSymbol != c.unknownSymbol {
 		return resolvedSymbol
 	}
@@ -14241,6 +14418,7 @@ func (c *Checker) GetGlobalDiagnostics() []*ast.Diagnostic {
 }
 
 func (c *Checker) addDeferredDiagnostic(callback func()) {
+	c.diagnosticCount++
 	c.deferredDiagnosticCallbacks = append(c.deferredDiagnosticCallbacks, callback)
 }
 
@@ -14252,6 +14430,7 @@ func (c *Checker) produceDeferredDiagnostics() {
 }
 
 func (c *Checker) addDiagnostic(diagnostic *ast.Diagnostic) *ast.Diagnostic {
+	c.diagnosticCount++
 	// Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
 	if c.serializationLevel < maxSerializationLevel {
 		return c.diagnostics.Add(diagnostic)
@@ -14260,6 +14439,7 @@ func (c *Checker) addDiagnostic(diagnostic *ast.Diagnostic) *ast.Diagnostic {
 }
 
 func (c *Checker) addSuggestionDiagnostic(diagnostic *ast.Diagnostic) *ast.Diagnostic {
+	c.diagnosticCount++
 	// Discard diagnostics created while at the maximum number of recursive TypeToString invocations.
 	if c.serializationLevel < maxSerializationLevel {
 		return c.suggestionDiagnostics.Add(diagnostic)
@@ -16137,7 +16317,7 @@ func (c *Checker) cloneTypeAsModuleType(symbol *ast.Symbol, moduleType *Type, re
 	links.target = symbol
 	links.originatingImport = referenceParent
 	resolvedModuleType := c.resolveStructuredTypeMembers(moduleType)
-	c.valueSymbolLinks.Get(result).resolvedType = c.newAnonymousType(result, resolvedModuleType.members, nil, nil, resolvedModuleType.getIndexInfos())
+	c.valueSymbolLinks.Get(result).resolvedType = c.newAnonymousType(result, resolvedModuleType.getMembers(), nil, nil, resolvedModuleType.getIndexInfos())
 	return result
 }
 
@@ -16555,18 +16735,16 @@ type ExportCollisionTable = map[string]*ExportCollision
 
 func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports ast.SymbolTable, typeOnlyExportStarMap map[string]*ast.Node) {
 	var visitedSymbols []*ast.Symbol
-	nonTypeOnlyNames := collections.NewSetWithSizeHint[string](len(moduleSymbol.Exports()))
+	var nonTypeOnlySymbols []*ast.Symbol
 	// The ES6 spec permits export * declarations in a module to circularly reference the module itself. For example,
 	// module 'a' can 'export * from "b"' and 'b' can 'export * from "a"' without error.
 	var visit func(*ast.Symbol, *ast.Node, bool) ast.SymbolTable
 	visit = func(symbol *ast.Symbol, exportStar *ast.Node, isTypeOnly bool) ast.SymbolTable {
 		if !isTypeOnly && symbol != nil {
-			// Add non-type-only names before checking if we've visited this module,
+			// Add non-type-only symbols before checking if we've visited this module,
 			// because we might have visited it via an 'export type *', and visiting
 			// again with 'export *' will override the type-onlyness of its exports.
-			for name := range symbol.Exports() {
-				nonTypeOnlyNames.Add(name)
-			}
+			nonTypeOnlySymbols = append(nonTypeOnlySymbols, symbol)
 		}
 		if symbol == nil || symbol.Exports() == nil || slices.Contains(visitedSymbols, symbol) {
 			return nil
@@ -16576,23 +16754,58 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 		// All export * declarations are collected in an __export symbol by the binder
 		exportStars := symbol.Exports()[ast.InternalSymbolNameExportStar]
 		if exportStars != nil {
-			nestedSymbols := make(ast.SymbolTable)
-			lookupTable := make(ExportCollisionTable)
-			for _, node := range exportStars.Declarations() {
+			decls := exportStars.Declarations()
+			if len(decls) == 1 {
+				node := decls[0]
 				resolvedModule := c.resolveExternalModuleName(node, node.ModuleSpecifier(), false /*ignoreErrors*/, c.getTypeFromImportAttributes(ast.GetImportAttributes(node)))
 				exportedSymbols := visit(resolvedModule, node, isTypeOnly || node.IsTypeOnly())
-				c.extendExportSymbols(nestedSymbols, exportedSymbols, lookupTable, node)
-			}
-			for id, s := range lookupTable {
-				// It's not an error if the file with multiple `export *`s with duplicate names exports a member with that name itself
-				if id == ast.InternalSymbolNameExportEquals || len(s.exportsWithDuplicate) == 0 || symbols[id] != nil {
-					continue
+				c.extendExportSymbols(symbols, exportedSymbols, nil, nil)
+			} else if len(decls) > 1 {
+				nestedSymbols := make(ast.SymbolTable)
+				var lookupTable ExportCollisionTable
+				exportedByStar := make([]ast.SymbolTable, len(decls))
+				for i, node := range decls {
+					resolvedModule := c.resolveExternalModuleName(node, node.ModuleSpecifier(), false /*ignoreErrors*/, c.getTypeFromImportAttributes(ast.GetImportAttributes(node)))
+					exportedSymbols := visit(resolvedModule, node, isTypeOnly || node.IsTypeOnly())
+					exportedByStar[i] = exportedSymbols
+					for id, sourceSymbol := range exportedSymbols {
+						if id == ast.InternalSymbolNameDefault {
+							continue
+						}
+						targetSymbol := nestedSymbols[id]
+						if targetSymbol == nil {
+							nestedSymbols[id] = sourceSymbol
+						} else if c.resolveSymbol(targetSymbol) != c.resolveSymbol(sourceSymbol) {
+							if lookupTable == nil {
+								lookupTable = make(ExportCollisionTable)
+							}
+							s := lookupTable[id]
+							if s == nil {
+								var specText string
+								for j := range i {
+									if exportedByStar[j][id] != nil {
+										specText = scanner.GetTextOfNode(decls[j].ModuleSpecifier())
+										break
+									}
+								}
+								s = &ExportCollision{specifierText: specText}
+								lookupTable[id] = s
+							}
+							s.exportsWithDuplicate = append(s.exportsWithDuplicate, node)
+						}
+					}
 				}
-				for _, node := range s.exportsWithDuplicate {
-					c.addDiagnostic(createDiagnosticForNode(node, diagnostics.Module_0_has_already_exported_a_member_named_1_Consider_explicitly_re_exporting_to_resolve_the_ambiguity, s.specifierText, id))
+				for id, s := range lookupTable {
+					// It's not an error if the file with multiple `export *`s with duplicate names exports a member with that name itself
+					if id == ast.InternalSymbolNameExportEquals || len(s.exportsWithDuplicate) == 0 || symbols[id] != nil {
+						continue
+					}
+					for _, node := range s.exportsWithDuplicate {
+						c.addDiagnostic(createDiagnosticForNode(node, diagnostics.Module_0_has_already_exported_a_member_named_1_Consider_explicitly_re_exporting_to_resolve_the_ambiguity, s.specifierText, id))
+					}
 				}
+				c.extendExportSymbols(symbols, nestedSymbols, nil, nil)
 			}
-			c.extendExportSymbols(symbols, nestedSymbols, nil, nil)
 		}
 		if exportStar != nil && exportStar.IsTypeOnly() {
 			if typeOnlyExportStarMap == nil {
@@ -16630,8 +16843,12 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 			}
 		}
 	}
-	for name := range nonTypeOnlyNames.Keys() {
-		delete(typeOnlyExportStarMap, name)
+	if typeOnlyExportStarMap != nil {
+		for _, sym := range nonTypeOnlySymbols {
+			for name := range sym.Exports() {
+				delete(typeOnlyExportStarMap, name)
+			}
+		}
 	}
 	return exports, typeOnlyExportStarMap
 }
@@ -16878,7 +17095,7 @@ func (c *Checker) GetTypeOfSymbolAtLocation(symbol *ast.Symbol, location *ast.No
 				} else {
 					t = c.getTypeOfExpression(location)
 				}
-				if c.getExportSymbolOfValueSymbolIfExported(c.symbolNodeLinks.Get(location).resolvedSymbol) == symbol {
+				if c.getExportSymbolOfValueSymbolIfExported(c.getResolvedSymbolOrNil(location)) == symbol {
 					return c.removeOptionalTypeMarker(t)
 				}
 			}
@@ -17795,6 +18012,58 @@ type keyBuilder struct {
 	inlineBuffer   [192]byte
 }
 
+var wasmKeyBuilderPool []*keyBuilder
+
+func acquireKeyBuilder() *keyBuilder {
+	if n := len(wasmKeyBuilderPool); n > 0 {
+		b := wasmKeyBuilderPool[n-1]
+		wasmKeyBuilderPool = wasmKeyBuilderPool[:n-1]
+		b.inlineLength = 0
+		if b.overflowBuffer != nil {
+			b.overflowBuffer = b.overflowBuffer[:0]
+		}
+		return b
+	}
+	return &keyBuilder{}
+}
+
+func (b *keyBuilder) releaseHash() CacheHashKey {
+	h := b.hash()
+	if runtime.GOARCH == "wasm" {
+		wasmKeyBuilderPool = append(wasmKeyBuilderPool, b)
+	}
+	return h
+}
+
+const (
+	packedInstantiationKeyTag = 0x1a5e
+	packedConditionalKeyTag   = 0xc0d7
+	packedUnionFrontKeyTag    = 0x70f0
+)
+
+func packedTypeListKey(tag uint64, types []*Type, flag bool) (CacheHashKey, bool) {
+	if len(types) > 3 {
+		return CacheHashKey{}, false
+	}
+	var id0, id1, id2 uint64
+	if len(types) > 0 {
+		id0 = uint64(types[0].id)
+		if len(types) > 1 {
+			id1 = uint64(types[1].id)
+			if len(types) > 2 {
+				id2 = uint64(types[2].id)
+			}
+		}
+	}
+	var flagBit uint64
+	if flag {
+		flagBit = 1
+	}
+	hi := (tag << 48) | (flagBit << 34) | (uint64(len(types)) << 32) | id2
+	y := ((id0 | (id1 << 32)) ^ (hi * 0x9e3779b97f4a7c15)) * 0xbf58476d1ce4e5b9
+	return CacheHashKey{Hi: hi, Lo: y ^ (y >> 32)}, true
+}
+
 func (b *keyBuilder) hash() CacheHashKey {
 	if b.overflowBuffer == nil {
 		return CacheHashKey(xxh3.Hash128(b.inlineBuffer[:b.inlineLength]))
@@ -17926,18 +18195,50 @@ func (b *keyBuilder) writeNode(node *ast.Node) {
 }
 
 func getTypeListKey(types []*Type) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeTypes(types)
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeTypes(types)
 	return b.hash()
 }
 
 func getAliasKey(alias *TypeAlias) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeAlias(alias)
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeAlias(alias)
 	return b.hash()
 }
 
 func getUnionKey(types []*Type, origin *Type, alias *TypeAlias) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		switch {
+		case origin == nil:
+			b.writeTypes(types)
+		case origin.flags&TypeFlagsUnion != 0:
+			b.writeByte('|')
+			b.writeTypes(origin.Types())
+		case origin.flags&TypeFlagsIntersection != 0:
+			b.writeByte('&')
+			b.writeTypes(origin.Types())
+		case origin.flags&TypeFlagsIndex != 0:
+			b.writeByte('#')
+			b.writeType(origin)
+			b.writeByte('|')
+			b.writeTypes(types)
+		default:
+			panic("Unhandled case in getUnionKey")
+		}
+		b.writeAlias(alias)
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	switch {
 	case origin == nil:
@@ -17949,7 +18250,7 @@ func getUnionKey(types []*Type, origin *Type, alias *TypeAlias) CacheHashKey {
 		b.writeByte('&')
 		b.writeTypes(origin.Types())
 	case origin.flags&TypeFlagsIndex != 0:
-		// origin type id alone is insufficient, as `keyof x` may resolve to multiple WIP values while `x` is still resolving
+		// origin type id alone is insufficient, as `keyof X` may resolve to multiple WIP values while `X` is still resolving
 		b.writeByte('#')
 		b.writeType(origin)
 		b.writeByte('|')
@@ -17962,6 +18263,16 @@ func getUnionKey(types []*Type, origin *Type, alias *TypeAlias) CacheHashKey {
 }
 
 func getIntersectionKey(types []*Type, flags IntersectionFlags, alias *TypeAlias) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeTypes(types)
+		if flags&IntersectionFlagsNoConstraintReduction == 0 {
+			b.writeAlias(alias)
+		} else {
+			b.writeByte('*')
+		}
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeTypes(types)
 	if flags&IntersectionFlagsNoConstraintReduction == 0 {
@@ -17973,6 +18284,28 @@ func getIntersectionKey(types []*Type, flags IntersectionFlags, alias *TypeAlias
 }
 
 func getTupleKey(elementInfos []TupleElementInfo, readonly bool) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		for _, e := range elementInfos {
+			switch {
+			case e.flags&ElementFlagsRequired != 0:
+				b.writeByte('#')
+			case e.flags&ElementFlagsOptional != 0:
+				b.writeByte('?')
+			case e.flags&ElementFlagsRest != 0:
+				b.writeByte('.')
+			default:
+				b.writeByte('*')
+			}
+			if e.labeledDeclaration != nil {
+				b.writeNode(e.labeledDeclaration)
+			}
+		}
+		if readonly {
+			b.writeByte('!')
+		}
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	for _, e := range elementInfos {
 		switch {
@@ -18000,6 +18333,20 @@ func getTypeAliasInstantiationKey(typeArguments []*Type, alias *TypeAlias) Cache
 }
 
 func getTypeInstantiationKey(typeArguments []*Type, alias *TypeAlias, singleSignature bool) CacheHashKey {
+	if alias == nil {
+		if key, ok := packedTypeListKey(packedInstantiationKeyTag, typeArguments, singleSignature); ok {
+			return key
+		}
+	}
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeTypes(typeArguments)
+		b.writeAlias(alias)
+		if singleSignature {
+			b.writeByte('!')
+		}
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeTypes(typeArguments)
 	b.writeAlias(alias)
@@ -18010,6 +18357,14 @@ func getTypeInstantiationKey(typeArguments []*Type, alias *TypeAlias, singleSign
 }
 
 func getIndexedAccessKey(objectType *Type, indexType *Type, accessFlags AccessFlags, alias *TypeAlias) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeType(objectType)
+		b.writeType(indexType)
+		b.writeUint32(uint32(accessFlags))
+		b.writeAlias(alias)
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeType(objectType)
 	b.writeType(indexType)
@@ -18019,6 +18374,19 @@ func getIndexedAccessKey(objectType *Type, indexType *Type, accessFlags AccessFl
 }
 
 func getTemplateTypeKey(texts []string, types []*Type) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeTypes(types)
+		b.writeByte('|')
+		for _, s := range texts {
+			b.writeInt(len(s))
+		}
+		b.writeByte('|')
+		for _, s := range texts {
+			b.writeString(s)
+		}
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeTypes(types)
 	b.writeByte('|')
@@ -18033,6 +18401,20 @@ func getTemplateTypeKey(texts []string, types []*Type) CacheHashKey {
 }
 
 func getConditionalTypeKey(typeArguments []*Type, alias *TypeAlias, forConstraint bool) CacheHashKey {
+	if alias == nil {
+		if key, ok := packedTypeListKey(packedConditionalKeyTag, typeArguments, forConstraint); ok {
+			return key
+		}
+	}
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeTypes(typeArguments)
+		b.writeAlias(alias)
+		if forConstraint {
+			b.writeByte('!')
+		}
+		return b.releaseHash()
+	}
 	var b keyBuilder
 	b.writeTypes(typeArguments)
 	b.writeAlias(alias)
@@ -18042,22 +18424,30 @@ func getConditionalTypeKey(typeArguments []*Type, alias *TypeAlias, forConstrain
 	return b.hash()
 }
 
-func getRelationKey(source *Type, target *Type, intersectionState IntersectionState, isIdentity bool, ignoreConstraints bool) (CacheHashKey, bool) {
+func getRelationKey(source *Type, target *Type, intersectionState IntersectionState, isIdentity bool, ignoreConstraints bool) (relationKey, bool) {
 	if isIdentity && source.id > target.id {
 		source, target = target, source
 	}
-	var b keyBuilder
-	var constrained bool
 	if isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) {
+		if runtime.GOARCH == "wasm" {
+			b := acquireKeyBuilder()
+			b.writeByte('g')
+			constrained := b.writeGenericTypeReferences(source, target, ignoreConstraints)
+			b.writeUint32(uint32(intersectionState))
+			return relationKey{value: b.releaseHash(), generic: true}, constrained
+		}
+		var b keyBuilder
 		b.writeByte('g')
-		constrained = b.writeGenericTypeReferences(source, target, ignoreConstraints)
-	} else {
-		b.writeByte('s')
-		b.writeType(source)
-		b.writeType(target)
+		constrained := b.writeGenericTypeReferences(source, target, ignoreConstraints)
+		b.writeUint32(uint32(intersectionState))
+		return relationKey{value: b.hash(), generic: true}, constrained
 	}
-	b.writeUint32(uint32(intersectionState))
-	return b.hash(), constrained
+	// Ordinary relationships need only the two exact IDs. Intersection
+	// states select separate maps, leaving generic hashes unmodified.
+	return relationKey{value: CacheHashKey{
+		Lo: uint64(source.id)<<32 | uint64(target.id),
+		Hi: uint64(intersectionState),
+	}}, false
 }
 
 func getNodeListKey(nodes []*ast.Node) CacheHashKey {
@@ -18070,9 +18460,20 @@ func getNodeListKey(nodes []*ast.Node) CacheHashKey {
 }
 
 func isTypeReferenceWithGenericArguments(t *Type) bool {
-	return isNonDeferredTypeReference(t) && core.Some(t.checker.getTypeArguments(t), func(t *Type) bool {
-		return t.flags&TypeFlagsTypeParameter != 0 || isTypeReferenceWithGenericArguments(t)
-	})
+	if !isNonDeferredTypeReference(t) {
+		return false
+	}
+	if t.objectFlags&ObjectFlagsHasGenericArgumentsComputed == 0 {
+		var result ObjectFlags
+		for _, arg := range t.checker.getTypeArguments(t) {
+			if arg.flags&TypeFlagsTypeParameter != 0 || isTypeReferenceWithGenericArguments(arg) {
+				result = ObjectFlagsHasGenericArguments
+				break
+			}
+		}
+		t.objectFlags |= ObjectFlagsHasGenericArgumentsComputed | result
+	}
+	return t.objectFlags&ObjectFlagsHasGenericArguments != 0
 }
 
 func isNonDeferredTypeReference(t *Type) bool {
@@ -18128,8 +18529,8 @@ func (c *Checker) getTypeForBindingElementParent(node *ast.Node, checkMode Check
 	if checkMode == CheckModeNormal {
 		// We can use a cached resolved type if no optionality was included in that type.
 		if symbol := c.getSymbolOfDeclaration(node); symbol != nil {
-			if resolvedType := c.valueSymbolLinks.Get(symbol).resolvedType; resolvedType != nil && !(c.strictNullChecks && isOptionalDeclaration(node)) {
-				return resolvedType
+			if links := c.valueSymbolLinks.TryGet(symbol); links != nil && links.resolvedType != nil && !(c.strictNullChecks && isOptionalDeclaration(node)) {
+				return links.resolvedType
 			}
 		}
 	}
@@ -19297,12 +19698,13 @@ func (c *Checker) getPropertiesOfObjectType(t *Type) []*ast.Symbol {
 func (c *Checker) getPropertiesOfUnionOrIntersectionType(t *Type) []*ast.Symbol {
 	d := t.AsUnionOrIntersectionType()
 	if d.resolvedProperties == nil {
-		var checked collections.Set[string]
+		checked := c.getTemporaryNameSet()
+		defer c.releaseTemporaryNameSet(checked)
 		props := []*ast.Symbol{}
 		for _, current := range d.types {
 			for _, prop := range c.getPropertiesOfType(current) {
-				if !checked.Has(prop.Name()) {
-					checked.Add(prop.Name())
+				if _, ok := checked[prop.Name()]; !ok {
+					checked[prop.Name()] = struct{}{}
 					combinedProp := c.getPropertyOfUnionOrIntersectionType(t, prop.Name(), t.flags&TypeFlagsIntersection != 0 /*skipObjectFunctionPropertyAugment*/)
 					if combinedProp != nil {
 						props = append(props, combinedProp)
@@ -19321,7 +19723,47 @@ func (c *Checker) getPropertiesOfUnionOrIntersectionType(t *Type) []*ast.Symbol 
 }
 
 func (c *Checker) getPropertyOfType(t *Type, name string) *ast.Symbol {
-	return c.getPropertyOfTypeEx(t, name, false /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/)
+	return c.getPropertyOfTypeWorker(t, name, false /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/, true /*instantiate*/)
+}
+
+func (c *Checker) hasPropertyOfType(t *Type, name string) bool {
+	return c.getPropertyOfTypeWorker(t, name, false /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/, false /*instantiate*/) != nil
+}
+
+func nameFilterBit(name string) (uint8, uint64) {
+	if len(name) == 0 {
+		return 0, 1
+	}
+	h := uint32(len(name))*131 + uint32(name[0])*31 + uint32(name[len(name)-1])
+	if len(name) > 2 {
+		h = h*31 + uint32(name[1])
+	}
+	return uint8((h >> 6) & 3), uint64(1) << (h & 63)
+}
+
+func (c *Checker) mayBeGlobalObjectMember(name string) bool {
+	if !c.globalObjectFilterReady {
+		if c.globalObjectType == nil || c.globalObjectType.flags&TypeFlagsObject == 0 || c.globalObjectType.objectFlags&ObjectFlagsMembersResolved == 0 {
+			return true
+		}
+		var filter [4]uint64
+		st := c.globalObjectType.AsStructuredType()
+		if st.members != nil && st.members.fallback != nil {
+			for k := range st.members.fallback {
+				w, bit := nameFilterBit(k)
+				filter[w] |= bit
+			}
+		} else {
+			for _, p := range st.properties {
+				w, bit := nameFilterBit(p.Name())
+				filter[w] |= bit
+			}
+		}
+		c.globalObjectAugmentFilter = filter
+		c.globalObjectFilterReady = true
+	}
+	w, bit := nameFilterBit(name)
+	return c.globalObjectAugmentFilter[w]&bit != 0
 }
 
 /**
@@ -19333,11 +19775,14 @@ func (c *Checker) getPropertyOfType(t *Type, name string) *ast.Symbol {
  * @param name a name of property to look up in a given type
  */
 func (c *Checker) getPropertyOfTypeEx(t *Type, name string, skipObjectFunctionPropertyAugment bool, includeTypeOnlyMembers bool) *ast.Symbol {
+	return c.getPropertyOfTypeWorker(t, name, skipObjectFunctionPropertyAugment, includeTypeOnlyMembers, true /*instantiate*/)
+}
+
+func (c *Checker) getPropertyOfTypeWorker(t *Type, name string, skipObjectFunctionPropertyAugment bool, includeTypeOnlyMembers bool, instantiate bool) *ast.Symbol {
 	t = c.getReducedApparentType(t)
 	switch {
 	case t.flags&TypeFlagsObject != 0:
-		resolved := c.resolveStructuredTypeMembers(t)
-		symbol := resolved.members[name]
+		symbol := c.getMemberOfStructuredTypeEx(t, name, instantiate)
 		if symbol != nil {
 			if !includeTypeOnlyMembers && t.symbol != nil && t.symbol.Flags()&ast.SymbolFlagsValueModule != 0 && c.moduleSymbolLinks.Get(t.symbol).typeOnlyExportStarMap[name] != nil {
 				// If this is the type of a module, `resolved.members.get(name)` might have effectively skipped over
@@ -19356,9 +19801,9 @@ func (c *Checker) getPropertyOfTypeEx(t *Type, name string, skipObjectFunctionPr
 		switch {
 		case t == c.anyFunctionType:
 			functionType = c.globalFunctionType
-		case len(resolved.CallSignatures()) != 0:
+		case len(c.getSignaturesOfStructuredType(t, SignatureKindCall)) != 0:
 			functionType = c.globalCallableFunctionType
-		case len(resolved.ConstructSignatures()) != 0:
+		case len(c.getSignaturesOfStructuredType(t, SignatureKindConstruct)) != 0:
 			functionType = c.globalNewableFunctionType
 		}
 		if functionType != nil {
@@ -19366,6 +19811,9 @@ func (c *Checker) getPropertyOfTypeEx(t *Type, name string, skipObjectFunctionPr
 			if symbol != nil {
 				return symbol
 			}
+		}
+		if !c.mayBeGlobalObjectMember(name) {
+			return nil
 		}
 		return c.getPropertyOfObjectType(c.globalObjectType, name)
 	case t.flags&TypeFlagsIntersection != 0:
@@ -19400,7 +19848,13 @@ func (c *Checker) getSignaturesOfStructuredType(t *Type, kind SignatureKind) []*
 	if t.flags&TypeFlagsStructuredType == 0 {
 		return nil
 	}
-	resolved := c.resolveStructuredTypeMembers(t)
+	if t.objectFlags&(ObjectFlagsMapped|ObjectFlagsMembersResolved) == ObjectFlagsMapped && c.getLazyMappedTable(t) != nil {
+		return nil
+	}
+	if t.objectFlags&ObjectFlagsMembersResolved == 0 && c.getReadyLazyMemberTable(t) == nil {
+		c.resolveStructuredTypeMembers(t)
+	}
+	resolved := t.AsStructuredType()
 	if resolved.extra == nil {
 		return nil
 	}
@@ -19416,7 +19870,16 @@ func (c *Checker) getIndexInfosOfType(t *Type) []*IndexInfo {
 
 func (c *Checker) getIndexInfosOfStructuredType(t *Type) []*IndexInfo {
 	if t.flags&TypeFlagsStructuredType != 0 {
-		return c.resolveStructuredTypeMembers(t).getIndexInfos()
+		if t.objectFlags&ObjectFlagsMembersResolved == 0 {
+			if c.getReadyLazyMemberTable(t) != nil {
+				return t.AsStructuredType().getIndexInfos()
+			}
+			if lazy := c.getLazyMappedTable(t); lazy != nil {
+				return c.getLazyMappedTypeIndexInfos(t, lazy)
+			}
+			return c.resolveStructuredTypeMembers(t).getIndexInfos()
+		}
+		return t.AsStructuredType().getIndexInfos()
 	}
 	return nil
 }
@@ -19456,38 +19919,49 @@ func (c *Checker) getApplicableIndexInfoForName(t *Type, name string) *IndexInfo
 }
 
 func (c *Checker) findApplicableIndexInfo(indexInfos []*IndexInfo, keyType *Type) *IndexInfo {
+	if len(indexInfos) == 0 {
+		return nil
+	}
 	// Index signatures for type 'string' are considered only when no other index signatures apply.
 	var stringIndexInfo *IndexInfo
-	applicableInfos := make([]*IndexInfo, 0, 8)
+	var firstApplicable *IndexInfo
+	var applicableInfos []*IndexInfo
 	for _, info := range indexInfos {
 		if info.keyType == c.stringType {
 			stringIndexInfo = info
 		} else if c.isApplicableIndexType(keyType, info.keyType) {
-			applicableInfos = append(applicableInfos, info)
+			if firstApplicable == nil {
+				firstApplicable = info
+			} else {
+				if applicableInfos == nil {
+					applicableInfos = []*IndexInfo{firstApplicable, info}
+				} else {
+					applicableInfos = append(applicableInfos, info)
+				}
+			}
 		}
 	}
-	// When more than one index signature is applicable we create a synthetic IndexInfo. Instead of computing
-	// the intersected key type, we just use unknownType for the key type as nothing actually depends on the
-	// keyType property of the returned IndexInfo.
-	switch len(applicableInfos) {
-	case 0:
+	// When more than one index signature is applicable we create a synthetic IndexInfo with an intersection of the
+	// value types and a readonly flag that is true if all applicable index signatures are readonly. Note that for
+	// the intersected key type, we just use unknownType for the key type as nothing actually depends on it.
+	if applicableInfos == nil {
+		if firstApplicable != nil {
+			return firstApplicable
+		}
 		if stringIndexInfo != nil && c.isApplicableIndexType(keyType, c.stringType) {
 			return stringIndexInfo
 		}
 		return nil
-	case 1:
-		return applicableInfos[0]
-	default:
-		isReadonly := true
-		types := make([]*Type, len(applicableInfos))
-		for i, info := range applicableInfos {
-			types[i] = info.valueType
-			if !info.isReadonly {
-				isReadonly = false
-			}
-		}
-		return c.newIndexInfo(c.unknownType, c.getIntersectionType(types), isReadonly, nil, nil)
 	}
+	isReadonly := true
+	types := make([]*Type, len(applicableInfos))
+	for i, info := range applicableInfos {
+		types[i] = info.valueType
+		if !info.isReadonly {
+			isReadonly = false
+		}
+	}
+	return c.newIndexInfo(c.unknownType, c.getIntersectionType(types), isReadonly, nil, nil)
 }
 
 func (c *Checker) isApplicableIndexType(source *Type, target *Type) bool {
@@ -19531,7 +20005,303 @@ func (c *Checker) resolveClassOrInterfaceMembers(t *Type) {
 	c.resolveObjectTypeMembers(t, t, nil, nil)
 }
 
+func mayHaveLazyMembers(t *Type) bool {
+	return t.objectFlags&(ObjectFlagsMembersResolved|ObjectFlagsReference) == ObjectFlagsReference
+}
+
+func (c *Checker) getReadyLazyMemberTable(t *Type) *lazyMemberTable {
+	if !mayHaveLazyMembers(t) {
+		return nil
+	}
+	return c.getReadyLazyMemberTableWorker(t)
+}
+
+func (c *Checker) getReadyLazyMemberTableWorker(t *Type) *lazyMemberTable {
+	if t.flags&TypeFlagsObject == 0 {
+		return nil
+	}
+	r := t.AsTypeReference()
+	if r.lazy != nil {
+		if !r.lazy.ready || t.objectFlags&ObjectFlagsMembersResolved != 0 {
+			return nil
+		}
+		return r.lazy
+	}
+	source := r.target
+	if source == nil || source == t || source.objectFlags&(ObjectFlagsClassOrInterface|ObjectFlagsTuple) == 0 || (t.symbol != nil && t.symbol.Flags()&ast.SymbolFlagsValueModule != 0) {
+		return nil
+	}
+	typeParameters := source.AsInterfaceType().allTypeParameters
+	typeArguments := c.getTypeArguments(t)
+	paddedTypeArguments := typeArguments
+	if len(typeArguments) == len(typeParameters)-1 {
+		if slices.Equal(typeParameters[:len(typeArguments)], typeArguments) && typeParameters[len(typeArguments)] == t {
+			return nil
+		}
+		paddedTypeArguments = make([]*Type, len(typeArguments)+1)
+		copy(paddedTypeArguments, typeArguments)
+		paddedTypeArguments[len(typeArguments)] = t
+	} else if slices.Equal(typeParameters, typeArguments) {
+		return nil
+	}
+	var lm *lazyMemberTable
+	if n := len(c.freeLazyMemberTables); n > 0 {
+		lm = c.freeLazyMemberTables[n-1]
+		c.freeLazyMemberTables = c.freeLazyMemberTables[:n-1]
+	} else {
+		lm = c.lazyMemberTableArena.New()
+	}
+	lm.mapper = newTypeMapper(typeParameters, paddedTypeArguments)
+	r.lazy = lm
+	c.prepareLazyMembers(t, source, lm, core.LastOrNil(paddedTypeArguments))
+	if t.objectFlags&ObjectFlagsMembersResolved != 0 {
+		return nil
+	}
+	return lm
+}
+
+func (c *Checker) prepareLazyMembers(t *Type, source *Type, lm *lazyMemberTable, thisArgument *Type) {
+	resolved := c.resolveDeclaredMembers(source)
+	callSignatures := c.instantiateSignatures(resolved.declaredCallSignatures, lm.mapper)
+	constructSignatures := c.instantiateSignatures(resolved.declaredConstructSignatures, lm.mapper)
+	indexInfos := c.instantiateIndexInfos(resolved.declaredIndexInfos, lm.mapper)
+	sourceBaseTypes := c.getBaseTypes(source)
+	var baseTypes []*Type
+	if len(sourceBaseTypes) != 0 {
+		baseTypes = make([]*Type, 0, len(sourceBaseTypes))
+		for _, baseType := range sourceBaseTypes {
+			instantiatedBaseType := baseType
+			if thisArgument != nil {
+				instantiatedBaseType = c.getTypeWithThisArgument(c.instantiateType(baseType, lm.mapper), thisArgument, false /*needApparentType*/)
+			}
+			baseTypes = append(baseTypes, instantiatedBaseType)
+			reduced := c.getReducedApparentType(instantiatedBaseType)
+			if reduced.flags&TypeFlagsIntersection == 0 && c.getReadyLazyMemberTable(reduced) == nil {
+				c.getPropertiesOfType(instantiatedBaseType)
+			}
+			callSignatures = core.Concatenate(callSignatures, c.getSignaturesOfType(instantiatedBaseType, SignatureKindCall))
+			constructSignatures = core.Concatenate(constructSignatures, c.getSignaturesOfType(instantiatedBaseType, SignatureKindConstruct))
+			var inheritedIndexInfos []*IndexInfo
+			if instantiatedBaseType != c.anyType {
+				inheritedIndexInfos = c.getIndexInfosOfType(instantiatedBaseType)
+			} else {
+				inheritedIndexInfos = []*IndexInfo{c.anyBaseTypeIndexInfo}
+			}
+			indexInfos = core.Concatenate(indexInfos, core.Filter(inheritedIndexInfos, func(info *IndexInfo) bool {
+				return findIndexInfo(indexInfos, info.keyType) == nil
+			}))
+		}
+	}
+	lm.baseTypes = baseTypes
+	lm.ready = true
+	c.setStructuredTypeSignatures(t.AsStructuredType(), callSignatures, constructSignatures, indexInfos)
+	if t.objectFlags&ObjectFlagsMembersResolved != 0 {
+		c.resolveLazyMembers(t, lm)
+	}
+}
+
+func (c *Checker) resolveLazyMembers(t *Type, lm *lazyMemberTable) {
+	source := t.Target()
+	resolved := c.resolveDeclaredMembers(source)
+	data := t.AsStructuredType()
+	callSignatures := data.CallSignatures()
+	constructSignatures := data.ConstructSignatures()
+	indexInfos := data.getIndexInfos()
+	if len(lm.baseTypes) == 0 && resolved.declaredPropertiesClean && (t.symbol == nil || t.symbol.Flags()&ast.SymbolFlagsValueModule == 0) && len(resolved.declaredProperties) == len(resolved.declaredMembers) {
+		var properties []*ast.Symbol
+		if len(resolved.declaredProperties) != 0 {
+			properties = make([]*ast.Symbol, len(resolved.declaredProperties))
+			for i, symbol := range resolved.declaredProperties {
+				properties[i] = c.getLazyDeclaredMember(lm, symbol, symbol.Name())
+			}
+		}
+		t.objectFlags |= ObjectFlagsMembersResolved
+		data.properties = properties
+		data.members = resolved.declaredMemberIndex
+		t.AsTypeReference().lazy = nil
+		c.releaseSymbolTable(lm.declared)
+		*lm = lazyMemberTable{}
+		c.freeLazyMemberTables = append(c.freeLazyMemberTables, lm)
+		return
+	}
+	var members ast.SymbolTable
+	if len(resolved.declaredMembers) != 0 {
+		members = c.acquireSymbolTable()
+		for id, symbol := range resolved.declaredMembers {
+			if c.isNamedMember(symbol, id) {
+				members[id] = c.getLazyDeclaredMember(lm, symbol, id)
+			}
+		}
+	}
+	for _, baseType := range lm.baseTypes {
+		members = c.addInheritedMembers(members, c.getPropertiesOfType(baseType))
+	}
+	c.setStructuredTypeMembers(t, members, callSignatures, constructSignatures, indexInfos)
+	t.AsTypeReference().lazy = nil
+	c.releaseSymbolTableIfUnused(t, members)
+	c.releaseSymbolTable(lm.declared)
+	*lm = lazyMemberTable{}
+	c.freeLazyMemberTables = append(c.freeLazyMemberTables, lm)
+}
+
+func (c *Checker) getLazyDeclaredMember(lm *lazyMemberTable, symbol *ast.Symbol, name string) *ast.Symbol {
+	if existing := lm.declared[name]; existing != nil {
+		return existing
+	}
+	result := c.instantiateSymbol(symbol, lm.mapper)
+	if lm.declared == nil {
+		lm.declared = c.acquireSymbolTable()
+	}
+	lm.declared[name] = result
+	return result
+}
+
+func (c *Checker) getMemberOfStructuredType(t *Type, name string) *ast.Symbol {
+	return c.getMemberOfStructuredTypeEx(t, name, true /*instantiate*/)
+}
+
+func (c *Checker) getMemberOfStructuredTypeEx(t *Type, name string, instantiate bool) *ast.Symbol {
+	if t.objectFlags&ObjectFlagsMembersResolved != 0 {
+		return t.AsStructuredType().getMember(name)
+	}
+	if t.objectFlags&ObjectFlagsMapped != 0 && !isReservedMemberName(name) {
+		if lazy := c.getLazyMappedTable(t); lazy != nil {
+			if member, ok := c.getLazyMappedTypeMember(t, lazy, name); ok {
+				return member
+			}
+		}
+	}
+	lm := c.getReadyLazyMemberTable(t)
+	if lm == nil || isReservedMemberName(name) {
+		return c.resolveStructuredTypeMembers(t).getMember(name)
+	}
+	var result *ast.Symbol
+	resolved := c.resolveDeclaredMembers(t.Target())
+	if decl := resolved.declaredMembers[name]; decl != nil && c.isNamedMember(decl, name) {
+		if instantiate {
+			result = c.getLazyDeclaredMember(lm, decl, name)
+		} else if existing := lm.declared[name]; existing != nil {
+			result = existing
+		} else {
+			result = decl
+		}
+	}
+	for _, baseType := range lm.baseTypes {
+		if result != nil && result.Flags()&ast.SymbolFlagsValue != 0 {
+			break
+		}
+		if prop := c.getPropertyOfTypeWorker(baseType, name, true /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/, instantiate); prop != nil {
+			if !isStaticPrivateIdentifierProperty(prop) {
+				result = prop
+			}
+		}
+	}
+	return result
+}
+
+func (c *Checker) everyPropertyOfStructuredType(t *Type, f func(*ast.Symbol) bool) bool {
+	if lm := c.getReadyLazyMemberTable(t); lm != nil {
+		seen := c.getTemporaryNameSet()
+		defer c.releaseTemporaryNameSet(seen)
+		return c.everyLazyProperty(t, lm, seen, f)
+	}
+	for _, p := range c.resolveStructuredTypeMembers(t).properties {
+		if !f(p) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Checker) hasPropertiesOfStructuredType(t *Type) bool {
+	return !c.everyPropertyOfStructuredType(t, func(*ast.Symbol) bool { return false })
+}
+
+func (c *Checker) everyLazyProperty(t *Type, lm *lazyMemberTable, seen map[string]struct{}, f func(*ast.Symbol) bool) bool {
+	resolved := c.resolveDeclaredMembers(t.Target())
+	if resolved.declaredPropertiesClean {
+		for _, symbol := range resolved.declaredProperties {
+			name := symbol.Name()
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				if !f(symbol) {
+					return false
+				}
+			}
+		}
+	} else {
+		for id, symbol := range resolved.declaredMembers {
+			if c.isNamedMember(symbol, id) {
+				if _, ok := seen[id]; !ok {
+					seen[id] = struct{}{}
+					if !f(symbol) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	for _, baseType := range lm.baseTypes {
+		reduced := c.getReducedApparentType(baseType)
+		if baseLm := c.getReadyLazyMemberTable(reduced); baseLm != nil {
+			if !c.everyLazyProperty(reduced, baseLm, seen, f) {
+				return false
+			}
+			continue
+		}
+		for _, prop := range c.getPropertiesOfType(baseType) {
+			if !isStaticPrivateIdentifierProperty(prop) {
+				name := prop.Name()
+				if _, ok := seen[name]; !ok {
+					seen[name] = struct{}{}
+					if !f(prop) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// Same as getPropertiesOfType, except that for a type with a lazy member table, declared members stand
+// in for instantiations the table hasn't created yet. They have the same names, flags and declarations,
+// so the order is the same. The second result is the type with the table (the reduced apparent type of t), or
+// nil if there is none. Mirrors resolveLazyMembers.
+func (c *Checker) getPropertiesOfTypeLazily(t *Type) (properties []*ast.Symbol, lazyType *Type) {
+	t = c.getReducedApparentType(t)
+	if t.flags&TypeFlagsUnionOrIntersection != 0 {
+		return c.getPropertiesOfUnionOrIntersectionType(t), nil
+	}
+	lm := c.getReadyLazyMemberTable(t)
+	if lm == nil {
+		return c.getPropertiesOfObjectType(t), nil
+	}
+	if lm.orderedProperties == nil {
+		var members ast.SymbolTable
+		if declaredMembers := c.resolveDeclaredMembers(t.Target()).declaredMembers; len(declaredMembers) != 0 {
+			members = c.acquireSymbolTable()
+			for id, symbol := range declaredMembers {
+				if c.isNamedMember(symbol, id) {
+					members[id] = core.OrElse(lm.declared[id], symbol)
+				}
+			}
+		}
+		for _, baseType := range lm.baseTypes {
+			baseProperties, _ := c.getPropertiesOfTypeLazily(baseType)
+			members = c.addInheritedMembers(members, baseProperties)
+		}
+		lm.orderedProperties = c.getNamedMembers(members, t.symbol)
+		c.releaseSymbolTable(members)
+	}
+	return lm.orderedProperties, t
+}
+
 func (c *Checker) resolveTypeReferenceMembers(t *Type) {
+	if r := t.AsTypeReference(); r.lazy != nil && r.lazy.ready {
+		c.resolveLazyMembers(t, r.lazy)
+		return
+	}
 	source := t.Target()
 	typeParameters := source.AsInterfaceType().allTypeParameters
 	typeArguments := c.getTypeArguments(t)
@@ -19545,12 +20315,22 @@ func (c *Checker) resolveTypeReferenceMembers(t *Type) {
 func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters []*Type, typeArguments []*Type) {
 	var mapper *TypeMapper
 	var members ast.SymbolTable
+	var properties []*ast.Symbol
 	var callSignatures []*Signature
 	var constructSignatures []*Signature
 	var indexInfos []*IndexInfo
 	var instantiated bool
 	resolved := c.resolveDeclaredMembers(source)
+	baseTypes := c.getBaseTypes(source)
 	if slices.Equal(typeParameters, typeArguments) {
+		if len(baseTypes) == 0 && resolved.declaredPropertiesClean && len(resolved.declaredProperties) == len(resolved.declaredMembers) && (t.symbol == nil || t.symbol.Flags()&ast.SymbolFlagsValueModule == 0) {
+			t.objectFlags |= ObjectFlagsMembersResolved
+			data := t.AsStructuredType()
+			data.properties = resolved.declaredProperties
+			data.members = resolved.declaredMemberIndex
+			c.setStructuredTypeSignatures(data, resolved.declaredCallSignatures, resolved.declaredConstructSignatures, resolved.declaredIndexInfos)
+			return
+		}
 		members = resolved.declaredMembers
 		callSignatures = resolved.declaredCallSignatures
 		constructSignatures = resolved.declaredConstructSignatures
@@ -19558,15 +20338,40 @@ func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters
 	} else {
 		instantiated = true
 		mapper = newTypeMapper(typeParameters, typeArguments)
-		members = c.instantiateSymbolTable(resolved.declaredMembers, mapper)
 		callSignatures = c.instantiateSignatures(resolved.declaredCallSignatures, mapper)
 		constructSignatures = c.instantiateSignatures(resolved.declaredConstructSignatures, mapper)
 		indexInfos = c.instantiateIndexInfos(resolved.declaredIndexInfos, mapper)
+		if len(baseTypes) == 0 && resolved.declaredPropertiesClean && len(resolved.declaredProperties) == len(resolved.declaredMembers) && (t.symbol == nil || t.symbol.Flags()&ast.SymbolFlagsValueModule == 0) {
+			if len(resolved.declaredProperties) != 0 {
+				properties = make([]*ast.Symbol, len(resolved.declaredProperties))
+				for i, symbol := range resolved.declaredProperties {
+					properties[i] = c.instantiateSymbol(symbol, mapper)
+				}
+			}
+			t.objectFlags |= ObjectFlagsMembersResolved
+			data := t.AsStructuredType()
+			data.properties = properties
+			data.members = resolved.declaredMemberIndex
+			c.setStructuredTypeSignatures(data, callSignatures, constructSignatures, indexInfos)
+			return
+		}
+		if len(baseTypes) == 0 && resolved.declaredPropertiesClean {
+			properties = make([]*ast.Symbol, len(resolved.declaredProperties))
+			for i, symbol := range resolved.declaredProperties {
+				properties[i] = c.instantiateSymbol(symbol, mapper)
+			}
+		} else {
+			members = c.instantiateSymbolTable(resolved.declaredMembers, mapper)
+		}
 	}
-	baseTypes := c.getBaseTypes(source)
 	if len(baseTypes) != 0 {
 		if !instantiated {
 			members = maps.Clone(members)
+		} else if members == nil {
+			members = make(ast.SymbolTable, len(properties))
+			for _, symbol := range properties {
+				members[symbol.Name()] = symbol
+			}
 		}
 		thisArgument := core.LastOrNil(typeArguments)
 		for _, baseType := range baseTypes {
@@ -19589,6 +20394,11 @@ func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters
 		}
 	}
 	c.setStructuredTypeMembers(t, members, callSignatures, constructSignatures, indexInfos)
+	if instantiated && len(baseTypes) == 0 && members == nil {
+		data := t.AsStructuredType()
+		data.properties = properties
+		data.members = c.newPropertyIndex(properties, nil)
+	}
 }
 
 func findIndexInfo(indexInfos []*IndexInfo, keyType *Type) *IndexInfo {
@@ -19634,6 +20444,16 @@ func (c *Checker) getBaseTypes(t *Type) []*Type {
 		// members partially resolved. Here we ensure any such partial resolution is reset.
 		// See https://github.com/microsoft/TypeScript/issues/16861 for an example.
 		t.objectFlags &^= ObjectFlagsMembersResolved
+		data.lazy = nil
+		for _, inst := range data.instantiations {
+			if inst != t && inst.AsTypeReference().lazy != nil {
+				inst.objectFlags &^= ObjectFlagsMembersResolved
+				inst.AsTypeReference().lazy = nil
+			}
+		}
+		if t == c.globalObjectType {
+			c.globalObjectFilterReady = false
+		}
 		data.baseTypesResolved = true
 	}
 	return data.resolvedBaseTypes
@@ -19788,13 +20608,14 @@ func (c *Checker) getSingleCallOrConstructSignature(t *Type) *Signature {
 
 func (c *Checker) getSingleSignature(t *Type, kind SignatureKind, allowMembers bool) *Signature {
 	if t.flags&TypeFlagsObject != 0 {
-		resolved := c.resolveStructuredTypeMembers(t)
-		if allowMembers || len(resolved.properties) == 0 && len(resolved.getIndexInfos()) == 0 {
-			if kind == SignatureKindCall && len(resolved.CallSignatures()) == 1 && len(resolved.ConstructSignatures()) == 0 {
-				return resolved.CallSignatures()[0]
+		if allowMembers || !c.hasPropertiesOfStructuredType(t) && len(c.getIndexInfosOfStructuredType(t)) == 0 {
+			callSignatures := c.getSignaturesOfStructuredType(t, SignatureKindCall)
+			constructSignatures := c.getSignaturesOfStructuredType(t, SignatureKindConstruct)
+			if kind == SignatureKindCall && len(callSignatures) == 1 && len(constructSignatures) == 0 {
+				return callSignatures[0]
 			}
-			if kind == SignatureKindConstruct && len(resolved.ConstructSignatures()) == 1 && len(resolved.CallSignatures()) == 0 {
-				return resolved.ConstructSignatures()[0]
+			if kind == SignatureKindConstruct && len(constructSignatures) == 1 && len(callSignatures) == 0 {
+				return constructSignatures[0]
 			}
 		}
 	}
@@ -20036,7 +20857,7 @@ func (c *Checker) addInheritedMembers(symbols ast.SymbolTable, baseSymbols []*as
 		if !isStaticPrivateIdentifierProperty(base) {
 			if s, ok := symbols[base.Name()]; !ok || s.Flags()&ast.SymbolFlagsValue == 0 {
 				if symbols == nil {
-					symbols = make(ast.SymbolTable)
+					symbols = c.acquireSymbolTable()
 				}
 				symbols[base.Name()] = base
 			}
@@ -20054,6 +20875,13 @@ func (c *Checker) resolveDeclaredMembers(t *Type) *InterfaceType {
 		d.declaredCallSignatures = c.getSignaturesOfSymbol(d.declaredMembers[ast.InternalSymbolNameCall])
 		d.declaredConstructSignatures = c.getSignaturesOfSymbol(d.declaredMembers[ast.InternalSymbolNameNew])
 		d.declaredIndexInfos = c.getIndexInfosOfSymbol(t.symbol)
+		if symbolTableKeysMatchNames(members) {
+			d.declaredProperties = c.getNamedMembers(members, t.symbol)
+			d.declaredPropertiesClean = true
+			if len(d.declaredProperties) == len(members) {
+				d.declaredMemberIndex = c.newPropertyIndex(d.declaredProperties, nil)
+			}
+		}
 	}
 	return d
 }
@@ -21087,7 +21915,26 @@ func (c *Checker) resolveAnonymousTypeMembers(t *Type) {
 	d := t.AsObjectType()
 	if d.target != nil {
 		c.setStructuredTypeMembers(t, nil, nil, nil, nil)
-		members := c.createInstantiatedSymbolTable(c.getPropertiesOfObjectType(d.target), d.mapper)
+		targetProps := c.getPropertiesOfObjectType(d.target)
+		targetMembers := d.target.AsStructuredType().members
+		if (targetMembers == nil || targetMembers.fallback == nil) && (t.symbol == nil || t.symbol.Flags()&ast.SymbolFlagsValueModule == 0) {
+			var properties []*ast.Symbol
+			if len(targetProps) != 0 {
+				properties = make([]*ast.Symbol, len(targetProps))
+				for i, symbol := range targetProps {
+					properties[i] = c.instantiateSymbol(symbol, d.mapper)
+				}
+			}
+			callSignatures := c.instantiateSignatures(c.getSignaturesOfType(d.target, SignatureKindCall), d.mapper)
+			constructSignatures := c.instantiateSignatures(c.getSignaturesOfType(d.target, SignatureKindConstruct), d.mapper)
+			indexInfos := c.instantiateIndexInfos(c.getIndexInfosOfType(d.target), d.mapper)
+			data := t.AsStructuredType()
+			data.properties = properties
+			data.members = targetMembers
+			c.setStructuredTypeSignatures(data, callSignatures, constructSignatures, indexInfos)
+			return
+		}
+		members := c.createInstantiatedSymbolTable(targetProps, d.mapper)
 		callSignatures := c.instantiateSignatures(c.getSignaturesOfType(d.target, SignatureKindCall), d.mapper)
 		constructSignatures := c.instantiateSignatures(c.getSignaturesOfType(d.target, SignatureKindConstruct), d.mapper)
 		indexInfos := c.instantiateIndexInfos(c.getIndexInfosOfType(d.target), d.mapper)
@@ -21199,27 +22046,30 @@ func (c *Checker) instantiateSymbol(symbol *ast.Symbol, m *TypeMapper) *ast.Symb
 	if symbol == nil {
 		return nil
 	}
-	links := c.valueSymbolLinks.Get(symbol)
 	if m != nil && m.MapsThisOnly() && isThisless(symbol) {
 		return symbol
 	}
-	// If the type of the symbol is already resolved, and if that type could not possibly
-	// be affected by instantiation, simply return the symbol itself.
-	if links.resolvedType != nil && !c.couldContainTypeVariables(links.resolvedType) {
-		if symbol.Flags()&ast.SymbolFlagsSetAccessor == 0 {
-			return symbol
+	links := c.valueSymbolLinks.TryGet(symbol)
+	if links != nil {
+		// If the type of the symbol is already resolved, and if that type could not possibly
+		// be affected by instantiation, simply return the symbol itself.
+		if links.resolvedType != nil && !c.couldContainTypeVariables(links.resolvedType) {
+			if symbol.Flags()&ast.SymbolFlagsSetAccessor == 0 {
+				return symbol
+			}
+			// If we're a setter, check writeType.
+			if links.getWriteType() != nil && !c.couldContainTypeVariables(links.getWriteType()) {
+				return symbol
+			}
 		}
-		// If we're a setter, check writeType.
-		if links.getWriteType() != nil && !c.couldContainTypeVariables(links.getWriteType()) {
-			return symbol
+		if symbol.CheckFlags()&ast.CheckFlagsInstantiated != 0 {
+			// If symbol being instantiated is itself a instantiation, fetch the original target and combine the
+			// type mappers. This ensures that original type identities are properly preserved and that aliases
+			// always reference a non-aliases.
+			symbol = links.target
+			m = c.combineTypeMappers(links.mapper, m)
+			links = c.valueSymbolLinks.TryGet(symbol)
 		}
-	}
-	if symbol.CheckFlags()&ast.CheckFlagsInstantiated != 0 {
-		// If symbol being instantiated is itself a instantiation, fetch the original target and combine the
-		// type mappers. This ensures that original type identities are properly preserved and that aliases
-		// always reference a non-aliases.
-		symbol = links.target
-		m = c.combineTypeMappers(links.mapper, m)
 	}
 	// Create a new transient symbol that shares the underlying data with the original symbol.
 	result := c.newSharedDataSymbol(symbol)
@@ -21227,7 +22077,9 @@ func (c *Checker) instantiateSymbol(symbol *ast.Symbol, m *TypeMapper) *ast.Symb
 	resultLinks := c.valueSymbolLinks.Get(result)
 	resultLinks.target = symbol
 	resultLinks.mapper = m
-	resultLinks.setNameType(c, links.getNameType())
+	if links != nil {
+		resultLinks.setNameType(c, links.getNameType())
+	}
 	return result
 }
 
@@ -21332,7 +22184,134 @@ func (c *Checker) getDefaultConstructSignatures(classType *Type) []*Signature {
 	return result
 }
 
+func (c *Checker) getLazyMappedTable(t *Type) *lazyMappedTable {
+	if t.objectFlags&(ObjectFlagsMapped|ObjectFlagsMembersResolved) != ObjectFlagsMapped {
+		return nil
+	}
+	m := t.AsMappedType()
+	if m.lazy != nil {
+		return m.lazy
+	}
+	if !c.isMappedTypeWithKeyofConstraintDeclaration(t) {
+		return nil
+	}
+	typeParameter := c.getTypeParameterFromMappedType(t)
+	c.getConstraintTypeFromMappedType(t)
+	mappedType := core.OrElse(m.target, t)
+	if c.getNameTypeFromMappedType(mappedType) != nil {
+		return nil
+	}
+	shouldLinkPropDeclarations := c.getMappedTypeNameTypeKind(mappedType) != MappedTypeNameTypeKindRemapping
+	modifiersType := c.getApparentType(c.getModifiersTypeFromMappedType(t))
+	if modifiersType.flags&TypeFlagsObject == 0 || t.objectFlags&ObjectFlagsMembersResolved != 0 {
+		return nil
+	}
+	lazy := c.lazyMappedTableArena.New()
+	lazy.typeParameter = typeParameter
+	lazy.modifiersType = modifiersType
+	lazy.templateModifiers = getMappedTypeModifiers(t)
+	lazy.shouldLinkPropDeclarations = shouldLinkPropDeclarations
+	m.lazy = lazy
+	return lazy
+}
+
+func (c *Checker) getLazyMappedTypeMember(t *Type, lazy *lazyMappedTable, name string) (*ast.Symbol, bool) {
+	if lazy.members != nil {
+		if existing, ok := lazy.members[name]; ok {
+			return existing, true
+		}
+	} else {
+		lazy.members = make(map[string]*ast.Symbol)
+	}
+	// Recursive lookups see nil, as they would while resolveMappedTypeMembers runs.
+	lazy.members[name] = nil
+	modifiersProp := c.getMemberOfStructuredType(lazy.modifiersType, name)
+	if t.objectFlags&ObjectFlagsMembersResolved != 0 {
+		return t.AsStructuredType().getMember(name), true
+	}
+	var member *ast.Symbol
+	if modifiersProp != nil && c.isNamedMember(modifiersProp, name) {
+		keyType := c.getLiteralTypeFromProperty(modifiersProp, TypeFlagsStringOrNumberLiteralOrUnique, false)
+		if !isTypeUsableAsPropertyName(keyType) || getPropertyNameFromType(keyType) != name {
+			delete(lazy.members, name)
+			return nil, false
+		}
+		member = c.newMappedTypeMember(t, lazy.modifiersType, lazy.templateModifiers, lazy.shouldLinkPropDeclarations, keyType, keyType, name)
+	}
+	lazy.members[name] = member
+	return member, true
+}
+
+func (c *Checker) getLazyMappedTypeIndexInfos(t *Type, lazy *lazyMappedTable) []*IndexInfo {
+	if !lazy.indexInfosReady {
+		if lazy.resolving {
+			return nil
+		}
+		lazy.resolving = true
+		templateType := c.getTemplateTypeFromMappedType(core.OrElse(t.AsMappedType().target, t))
+		var indexInfos []*IndexInfo
+		for _, info := range c.getIndexInfosOfType(lazy.modifiersType) {
+			indexInfos = c.appendMappedTypeIndexInfo(indexInfos, t, lazy.modifiersType, lazy.typeParameter, templateType, lazy.templateModifiers, info.keyType, info.keyType)
+		}
+		lazy.resolving = false
+		if t.objectFlags&ObjectFlagsMembersResolved != 0 {
+			return t.AsStructuredType().getIndexInfos()
+		}
+		lazy.indexInfos = indexInfos
+		lazy.indexInfosReady = true
+	}
+	return lazy.indexInfos
+}
+
+func (c *Checker) newMappedTypeMember(t *Type, modifiersType *Type, templateModifiers MappedTypeModifiers, shouldLinkPropDeclarations bool, keyType *Type, propNameType *Type, propName string) *ast.Symbol {
+	var modifiersProp *ast.Symbol
+	if isTypeUsableAsPropertyName(keyType) {
+		modifiersProp = c.getPropertyOfType(modifiersType, getPropertyNameFromType(keyType))
+	}
+	isOptional := templateModifiers&MappedTypeModifiersIncludeOptional != 0 || templateModifiers&MappedTypeModifiersExcludeOptional == 0 && modifiersProp != nil && modifiersProp.Flags()&ast.SymbolFlagsOptional != 0
+	isReadonly := templateModifiers&MappedTypeModifiersIncludeReadonly != 0 || templateModifiers&MappedTypeModifiersExcludeReadonly == 0 && modifiersProp != nil && c.isReadonlySymbol(modifiersProp)
+	stripOptional := c.strictNullChecks && !isOptional && modifiersProp != nil && modifiersProp.Flags()&ast.SymbolFlagsOptional != 0
+	var lateFlag ast.CheckFlags
+	if modifiersProp != nil {
+		lateFlag = modifiersProp.CheckFlags() & ast.CheckFlagsLate
+	}
+	prop := c.newSymbol(ast.SymbolFlagsProperty|core.IfElse(isOptional, ast.SymbolFlagsOptional, 0), propName)
+	prop.SetCheckFlags(lateFlag | ast.CheckFlagsMapped | core.IfElse(isReadonly, ast.CheckFlagsReadonly, 0) | core.IfElse(stripOptional, ast.CheckFlagsStripOptional, 0))
+	valueLinks := c.valueSymbolLinks.Get(prop)
+	valueLinks.setContainingType(c, t)
+	valueLinks.setNameType(c, propNameType)
+	mappedLinks := c.mappedSymbolLinks.Get(prop)
+	mappedLinks.keyType = keyType
+	if modifiersProp != nil {
+		mappedLinks.syntheticOrigin = modifiersProp
+		if shouldLinkPropDeclarations {
+			prop.SetDeclarations(modifiersProp.Declarations())
+		}
+	}
+	return prop
+}
+
+func (c *Checker) appendMappedTypeIndexInfo(indexInfos []*IndexInfo, t *Type, modifiersType *Type, typeParameter *Type, templateType *Type, templateModifiers MappedTypeModifiers, keyType *Type, propNameType *Type) []*IndexInfo {
+	if c.isValidIndexKeyType(propNameType) || propNameType.flags&(TypeFlagsAny|TypeFlagsEnum) != 0 {
+		indexKeyType := propNameType
+		switch {
+		case propNameType.flags&(TypeFlagsAny|TypeFlagsString) != 0:
+			indexKeyType = c.stringType
+		case propNameType.flags&(TypeFlagsNumber|TypeFlagsEnum) != 0:
+			indexKeyType = c.numberType
+		}
+		propType := c.instantiateType(templateType, appendTypeMapping(t.AsMappedType().mapper, typeParameter, keyType))
+		modifiersIndexInfo := c.getApplicableIndexInfo(modifiersType, propNameType)
+		isReadonly := templateModifiers&MappedTypeModifiersIncludeReadonly != 0 || templateModifiers&MappedTypeModifiersExcludeReadonly == 0 && modifiersIndexInfo != nil && modifiersIndexInfo.isReadonly
+		indexInfo := c.newIndexInfo(indexKeyType, propType, isReadonly, nil, nil)
+		indexInfos = c.appendIndexInfo(indexInfos, indexInfo, true /*union*/)
+	}
+	return indexInfos
+}
+
 func (c *Checker) resolveMappedTypeMembers(t *Type) {
+	lazy := t.AsMappedType().lazy
+	t.AsMappedType().lazy = nil
 	members := make(ast.SymbolTable)
 	var indexInfos []*IndexInfo
 	// Resolve upfront such that recursive references see an empty object type.
@@ -21345,8 +22324,7 @@ func (c *Checker) resolveMappedTypeMembers(t *Type) {
 	nameType := c.getNameTypeFromMappedType(mappedType)
 	shouldLinkPropDeclarations := c.getMappedTypeNameTypeKind(mappedType) != MappedTypeNameTypeKindRemapping
 	templateType := c.getTemplateTypeFromMappedType(mappedType)
-	modifiersType := c.getApparentType(c.getModifiersTypeFromMappedType(t))
-	// The 'T' in 'keyof T'
+	modifiersType := c.getApparentType(c.getModifiersTypeFromMappedType(t)) // The 'T' in 'keyof T'
 	templateModifiers := getMappedTypeModifiers(t)
 	include := TypeFlagsStringOrNumberLiteralOrUnique
 	addMemberForKeyTypeWorker := func(keyType *Type, propNameType *Type) {
@@ -21362,46 +22340,13 @@ func (c *Checker) resolveMappedTypeMembers(t *Type) {
 				valueLinks.setNameType(c, c.getUnionType([]*Type{valueLinks.getNameType(), propNameType}))
 				mappedLinks := c.mappedSymbolLinks.Get(existingProp)
 				mappedLinks.keyType = c.getUnionType([]*Type{mappedLinks.keyType, keyType})
+			} else if lazy != nil && lazy.members != nil && lazy.members[propName] != nil {
+				members[propName] = lazy.members[propName]
 			} else {
-				var modifiersProp *ast.Symbol
-				if isTypeUsableAsPropertyName(keyType) {
-					modifiersProp = c.getPropertyOfType(modifiersType, getPropertyNameFromType(keyType))
-				}
-				isOptional := templateModifiers&MappedTypeModifiersIncludeOptional != 0 || templateModifiers&MappedTypeModifiersExcludeOptional == 0 && modifiersProp != nil && modifiersProp.Flags()&ast.SymbolFlagsOptional != 0
-				isReadonly := templateModifiers&MappedTypeModifiersIncludeReadonly != 0 || templateModifiers&MappedTypeModifiersExcludeReadonly == 0 && modifiersProp != nil && c.isReadonlySymbol(modifiersProp)
-				stripOptional := c.strictNullChecks && !isOptional && modifiersProp != nil && modifiersProp.Flags()&ast.SymbolFlagsOptional != 0
-				var lateFlag ast.CheckFlags
-				if modifiersProp != nil {
-					lateFlag = modifiersProp.CheckFlags() & ast.CheckFlagsLate
-				}
-				prop := c.newSymbol(ast.SymbolFlagsProperty|core.IfElse(isOptional, ast.SymbolFlagsOptional, 0), propName)
-				prop.SetCheckFlags(lateFlag | ast.CheckFlagsMapped | core.IfElse(isReadonly, ast.CheckFlagsReadonly, 0) | core.IfElse(stripOptional, ast.CheckFlagsStripOptional, 0))
-				valueLinks := c.valueSymbolLinks.Get(prop)
-				valueLinks.setContainingType(c, t)
-				valueLinks.setNameType(c, propNameType)
-				mappedLinks := c.mappedSymbolLinks.Get(prop)
-				mappedLinks.keyType = keyType
-				if modifiersProp != nil {
-					mappedLinks.syntheticOrigin = modifiersProp
-					if shouldLinkPropDeclarations {
-						prop.SetDeclarations(modifiersProp.Declarations())
-					}
-				}
-				members[propName] = prop
+				members[propName] = c.newMappedTypeMember(t, modifiersType, templateModifiers, shouldLinkPropDeclarations, keyType, propNameType, propName)
 			}
-		} else if c.isValidIndexKeyType(propNameType) || propNameType.flags&(TypeFlagsAny|TypeFlagsEnum) != 0 {
-			indexKeyType := propNameType
-			switch {
-			case propNameType.flags&(TypeFlagsAny|TypeFlagsString) != 0:
-				indexKeyType = c.stringType
-			case propNameType.flags&(TypeFlagsNumber|TypeFlagsEnum) != 0:
-				indexKeyType = c.numberType
-			}
-			propType := c.instantiateType(templateType, appendTypeMapping(t.AsMappedType().mapper, typeParameter, keyType))
-			modifiersIndexInfo := c.getApplicableIndexInfo(modifiersType, propNameType)
-			isReadonly := templateModifiers&MappedTypeModifiersIncludeReadonly != 0 || templateModifiers&MappedTypeModifiersExcludeReadonly == 0 && modifiersIndexInfo != nil && modifiersIndexInfo.isReadonly
-			indexInfo := c.newIndexInfo(indexKeyType, propType, isReadonly, nil, nil)
-			indexInfos = c.appendIndexInfo(indexInfos, indexInfo, true /*union*/)
+		} else if lazy == nil || !lazy.indexInfosReady {
+			indexInfos = c.appendMappedTypeIndexInfo(indexInfos, t, modifiersType, typeParameter, templateType, templateModifiers, keyType, propNameType)
 		}
 	}
 	addMemberForKeyType := func(keyType *Type) {
@@ -21418,6 +22363,9 @@ func (c *Checker) resolveMappedTypeMembers(t *Type) {
 		c.forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType(modifiersType, include, false /*stringsOnly*/, addMemberForKeyType)
 	} else {
 		forEachType(c.getLowerBoundOfKeyType(constraintType), addMemberForKeyType)
+	}
+	if lazy != nil && lazy.indexInfosReady {
+		indexInfos = lazy.indexInfos
 	}
 	c.setStructuredTypeMembers(t, members, nil, nil, indexInfos)
 }
@@ -21843,8 +22791,7 @@ func (c *Checker) includeMixinType(t *Type, types []*Type, mixinFlags []bool, in
  */
 func (c *Checker) getPropertyOfObjectType(t *Type, name string) *ast.Symbol {
 	if t.flags&TypeFlagsObject != 0 {
-		resolved := c.resolveStructuredTypeMembers(t)
-		symbol := resolved.members[name]
+		symbol := c.getMemberOfStructuredType(t, name)
 		if symbol != nil && c.symbolIsValue(symbol) {
 			return symbol
 		}
@@ -21867,38 +22814,94 @@ func (c *Checker) getPropertyOfUnionOrIntersectionType(t *Type, name string, ski
 // these partial properties when identifying discriminant properties, but otherwise they are filtered out
 // and do not appear to be present in the union type.
 func (c *Checker) getUnionOrIntersectionProperty(t *Type, name string, skipObjectFunctionPropertyAugment bool) *ast.Symbol {
-	var cache ast.SymbolTable
+	data := t.AsUnionOrIntersectionType()
 	if skipObjectFunctionPropertyAugment {
-		cache = ast.GetSymbolTable(&t.AsUnionOrIntersectionType().propertyCacheWithoutFunctionPropertyAugment)
+		if prop := data.propertyCacheWithoutFunctionPropertyAugment[name]; prop != nil {
+			return prop
+		}
 	} else {
-		cache = ast.GetSymbolTable(&t.AsUnionOrIntersectionType().propertyCache)
-	}
-	if prop := cache[name]; prop != nil {
-		return prop
+		if data.propertyCache != nil {
+			if prop := data.propertyCache[name]; prop != nil {
+				return prop
+			}
+		}
+		// Complete non-augmented properties are also valid for augmented
+		// lookup. Share the entry instead of retaining it in both tables.
+		if prop := data.propertyCacheWithoutFunctionPropertyAugment[name]; prop != nil && prop.CheckFlags()&ast.CheckFlagsPartial == 0 {
+			return prop
+		}
 	}
 	prop := c.createUnionOrIntersectionProperty(t, name, skipObjectFunctionPropertyAugment)
 	if prop != nil {
-		cache[name] = prop
-		// Propagate an entry from the non-augmented cache to the augmented cache unless the property is partial.
-		if skipObjectFunctionPropertyAugment && prop.CheckFlags()&ast.CheckFlagsPartial == 0 {
-			augmentedCache := ast.GetSymbolTable(&t.AsUnionOrIntersectionType().propertyCache)
-			if augmentedCache[name] == nil {
-				augmentedCache[name] = prop
+		if skipObjectFunctionPropertyAugment {
+			ast.GetSymbolTable(&data.propertyCacheWithoutFunctionPropertyAugment)[name] = prop
+			if prop.CheckFlags()&ast.CheckFlagsPartial == 0 && data.propertyCache[name] == prop {
+				delete(data.propertyCache, name)
+				if len(data.propertyCache) == 0 {
+					data.propertyCache = nil
+				}
 			}
+		} else {
+			ast.GetSymbolTable(&data.propertyCache)[name] = prop
 		}
 	}
 	return prop
 }
 
-func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name string, skipObjectFunctionPropertyAugment bool) *ast.Symbol {
+// unionOrIntersectionPropertySources describes the constituent properties from
+// which a union or intersection property would be synthesized.
+type unionOrIntersectionPropertySources struct {
+	singleProp *ast.Symbol
+	// props holds distinct constituent properties in first-seen order, or is
+	// empty when every constituent shares singleProp. propsByKey indexes it
+	// only once it is large enough for hashing to beat a linear scan.
+	props                []*ast.Symbol
+	propsByKey           map[*ast.Symbol]struct{}
+	indexTypes           []*Type
+	propFlags            ast.SymbolFlags
+	optionalFlag         ast.SymbolFlags
+	checkFlags           ast.CheckFlags
+	syntheticFlag        ast.CheckFlags
+	mergedInstantiations bool
+}
+
+// isSynthetic reports whether the sources require a new synthetic symbol rather
+// than reusing (or cloning) singleProp.
+func (s *unionOrIntersectionPropertySources) isSynthetic() bool {
+	return len(s.props) != 0 || s.checkFlags&ast.CheckFlagsReadPartial != 0 || len(s.indexTypes) != 0
+}
+
+// addProp adds prop to props if it is not already present, preserving
+// first-insertion order.
+func (s *unionOrIntersectionPropertySources) addProp(prop *ast.Symbol) {
+	if s.propsByKey == nil {
+		if slices.Contains(s.props, prop) {
+			return
+		}
+		s.props = append(s.props, prop)
+		if len(s.props) > orderedSetMapThreshold {
+			s.propsByKey = make(map[*ast.Symbol]struct{}, len(s.props))
+			for _, p := range s.props {
+				s.propsByKey[p] = struct{}{}
+			}
+		}
+		return
+	}
+	if _, ok := s.propsByKey[prop]; ok {
+		return
+	}
+	s.props = append(s.props, prop)
+	s.propsByKey[prop] = struct{}{}
+}
+
+func (c *Checker) getUnionOrIntersectionPropertySources(containingType *Type, name string, skipObjectFunctionPropertyAugment bool, sources *unionOrIntersectionPropertySources) bool {
 	propFlags := ast.SymbolFlagsNone
-	var singleProp *ast.Symbol
-	var propSet collections.OrderedSet[*ast.Symbol]
-	var indexTypes []*Type
 	isUnion := containingType.flags&TypeFlagsUnion != 0
 	// Flags we want to propagate to the result if they exist in all source symbols
 	var checkFlags ast.CheckFlags
 	var optionalFlag ast.SymbolFlags
+	var singleProp *ast.Symbol
+	var indexTypes []*Type
 	if !isUnion {
 		checkFlags = ast.CheckFlagsReadonly
 		optionalFlag = ast.SymbolFlagsOptional
@@ -21912,7 +22915,10 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 			var modifiers ast.ModifierFlags
 			if prop != nil {
 				modifiers = getDeclarationModifierFlagsFromSymbol(prop)
-				writeModifiers := getDeclarationModifierFlagsFromSymbolEx(prop, true /*isWrite*/)
+				writeModifiers := modifiers
+				if prop.Flags()&ast.SymbolFlagsSetAccessor != 0 || prop.CheckFlags()&ast.CheckFlagsSynthetic != 0 {
+					writeModifiers = getDeclarationModifierFlagsFromSymbolEx(prop, true /*isWrite*/)
+				}
 				if prop.Flags()&ast.SymbolFlagsClassMember != 0 {
 					if isUnion {
 						optionalFlag |= prop.Flags() & ast.SymbolFlagsOptional
@@ -21934,10 +22940,10 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 						// back and not `Array<string>.length` when we're looking at a `.length` access on a `string[] | number[]`
 						mergedInstantiations = singleProp.Parent() != nil && len(c.getLocalTypeParametersOfClassOrInterfaceOrTypeAlias(singleProp.Parent())) != 0
 					} else {
-						if propSet.Size() == 0 {
-							propSet.Add(singleProp)
+						if len(sources.props) == 0 {
+							sources.addProp(singleProp)
 						}
-						propSet.Add(prop)
+						sources.addProp(prop)
 					}
 					// classes created by mixins are represented as intersections
 					// and overriding a property in a derived class redefines it completely at runtime
@@ -22000,17 +23006,17 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 	}
 	if singleProp == nil {
 		// No property was found
-		return nil
+		return false
 	}
 	if isUnion &&
-		(propSet.Size() != 0 || checkFlags&ast.CheckFlagsPartial != 0) &&
+		(len(sources.props) != 0 || checkFlags&ast.CheckFlagsPartial != 0) &&
 		checkFlags&(ast.CheckFlagsContainsPrivate|ast.CheckFlagsContainsProtected|ast.CheckFlagsContainsWritePrivate|ast.CheckFlagsContainsWriteProtected) != 0 &&
-		!(propSet.Size() != 0 && c.hasCommonDeclaration(&propSet)) {
+		!(len(sources.props) != 0 && c.hasCommonDeclaration(sources.props)) {
 		// A property in a union has a private or protected declaration in one constituent, but is missing
 		// or has a different declaration in another constituent. If the private or protected declaration is
 		// for reading, we don't create a property.
 		if checkFlags&(ast.CheckFlagsContainsPrivate|ast.CheckFlagsContainsProtected) != 0 {
-			return nil
+			return false
 		}
 		// Otherwise, if the private or protected declaration is for writing, reduce accessibility to that of
 		// the most restricted constituent.
@@ -22020,8 +23026,30 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 			checkFlags &^= ast.CheckFlagsContainsWritePublic
 		}
 	}
-	if propSet.Size() == 0 && checkFlags&ast.CheckFlagsReadPartial == 0 && len(indexTypes) == 0 {
-		if !mergedInstantiations {
+	sources.singleProp = singleProp
+	sources.indexTypes = indexTypes
+	sources.propFlags = propFlags
+	sources.optionalFlag = optionalFlag
+	sources.checkFlags = checkFlags
+	sources.syntheticFlag = syntheticFlag
+	sources.mergedInstantiations = mergedInstantiations
+	return true
+}
+
+func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name string, skipObjectFunctionPropertyAugment bool) *ast.Symbol {
+	var sources unionOrIntersectionPropertySources
+	if !c.getUnionOrIntersectionPropertySources(containingType, name, skipObjectFunctionPropertyAugment, &sources) {
+		return nil
+	}
+	singleProp := sources.singleProp
+	indexTypes := sources.indexTypes
+	propFlags := sources.propFlags
+	optionalFlag := sources.optionalFlag
+	checkFlags := sources.checkFlags
+	syntheticFlag := sources.syntheticFlag
+	isUnion := containingType.flags&TypeFlagsUnion != 0
+	if !sources.isSynthetic() {
+		if !sources.mergedInstantiations {
 			return singleProp
 		}
 		// No symbol from a union/intersection should have a `.parent` set (since unions/intersections don't act as symbol parents)
@@ -22044,8 +23072,8 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 		links.setWriteType(c, c.getWriteTypeOfSymbol(singleProp))
 		return clone
 	}
-	if propSet.Size() == 0 {
-		propSet.Add(singleProp)
+	if len(sources.props) == 0 {
+		sources.props = []*ast.Symbol{singleProp}
 	}
 	var declarations []*ast.Node
 	var firstType *Type
@@ -22054,7 +23082,7 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 	var writeTypes []*Type
 	var firstValueDeclaration *ast.Node
 	var hasNonUniformValueDeclaration bool
-	for prop := range propSet.Values() {
+	for _, prop := range sources.props {
 		if firstValueDeclaration == nil {
 			firstValueDeclaration = prop.ValueDeclaration()
 		} else if prop.ValueDeclaration() != nil && prop.ValueDeclaration() != firstValueDeclaration {
@@ -22066,7 +23094,7 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 		t := c.getTypeOfSymbol(prop)
 		if firstType == nil {
 			firstType = t
-			nameType = c.valueSymbolLinks.Get(prop).getNameType()
+			nameType = c.valueSymbolLinks.TryGet(prop).getNameType()
 		}
 		writeType := c.getWriteTypeOfSymbol(prop)
 		if writeTypes != nil || writeType != t {
@@ -22125,7 +23153,10 @@ func (c *Checker) getTargetSymbol(s *ast.Symbol) *ast.Symbol {
 	// if symbol is instantiated its flags are not copied from the 'target'
 	// so we'll need to get back original 'target' symbol to work with correct set of flags
 	if s != nil && s.CheckFlags()&ast.CheckFlagsInstantiated != 0 {
-		return c.valueSymbolLinks.Get(s).target
+		if links := c.valueSymbolLinks.TryGet(s); links != nil {
+			return links.target
+		}
+		return nil
 	}
 	return s
 }
@@ -22138,9 +23169,9 @@ func isPrototypeProperty(symbol *ast.Symbol) bool {
 	return symbol.Flags()&ast.SymbolFlagsMethod != 0 || symbol.CheckFlags()&ast.CheckFlagsSyntheticMethod != 0
 }
 
-func (c *Checker) hasCommonDeclaration(symbols *collections.OrderedSet[*ast.Symbol]) bool {
+func (c *Checker) hasCommonDeclaration(symbols []*ast.Symbol) bool {
 	var commonDeclarations collections.Set[*ast.Node]
-	for symbol := range symbols.Values() {
+	for _, symbol := range symbols {
 		if len(symbol.Declarations()) == 0 {
 			return false
 		}
@@ -22170,7 +23201,7 @@ func (c *Checker) createSymbolWithType(source *ast.Symbol, t *Type) *ast.Symbol 
 	links := c.valueSymbolLinks.Get(symbol)
 	links.resolvedType = t
 	links.target = source
-	links.setNameType(c, c.valueSymbolLinks.Get(source).getNameType())
+	links.setNameType(c, c.valueSymbolLinks.TryGet(source).getNameType())
 	return symbol
 }
 
@@ -22319,23 +23350,101 @@ func (c *Checker) isMappingOfSameObjectType(types []*Type) bool {
 
 func (c *Checker) somePropertyReducesToNever(t *Type) bool {
 	// Collect declaration counts for each property across all constituent types of the intersection.
+	// A name that occurs in more than one constituent occurs in one other than skipped, so skipped
+	// only needs its members looked up, which may not resolve them.
+	types := t.Types()
+	skipped := -1
+	for i, ct := range types {
+		if ct.objectFlags&(ObjectFlagsMapped|ObjectFlagsMembersResolved) == ObjectFlagsMapped || mayHaveLazyMembers(ct) && ct.flags&TypeFlagsObject != 0 {
+			skipped = i
+			break
+		}
+	}
 	counts := c.getTemporaryPropertyCounts()
 	defer c.releaseTemporaryPropertyCounts(counts)
-	for _, t := range t.Types() {
-		for _, prop := range c.getPropertiesOfType(t) {
-			counts.Set(prop.Name(), counts.GetOrZero(prop.Name())+1)
+	for i, ct := range types {
+		if i != skipped {
+			for _, prop := range c.getPropertiesOfType(ct) {
+				counts.Set(prop.Name(), counts.GetOrZero(prop.Name())+1)
+			}
+		}
+	}
+	if skipped != -1 {
+		skippedType := types[skipped]
+		for propName, count := range counts.Entries() {
+			if c.getPropertyOfTypeWorker(skippedType, propName, true /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/, false /*instantiate*/) != nil {
+				counts.Set(propName, count+1)
+			}
 		}
 	}
 	// Check if any property appears in more than one constituent type and reduces to 'never'.
 	// Go in the order the properties were found so the combined properties are created in the same order every time.
 	for propName, count := range counts.Entries() {
 		if count > 1 {
-			if prop := c.getPropertyOfUnionOrIntersectionType(t, propName, true /*skipObjectFunctionPropertyAugment*/); prop != nil && c.isNeverReducedProperty(prop) {
+			if c.intersectionPropertyReducesToNever(t, propName) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// intersectionPropertyReducesToNever reports whether the combined property named
+// name would satisfy isNeverReducedProperty, without creating and caching that
+// property. Most such properties are never otherwise looked up, so creating
+// them only to inspect their flags retains a large number of symbols.
+func (c *Checker) intersectionPropertyReducesToNever(t *Type, name string) bool {
+	if prop := t.AsUnionOrIntersectionType().propertyCacheWithoutFunctionPropertyAugment[name]; prop != nil {
+		return c.isNeverReducedProperty(prop)
+	}
+	var sources unionOrIntersectionPropertySources
+	if !c.getUnionOrIntersectionPropertySources(t, name, true /*skipObjectFunctionPropertyAugment*/, &sources) {
+		return false
+	}
+	if !sources.isSynthetic() {
+		if !sources.mergedInstantiations {
+			return c.isNeverReducedProperty(sources.singleProp)
+		}
+		prop := c.getUnionOrIntersectionProperty(t, name, true /*skipObjectFunctionPropertyAugment*/)
+		return prop != nil && c.isNeverReducedProperty(prop)
+	}
+	if len(sources.props) == 0 {
+		sources.props = []*ast.Symbol{sources.singleProp}
+	}
+	checkFlags := sources.checkFlags
+	var firstType *Type
+	var firstValueDeclaration *ast.Node
+	hasNonUniformValueDeclaration := false
+	propTypes := make([]*Type, 0, len(sources.props)+len(sources.indexTypes))
+	for _, prop := range sources.props {
+		if firstValueDeclaration == nil {
+			firstValueDeclaration = prop.ValueDeclaration()
+		} else if prop.ValueDeclaration() != nil && prop.ValueDeclaration() != firstValueDeclaration {
+			hasNonUniformValueDeclaration = true
+		}
+		propType := c.getTypeOfSymbol(prop)
+		if firstType == nil {
+			firstType = propType
+		}
+		if propType != firstType {
+			checkFlags |= ast.CheckFlagsHasNonUniformType
+		}
+		if isLiteralType(propType) || c.isPatternLiteralType(propType) {
+			checkFlags |= ast.CheckFlagsHasLiteralType
+		}
+		if propType.flags&TypeFlagsNever != 0 && propType != c.uniqueLiteralType {
+			checkFlags |= ast.CheckFlagsHasNeverType
+		}
+		propTypes = append(propTypes, propType)
+	}
+	propTypes = append(propTypes, sources.indexTypes...)
+	hasValueDeclaration := !hasNonUniformValueDeclaration && firstValueDeclaration != nil
+	if !hasValueDeclaration && checkFlags&ast.CheckFlagsContainsPrivate != 0 {
+		return true
+	}
+	return (sources.propFlags|sources.optionalFlag)&ast.SymbolFlagsOptional == 0 &&
+		checkFlags&(ast.CheckFlagsNonUniformAndLiteral|ast.CheckFlagsHasNeverType) == ast.CheckFlagsNonUniformAndLiteral &&
+		c.getIntersectionType(propTypes).flags&TypeFlagsNever != 0
 }
 
 func (c *Checker) getReducedUnionType(unionType *Type) *Type {
@@ -22598,11 +23707,20 @@ func (c *Checker) instantiateType(t *Type, m *TypeMapper) *Type {
 	return c.instantiateTypeWithAlias(t, m, nil /*alias*/)
 }
 
+func (c *Checker) anyCouldContainTypeVariables(types []*Type) bool {
+	for _, t := range types {
+		if c.couldContainTypeVariables(t) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Checker) instantiateTypeWithAlias(t *Type, m *TypeMapper, alias *TypeAlias) *Type {
 	// Check for type variables in the alias, so things like `type Brand<T> = number & {}` can potentially be copied with new alias type args, despite them being unreferenced.
 	// This is the behavior most people using aliases expect, and prevents the cache from leaking type parameters outside their scope of validity.
 	// tests/cases/compiler/declarationEmitArrowFunctionNoRenaming.ts contains an example of this, which previously only worked in strada via some input node reuse logic instead.
-	if t == nil || m == nil || !(c.couldContainTypeVariables(t) || (t.alias != nil && len(t.alias.typeArguments) > 0 && core.Some(t.alias.typeArguments, c.couldContainTypeVariables))) {
+	if t == nil || m == nil || !(c.couldContainTypeVariables(t) || (t.alias != nil && len(t.alias.typeArguments) > 0 && c.anyCouldContainTypeVariables(t.alias.typeArguments))) {
 		return t
 	}
 	if len(c.instantiationStack) == 100 || c.instantiationCount >= 5_000_000 {
@@ -22624,16 +23742,28 @@ func (c *Checker) instantiateTypeWithAlias(t *Type, m *TypeMapper, alias *TypeAl
 		return c.errorType
 	}
 	index := c.findActiveMapper(m)
+	var key CacheHashKey
+	var cache map[CacheHashKey]*Type
 	if index == -1 {
 		c.pushActiveMapper(m)
-	}
-	var b keyBuilder
-	b.writeType(t)
-	b.writeAlias(alias)
-	key := b.hash()
-	cache := c.activeTypeMappersCaches[core.IfElse(index != -1, index, len(c.activeTypeMappersCaches)-1)]
-	if cachedType, ok := cache[key]; ok {
-		return cachedType
+	} else {
+		if alias == nil {
+			key = CacheHashKey{Lo: uint64(t.id), Hi: 1}
+		} else if runtime.GOARCH == "wasm" {
+			b := acquireKeyBuilder()
+			b.writeType(t)
+			b.writeAlias(alias)
+			key = b.releaseHash()
+		} else {
+			var b keyBuilder
+			b.writeType(t)
+			b.writeAlias(alias)
+			key = b.hash()
+		}
+		cache = c.activeTypeMappersCaches[index]
+		if cachedType, ok := cache[key]; ok {
+			return cachedType
+		}
 	}
 	c.TotalInstantiationCount++
 	c.instantiationCount++
@@ -22690,12 +23820,21 @@ func (c *Checker) popActiveMapper() {
 
 	// Clear the map, but leave it in the list for later reuse.
 	lastIndex := len(c.activeTypeMappersCaches) - 1
-	clear(c.activeTypeMappersCaches[lastIndex])
+	if len(c.activeTypeMappersCaches[lastIndex]) > 64 {
+		c.activeTypeMappersCaches[lastIndex] = nil
+	} else if len(c.activeTypeMappersCaches[lastIndex]) != 0 {
+		clear(c.activeTypeMappersCaches[lastIndex])
+	}
 	c.activeTypeMappersCaches = c.activeTypeMappersCaches[:lastIndex]
 }
 
 func (c *Checker) findActiveMapper(mapper *TypeMapper) int {
-	return core.FindLastIndex(c.activeMappers, func(m *TypeMapper) bool { return m == mapper })
+	for i := len(c.activeMappers) - 1; i >= 0; i-- {
+		if c.activeMappers[i] == mapper {
+			return i
+		}
+	}
+	return -1
 }
 
 func (c *Checker) clearActiveMapperCaches() {
@@ -22774,17 +23913,23 @@ func (c *Checker) instantiateTypeWorker(t *Type, m *TypeMapper, alias *TypeAlias
 			}
 		}
 		types := source.Types()
-		newTypes := c.instantiateTypes(types, m)
-		if core.Same(newTypes, types) && alias.Symbol() == t.alias.Symbol() {
+		newTypes, changed := c.instantiateTypesTemp(types, m)
+		if !changed && alias.Symbol() == t.alias.Symbol() {
 			return t
 		}
 		if alias == nil {
 			alias = c.instantiateTypeAlias(t.alias, m)
 		}
+		var res *Type
 		if source.flags&TypeFlagsIntersection != 0 {
-			return c.getIntersectionTypeEx(newTypes, IntersectionFlagsNone, alias)
+			res = c.getIntersectionTypeEx(newTypes, IntersectionFlagsNone, alias)
+		} else {
+			res = c.getUnionTypeEx(newTypes, UnionReductionLiteral, alias, nil /*origin*/)
 		}
-		return c.getUnionTypeEx(newTypes, UnionReductionLiteral, alias, nil /*origin*/)
+		if changed {
+			c.releaseTemporaryTypeArguments(newTypes)
+		}
+		return res
 	case flags&TypeFlagsIndex != 0:
 		return c.getIndexType(c.instantiateType(t.Target(), m))
 	case flags&TypeFlagsIndexedAccess != 0:
@@ -22794,11 +23939,16 @@ func (c *Checker) instantiateTypeWorker(t *Type, m *TypeMapper, alias *TypeAlias
 		d := t.AsIndexedAccessType()
 		return c.getIndexedAccessTypeEx(c.instantiateType(d.objectType, m), c.instantiateType(d.indexType, m), d.accessFlags, nil /*accessNode*/, alias)
 	case flags&TypeFlagsTemplateLiteral != 0:
-		return c.getTemplateLiteralType(t.AsTemplateLiteralType().texts, c.instantiateTypes(t.AsTemplateLiteralType().types, m))
+		newTypes, changed := c.instantiateTypesTemp(t.AsTemplateLiteralType().types, m)
+		res := c.getTemplateLiteralType(t.AsTemplateLiteralType().texts, newTypes)
+		if changed {
+			c.releaseTemporaryTypeArguments(newTypes)
+		}
+		return res
 	case flags&TypeFlagsStringMapping != 0:
 		return c.getStringMappingType(t.symbol, c.instantiateType(t.AsStringMappingType().target, m))
 	case flags&TypeFlagsConditional != 0:
-		return c.getConditionalTypeInstantiation(t, c.combineTypeMappers(t.AsConditionalType().mapper, m), false /*forConstraint*/, alias)
+		return c.getConditionalTypeInstantiationEx(t, t.AsConditionalType().mapper, m, false /*forConstraint*/, alias)
 	case flags&TypeFlagsSubstitution != 0:
 		newBaseType := c.instantiateType(t.AsSubstitutionType().baseType, m)
 		if c.isNoInferType(t) {
@@ -22879,7 +24029,7 @@ func (c *Checker) getObjectTypeInstantiation(t *Type, m *TypeMapper, alias *Type
 	// We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
 	// mapper to the type parameters to produce the effective list of type arguments, and compute the
 	// instantiation cache key from the type IDs of the type arguments.
-	typeArguments := make([]*Type, len(typeParameters))
+	typeArguments := c.getTemporaryTypeArguments(len(typeParameters))
 	for i, tp := range typeParameters {
 		typeArguments[i] = c.mapTypeWithCompositeMapper(tp, t.Mapper(), m)
 	}
@@ -22895,7 +24045,12 @@ func (c *Checker) getObjectTypeInstantiation(t *Type, m *TypeMapper, alias *Type
 	}
 	result := data.instantiations[key]
 	if result == nil {
-		newMapper := newTypeMapper(typeParameters, typeArguments)
+		var newMapper *TypeMapper
+		if len(typeParameters) == 1 {
+			newMapper = newSimpleTypeMapper(typeParameters[0], typeArguments[0])
+		} else {
+			newMapper = newArrayTypeMapper(typeParameters, c.typeListArena.Clone(typeArguments))
+		}
 		if target.objectFlags&ObjectFlagsSingleSignatureType != 0 && m != nil {
 			newMapper = c.combineTypeMappers(newMapper, m)
 		}
@@ -22910,7 +24065,7 @@ func (c *Checker) getObjectTypeInstantiation(t *Type, m *TypeMapper, alias *Type
 		data.instantiations[key] = result
 		if result.flags&TypeFlagsObjectFlagsType != 0 && result.objectFlags&ObjectFlagsCouldContainTypeVariablesComputed == 0 {
 			// if `result` is one of the object types we tried to make (it may not be, due to how `instantiateMappedType` works), we can carry forward the type variable containment check from the input type arguments
-			resultCouldContainObjectFlags := core.Some(typeArguments, c.couldContainTypeVariables)
+			resultCouldContainObjectFlags := c.anyCouldContainTypeVariables(typeArguments)
 			if result.objectFlags&ObjectFlagsCouldContainTypeVariablesComputed == 0 {
 				if result.objectFlags&(ObjectFlagsMapped|ObjectFlagsAnonymous|ObjectFlagsReference) != 0 {
 					result.objectFlags |= ObjectFlagsCouldContainTypeVariablesComputed | core.IfElse(resultCouldContainObjectFlags, ObjectFlagsCouldContainTypeVariables, 0)
@@ -22923,10 +24078,11 @@ func (c *Checker) getObjectTypeInstantiation(t *Type, m *TypeMapper, alias *Type
 			}
 		}
 	}
+	c.releaseTemporaryTypeArguments(typeArguments)
 	return result
 }
 
-func (c *Checker) isTypeParameterPossiblyReferenced(tp *Type, node *ast.Node) bool {
+func (c *Checker) typeParameterReferenceInSubtree(tp *Type, node *ast.Node) bool {
 	var containsReference func(*ast.Node) bool
 	containsReference = func(node *ast.Node) bool {
 		switch node.Kind {
@@ -22965,18 +24121,67 @@ func (c *Checker) isTypeParameterPossiblyReferenced(tp *Type, node *ast.Node) bo
 		}
 		return node.ForEachChild(containsReference)
 	}
-	// If the type parameter doesn't have exactly one declaration, if there are intervening statement blocks
-	// between the node and the type parameter declaration, if the node contains actual references to the
-	// type parameter, or if the node contains type queries that we can't prove couldn't contain references to the type parameter,
-	// we consider the type parameter possibly referenced.
-	if tp.symbol != nil && len(tp.symbol.Declarations()) == 1 {
+	return containsReference(node)
+}
+
+func (c *Checker) filterPossiblyReferencedTypeParameters(candidates []*Type, node *ast.Node) []*Type {
+	if len(candidates) <= 1 {
+		return core.Filter(candidates, func(tp *Type) bool { return c.isTypeParameterPossiblyReferenced(tp, node) })
+	}
+	referenced := make(map[*ast.Symbol]bool)
+	thisReferenced := false
+	uncertain := false
+	var collect func(*ast.Node) bool
+	collect = func(n *ast.Node) bool {
+		switch n.Kind {
+		case ast.KindThisType:
+			thisReferenced = true
+		case ast.KindTypeReference:
+			if len(n.TypeArguments()) == 0 {
+				if sym := c.getSymbolFromTypeReference(n); sym != nil {
+					referenced[sym] = true
+				}
+			}
+		case ast.KindTypeQuery, ast.KindMethodDeclaration, ast.KindMethodSignature:
+			uncertain = true
+			return true
+		}
+		return n.ForEachChild(collect)
+	}
+	collect(node)
+	if uncertain {
+		return core.Filter(candidates, func(tp *Type) bool { return c.isTypeParameterPossiblyReferenced(tp, node) })
+	}
+	return core.Filter(candidates, func(tp *Type) bool {
+		if tp.symbol == nil || len(tp.symbol.Declarations()) != 1 {
+			return true
+		}
 		container := tp.symbol.Declarations()[0].Parent
 		for n := node; n != container; n = n.Parent {
-			if n == nil || ast.IsBlock(n) || ast.IsConditionalTypeNode(n) && containsReference(n.AsConditionalTypeNode().ExtendsType) {
+			if n == nil || ast.IsBlock(n) || ast.IsConditionalTypeNode(n) && c.typeParameterReferenceInSubtree(tp, n.AsConditionalTypeNode().ExtendsType) {
 				return true
 			}
 		}
-		return containsReference(node)
+		if tp.AsTypeParameter().isThisType {
+			return thisReferenced
+		}
+		return referenced[tp.symbol]
+	})
+}
+
+func (c *Checker) isTypeParameterPossiblyReferenced(tp *Type, node *ast.Node) bool {
+	// If the type parameter doesn't have exactly one declaration, if there are intervening statement blocks
+	// between the node and the type parameter declaration, if the node contains actual references to the
+	// type parameter, or if the node contains type queries that we can't prove couldn't contain references to the
+	// type parameter, we consider the type parameter possibly referenced.
+	if tp.symbol != nil && len(tp.symbol.Declarations()) == 1 {
+		container := tp.symbol.Declarations()[0].Parent
+		for n := node; n != container; n = n.Parent {
+			if n == nil || ast.IsBlock(n) || ast.IsConditionalTypeNode(n) && c.typeParameterReferenceInSubtree(tp, n.AsConditionalTypeNode().ExtendsType) {
+				return true
+			}
+		}
+		return c.typeParameterReferenceInSubtree(tp, node)
 	}
 	return true
 }
@@ -23009,16 +24214,37 @@ func (c *Checker) instantiateAnonymousType(t *Type, m *TypeMapper, alias *TypeAl
 }
 
 func (c *Checker) getConditionalTypeInstantiation(t *Type, mapper *TypeMapper, forConstraint bool, alias *TypeAlias) *Type {
+	return c.getConditionalTypeInstantiationEx(t, nil, mapper, forConstraint, alias)
+}
+
+func (c *Checker) getConditionalTypeInstantiationEx(t *Type, m1 *TypeMapper, mapper *TypeMapper, forConstraint bool, alias *TypeAlias) *Type {
 	root := t.AsConditionalType().root
 	if len(root.outerTypeParameters) != 0 {
 		// We are instantiating a conditional type that has one or more type parameters in scope. Apply the
 		// mapper to the type parameters to produce the effective list of type arguments, and compute the
 		// instantiation cache key from the type IDs of the type arguments.
-		typeArguments := core.Map(root.outerTypeParameters, mapper.Map)
+		outerTypeParameters := root.outerTypeParameters
+		typeArguments := c.getTemporaryTypeArguments(len(outerTypeParameters))
+		for i, tp := range outerTypeParameters {
+			// What CompositeTypeMapper.Map does.
+			if m1 != nil {
+				if t1 := m1.Map(tp); t1 != tp {
+					typeArguments[i] = c.instantiateType(t1, mapper)
+					continue
+				}
+			}
+			typeArguments[i] = mapper.Map(tp)
+		}
 		key := getConditionalTypeKey(typeArguments, alias, forConstraint)
 		result := root.instantiations[key]
 		if result == nil {
-			newMapper := newTypeMapper(root.outerTypeParameters, typeArguments)
+			var newMapper *TypeMapper
+			if len(outerTypeParameters) == 1 {
+				newMapper = newSimpleTypeMapper(outerTypeParameters[0], typeArguments[0])
+			} else {
+				newMapper = newArrayTypeMapper(outerTypeParameters, c.typeListArena.Clone(typeArguments))
+			}
+			c.releaseTemporaryTypeArguments(typeArguments)
 			checkType := root.checkType
 			var distributionType *Type
 			if root.isDistributive {
@@ -23035,6 +24261,8 @@ func (c *Checker) getConditionalTypeInstantiation(t *Type, mapper *TypeMapper, f
 				result = c.getConditionalType(root, newMapper, forConstraint, alias)
 			}
 			root.instantiations[key] = result
+		} else {
+			c.releaseTemporaryTypeArguments(typeArguments)
 		}
 		return result
 	}
@@ -23283,15 +24511,67 @@ func (c *Checker) instantiateReverseMappedType(t *Type, m *TypeMapper) *Type {
 	// Nested invocation of `inferTypeForHomomorphicMappedType` or the `source` instantiated into something unmappable
 }
 
+func (c *Checker) getTemporaryTypeArguments(n int) []*Type {
+	if l := len(c.freeTypeArgLists); l > 0 {
+		s := c.freeTypeArgLists[l-1]
+		c.freeTypeArgLists[l-1] = nil
+		c.freeTypeArgLists = c.freeTypeArgLists[:l-1]
+		if cap(s) >= n {
+			return s[:n]
+		}
+	}
+	return make([]*Type, n, max(n, 8))
+}
+
+func (c *Checker) releaseTemporaryTypeArguments(s []*Type) {
+	clear(s)
+	c.freeTypeArgLists = append(c.freeTypeArgLists, s[:0])
+}
+
 func (c *Checker) instantiateTypeAlias(alias *TypeAlias, m *TypeMapper) *TypeAlias {
 	if alias == nil {
 		return nil
 	}
-	return &TypeAlias{symbol: alias.symbol, typeArguments: c.instantiateTypes(alias.typeArguments, m)}
+	newTypeArgs := c.instantiateTypes(alias.typeArguments, m)
+	if core.Same(newTypeArgs, alias.typeArguments) {
+		return alias
+	}
+	result := c.typeAliasArena.New()
+	result.symbol = alias.symbol
+	result.typeArguments = newTypeArgs
+	return result
+}
+
+func (c *Checker) instantiateTypesTemp(types []*Type, m *TypeMapper) ([]*Type, bool) {
+	for i, value := range types {
+		mapped := c.instantiateType(value, m)
+		if mapped != value {
+			result := c.getTemporaryTypeArguments(len(types))
+			copy(result, types[:i])
+			result[i] = mapped
+			for j := i + 1; j < len(types); j++ {
+				result[j] = c.instantiateType(types[j], m)
+			}
+			return result, true
+		}
+	}
+	return types, false
 }
 
 func (c *Checker) instantiateTypes(types []*Type, m *TypeMapper) []*Type {
-	return c.instantiateList(types, m, (*Checker).instantiateType)
+	for i, value := range types {
+		mapped := c.instantiateType(value, m)
+		if mapped != value {
+			result := c.typeListArena.NewSlice(len(types))
+			copy(result, types[:i])
+			result[i] = mapped
+			for j := i + 1; j < len(types); j++ {
+				result[j] = c.instantiateType(types[j], m)
+			}
+			return result
+		}
+	}
+	return types
 }
 
 func (c *Checker) instantiateSymbols(symbols []*ast.Symbol, m *TypeMapper) []*ast.Symbol {
@@ -23331,7 +24611,17 @@ func (c *Checker) tryGetTypeFromTypeNode(node *ast.Node) *Type {
 }
 
 func (c *Checker) getTypeFromTypeNode(node *ast.Node) *Type {
-	return c.getConditionalFlowTypeOfType(c.getTypeFromTypeNodeWorker(node), node)
+	if node.Flags&ast.NodeFlagsCondFlowClean != 0 {
+		return c.getTypeFromTypeNodeWorker(node)
+	}
+	if links := c.typeNodeLinks.TryGet(node); links != nil && links.resolvedFlowType != nil {
+		return links.resolvedFlowType
+	}
+	t := c.getConditionalFlowTypeOfType(c.getTypeFromTypeNodeWorker(node), node)
+	if node.Flags&ast.NodeFlagsCondFlowClean == 0 && len(c.typeResolutions) == c.resolutionStart {
+		c.typeNodeLinks.Get(node).resolvedFlowType = t
+	}
+	return t
 }
 
 func (c *Checker) getTypeFromTypeNodeWorker(node *ast.Node) *Type {
@@ -24848,7 +26138,7 @@ func (c *Checker) getTypeFromConditionalTypeNode(node *ast.Node) *Type {
 		if alias != nil && len(alias.typeArguments) != 0 {
 			outerTypeParameters = allOuterTypeParameters
 		} else {
-			outerTypeParameters = core.Filter(allOuterTypeParameters, func(tp *Type) bool { return c.isTypeParameterPossiblyReferenced(tp, node) })
+			outerTypeParameters = c.filterPossiblyReferencedTypeParameters(allOuterTypeParameters, node)
 		}
 		root := &ConditionalRoot{
 			node:                node.AsConditionalTypeNode(),
@@ -25521,10 +26811,35 @@ func (c *Checker) getUniqueLiteralTypeForTypeParameter(t *Type) *Type {
 	return t
 }
 
+func condFlowRelevant(node *ast.Node) bool {
+	parent := node.Parent
+	if parent == nil {
+		return false
+	}
+	if ast.IsParameterDeclaration(parent) {
+		return true
+	}
+	if ast.IsConditionalTypeNode(parent) && node == parent.AsConditionalTypeNode().TrueType {
+		return true
+	}
+	if ast.IsMappedTypeNode(parent) && parent.AsMappedTypeNode().NameType == nil && node == parent.Type() {
+		return true
+	}
+	return false
+}
+
 func (c *Checker) getConditionalFlowTypeOfType(t *Type, node *ast.Node) *Type {
 	var constraints []*Type
 	covariant := true
+	start := node
+	var lastRelevant *ast.Node
 	for node != nil && !ast.IsStatement(node) && node.Kind != ast.KindJSDoc {
+		if node.Flags&ast.NodeFlagsCondFlowClean != 0 {
+			break
+		}
+		if condFlowRelevant(node) {
+			lastRelevant = node
+		}
 		parent := node.Parent
 		// only consider variance flipped by parameter locations - `keyof` types would usually be considered variance inverting, but
 		// often get used in indexed accesses where they behave sortof invariantly, but our checking is lax
@@ -25551,6 +26866,14 @@ func (c *Checker) getConditionalFlowTypeOfType(t *Type, node *ast.Node) *Type {
 			}
 		}
 		node = parent
+	}
+	mark := start
+	if lastRelevant != nil {
+		mark = lastRelevant.Parent
+	}
+	for mark != node && mark != nil {
+		mark.Flags |= ast.NodeFlagsCondFlowClean
+		mark = mark.Parent
 	}
 	if len(constraints) != 0 {
 		return c.getSubstitutionType(t, c.getIntersectionType(constraints))
@@ -25633,36 +26956,26 @@ func (c *Checker) newUniqueESSymbolType(symbol *ast.Symbol, name string) *Type {
 
 func (c *Checker) newObjectType(objectFlags ObjectFlags, symbol *ast.Symbol) *Type {
 	var t *Type
-	var kind typeKind
 	switch {
 	case objectFlags&ObjectFlagsClassOrInterface != 0:
-		t = c.interfaceTypeArena.New().AsType()
-		kind = typeKindInterface
+		t = c.newType(TypeFlagsObject, objectFlags, c.interfaceTypeArena.New().AsType(), typeKindInterface)
 	case objectFlags&ObjectFlagsTuple != 0:
-		t = (&TupleType{}).AsType()
-		kind = typeKindTuple
+		t = c.newType(TypeFlagsObject, objectFlags, (&TupleType{}).AsType(), typeKindTuple)
 	case objectFlags&ObjectFlagsReference != 0:
-		t = c.typeReferenceArena.New().AsType()
-		kind = typeKindTypeReference
+		t = c.newType(TypeFlagsObject, objectFlags, c.typeReferenceArena.New().AsType(), typeKindTypeReference)
 	case objectFlags&ObjectFlagsMapped != 0:
-		t = c.mappedTypeArena.New().AsType()
-		kind = typeKindMapped
+		t = c.newType(TypeFlagsObject, objectFlags, c.mappedTypeArena.New().AsType(), typeKindMapped)
 	case objectFlags&ObjectFlagsReverseMapped != 0:
-		t = (&ReverseMappedType{}).AsType()
-		kind = typeKindReverseMapped
+		t = c.newType(TypeFlagsObject, objectFlags, (&ReverseMappedType{}).AsType(), typeKindReverseMapped)
 	case objectFlags&ObjectFlagsEvolvingArray != 0:
-		t = (&EvolvingArrayType{}).AsType()
-		kind = typeKindEvolvingArray
+		t = c.newType(TypeFlagsObject, objectFlags, (&EvolvingArrayType{}).AsType(), typeKindEvolvingArray)
 	case objectFlags&ObjectFlagsInstantiationExpressionType != 0:
-		t = (&InstantiationExpressionType{}).AsType()
-		kind = typeKindInstantiationExpression
+		t = c.newType(TypeFlagsObject, objectFlags, (&InstantiationExpressionType{}).AsType(), typeKindInstantiationExpression)
 	case objectFlags&ObjectFlagsAnonymous != 0:
-		t = c.objectTypeArena.New().AsType()
-		kind = typeKindObject
+		t = c.newType(TypeFlagsObject, objectFlags, c.objectTypeArena.New().AsType(), typeKindObject)
 	default:
 		panic("Unhandled case in newObjectType")
 	}
-	c.newType(TypeFlagsObject, objectFlags, t, kind)
 	t.symbol = symbol
 	return t
 }
@@ -25725,8 +27038,18 @@ func (c *Checker) cloneTypeReference(source *Type) *Type {
 func (c *Checker) setStructuredTypeMembers(t *Type, members ast.SymbolTable, callSignatures []*Signature, constructSignatures []*Signature, indexInfos []*IndexInfo) {
 	t.objectFlags |= ObjectFlagsMembersResolved
 	data := t.AsStructuredType()
-	data.members = members
+	// Named-member filtering may recursively query this type before it finishes.
+	data.members = nil
+	if len(members) != 0 || (t.symbol != nil && t.symbol.Flags()&ast.SymbolFlagsValueModule != 0) {
+		data.members = c.memberIndexArena.New()
+		data.members.fallback = members
+	}
 	data.properties = c.getNamedMembers(members, t.symbol)
+	if data.members != nil && t.symbol != nil && t.symbol.Flags()&ast.SymbolFlagsValueModule != 0 {
+		data.members.fallback = members
+	} else {
+		data.members = c.newMemberIndex(members, data.properties, data.members)
+	}
 	c.setStructuredTypeSignatures(data, callSignatures, constructSignatures, indexInfos)
 }
 
@@ -26163,11 +27486,6 @@ func (c *Checker) mapTypeEx(t *Type, f func(*Type) *Type, noReductions bool) *Ty
 		types = u.origin.Types()
 	}
 	var set *temporaryTypeSet
-	defer func() {
-		if set != nil {
-			c.releaseTemporaryTypeSet(set)
-		}
-	}()
 	var mappedTypes []*Type
 	var changed bool
 	for i, s := range types {
@@ -26190,9 +27508,12 @@ func (c *Checker) mapTypeEx(t *Type, f func(*Type) *Type, noReductions bool) *Ty
 	if changed {
 		set.values = mappedTypes
 		if len(mappedTypes) == 0 {
+			c.releaseTemporaryTypeSet(set)
 			return nil
 		}
-		return c.getUnionTypeEx(mappedTypes, core.IfElse(noReductions, UnionReductionNone, UnionReductionLiteral), nil /*alias*/, nil /*origin*/)
+		res := c.getUnionTypeEx(mappedTypes, core.IfElse(noReductions, UnionReductionNone, UnionReductionLiteral), nil /*alias*/, nil /*origin*/)
+		c.releaseTemporaryTypeSet(set)
+		return res
 	}
 	return t
 }
@@ -26223,6 +27544,26 @@ func (c *Checker) getUnionType(types []*Type) *Type {
 // expression constructs such as array literals and the || and ?: operators). Named types can
 // circularly reference themselves and therefore cannot be subtype reduced during their declaration.
 // For example, "type Item = string | (() => Item" is a named type that circularly references itself.
+func getUnionFrontKey(types []*Type, unionReduction UnionReduction, alias *TypeAlias) CacheHashKey {
+	if alias == nil {
+		if key, ok := packedTypeListKey(packedUnionFrontKeyTag|uint64(unionReduction), types, false); ok {
+			return key
+		}
+	}
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeUint32(uint32(unionReduction))
+		b.writeTypes(types)
+		b.writeAlias(alias)
+		return b.releaseHash()
+	}
+	var b keyBuilder
+	b.writeUint32(uint32(unionReduction))
+	b.writeTypes(types)
+	b.writeAlias(alias)
+	return b.hash()
+}
+
 func (c *Checker) getUnionTypeEx(types []*Type, unionReduction UnionReduction, alias *TypeAlias, origin *Type) *Type {
 	if len(types) == 0 {
 		return c.neverType
@@ -26230,7 +27571,7 @@ func (c *Checker) getUnionTypeEx(types []*Type, unionReduction UnionReduction, a
 	if len(types) == 1 {
 		return types[0]
 	}
-	// We optimize for the common case of unioning a union type with some other type (such as `undefined`).
+	// We optimize for the common case of unioning a union type with some other type (such as 'undefined').
 	if len(types) == 2 && origin == nil && (types[0].flags&TypeFlagsUnion != 0 || types[1].flags&TypeFlagsUnion != 0) {
 		id1 := types[0].id
 		id2 := types[1].id
@@ -26244,6 +27585,27 @@ func (c *Checker) getUnionTypeEx(types []*Type, unionReduction UnionReduction, a
 			c.unionOfUnionTypes[key] = t
 		}
 		return t
+	}
+	if origin == nil && (alias == nil || alias.symbol != nil) {
+		key := getUnionFrontKey(types, unionReduction, alias)
+		if cached := c.unionFrontCache[key]; cached != nil {
+			return cached
+		}
+		typeCount := c.TypeCount
+		instCount := c.instantiationCount
+		totalInstCount := c.TotalInstantiationCount
+		impure := c.unionImpureCount
+		result := c.getUnionTypeWorker(types, unionReduction, alias, nil)
+		created := c.TypeCount != typeCount && !(c.TypeCount == typeCount+1 && result.id == TypeId(c.TypeCount))
+		instantiated := c.instantiationCount != instCount || c.TotalInstantiationCount != totalInstCount
+		wasImpure := c.unionImpureCount != impure
+		if !created && !instantiated && !wasImpure && result != c.errorType {
+			if c.unionFrontCache == nil {
+				c.unionFrontCache = make(map[CacheHashKey]*Type)
+			}
+			c.unionFrontCache[key] = result
+		}
+		return result
 	}
 	return c.getUnionTypeWorker(types, unionReduction, alias, origin)
 }
@@ -26277,9 +27639,11 @@ func (c *Checker) getUnionTypeWorker(types []*Type, unionReduction UnionReductio
 			typeSet = c.removeRedundantLiteralTypes(typeSet, includes, unionReduction&UnionReductionSubtype != 0)
 		}
 		if includes&TypeFlagsStringLiteral != 0 && includes&(TypeFlagsTemplateLiteral|TypeFlagsStringMapping) != 0 {
+			c.unionImpureCount++
 			typeSet = c.removeStringLiteralsMatchedByTemplateLiterals(typeSet)
 		}
 		if includes&TypeFlagsIncludesConstrainedTypeVariable != 0 {
+			c.unionImpureCount++
 			typeSet = c.removeConstrainedTypeVariables(typeSet)
 		}
 		if unionReduction == UnionReductionSubtype {
@@ -26307,9 +27671,27 @@ func (c *Checker) getUnionTypeWorker(types []*Type, unionReduction UnionReductio
 	if origin == nil && includes&TypeFlagsUnion != 0 {
 		namedUnions := c.addNamedUnions(nil, types)
 		var reducedTypes []*Type
-		for _, t := range typeSet {
-			if !core.Some(namedUnions, func(u *Type) bool { return containsType(u.Types(), t) }) {
-				reducedTypes = append(reducedTypes, t)
+		if len(c.files) > 0 && (len(namedUnions) > 1 || len(typeSet) > 8) {
+			if c.namedUnionMemberSet == nil {
+				c.namedUnionMemberSet = make(map[*Type]struct{}, 64)
+			} else {
+				clear(c.namedUnionMemberSet)
+			}
+			for _, u := range namedUnions {
+				for _, s := range u.Types() {
+					c.namedUnionMemberSet[s] = struct{}{}
+				}
+			}
+			for _, t := range typeSet {
+				if _, ok := c.namedUnionMemberSet[t]; !ok {
+					reducedTypes = append(reducedTypes, t)
+				}
+			}
+		} else {
+			for _, t := range typeSet {
+				if !core.Some(namedUnions, func(u *Type) bool { return containsType(u.Types(), t) }) {
+					reducedTypes = append(reducedTypes, t)
+				}
 			}
 		}
 		if alias == nil && len(namedUnions) == 1 && len(reducedTypes) == 0 {
@@ -26361,6 +27743,7 @@ func (c *Checker) UnionTypes() iter.Seq[*Type] {
 
 func (c *Checker) addTypesToUnion(sourceTypes []*Type, types []*Type) ([]*Type, TypeFlags) {
 	var includes TypeFlags
+	totalOrder := len(c.files) > 0
 	addType := func(t *Type) {
 		flags := t.flags
 		// We ignore 'never' types in unions
@@ -26388,9 +27771,31 @@ func (c *Checker) addTypesToUnion(sourceTypes []*Type, types []*Type) ([]*Type, 
 		}
 		types = append(types, t)
 	}
+	if totalOrder && len(sourceTypes) == 2 && (sourceTypes[0].flags&sourceTypes[1].flags)&TypeFlagsUnion != 0 {
+		if sourceTypes[0] == sourceTypes[1] {
+			u := sourceTypes[0].AsUnionType()
+			if sourceTypes[0].alias != nil || u.origin != nil {
+				includes |= TypeFlagsUnion
+			}
+			for _, s := range u.types {
+				addType(s)
+			}
+			return types, includes
+		}
+		for _, t := range sourceTypes {
+			u := t.AsUnionType()
+			if t.alias != nil || u.origin != nil {
+				includes |= TypeFlagsUnion
+			}
+		}
+		mergeSortedTypes(sourceTypes[0].AsUnionType().types, sourceTypes[1].AsUnionType().types, true /*dedup*/, addType)
+		return types, includes
+	}
+	runStarts := c.unionRunStarts[:0]
 	var lastType *Type
 	for _, t := range sourceTypes {
 		if t != lastType {
+			start := len(types)
 			if t.flags&TypeFlagsUnion != 0 {
 				u := t.AsUnionType()
 				if t.alias != nil || u.origin != nil {
@@ -26402,12 +27807,20 @@ func (c *Checker) addTypesToUnion(sourceTypes []*Type, types []*Type) ([]*Type, 
 			} else {
 				addType(t)
 			}
+			if totalOrder && start > 0 && len(types) > start && CompareTypes(types[start-1], types[start]) > 0 {
+				runStarts = append(runStarts, start)
+			}
 			lastType = t
 		}
 	}
+	c.unionRunStarts = runStarts
 	if len(types) >= 2 {
 		// Sort and deduplicate types
-		slices.SortStableFunc(types, CompareTypes)
+		if !totalOrder {
+			slices.SortStableFunc(types, CompareTypes)
+		} else if len(runStarts) > 0 {
+			types = c.mergeAscendingRuns(types, runStarts)
+		}
 		unique := 1
 		for _, t := range types[1:] {
 			if t != types[unique-1] {
@@ -26419,6 +27832,124 @@ func (c *Checker) addTypesToUnion(sourceTypes []*Type, types []*Type) ([]*Type, 
 		types = types[:unique]
 	}
 	return types, includes
+}
+
+func (c *Checker) mergeAscendingRuns(types []*Type, runStarts []int) []*Type {
+	n := len(types)
+	if len(runStarts) == 1 {
+		mid := runStarts[0]
+		if mid == 1 {
+			t := types[0]
+			i, _ := slices.BinarySearchFunc(types[1:], t, CompareTypes)
+			copy(types[:i], types[1:i+1])
+			types[i] = t
+			return types
+		}
+		if mid == n-1 {
+			t := types[n-1]
+			i, _ := slices.BinarySearchFunc(types[:n-1], t, CompareTypes)
+			copy(types[i+1:], types[i:n-1])
+			types[i] = t
+			return types
+		}
+	}
+	bounds := c.unionRunBounds[:0]
+	bounds = append(bounds, 0)
+	bounds = append(bounds, runStarts...)
+	bounds = append(bounds, n)
+	dst := c.unionMergeBuf
+	if cap(dst) < n {
+		dst = make([]*Type, 0, n)
+	}
+	src := types
+	swapped := false
+	next := c.unionRunNext[:0]
+	for len(bounds) > 2 {
+		runs := len(bounds) - 1
+		next = next[:0]
+		next = append(next, 0)
+		dst = dst[:0]
+		for j := 0; j < runs; {
+			if j+1 < runs {
+				mergeSortedTypes(src[bounds[j]:bounds[j+1]], src[bounds[j+1]:bounds[j+2]], false /*dedup*/, func(t *Type) {
+					dst = append(dst, t)
+				})
+				next = append(next, bounds[j+2])
+				j += 2
+			} else {
+				dst = append(dst, src[bounds[j]:bounds[j+1]]...)
+				next = append(next, bounds[j+1])
+				j++
+			}
+		}
+		src, dst = dst, src
+		swapped = !swapped
+		bounds, next = next, bounds
+	}
+	c.unionRunBounds = bounds
+	c.unionRunNext = next
+	if swapped {
+		copy(types, src)
+		clear(src)
+		c.unionMergeBuf = src[:0]
+	} else {
+		clear(dst)
+		c.unionMergeBuf = dst[:0]
+	}
+	return types
+}
+
+func mergeSortedTypes(left []*Type, right []*Type, dedup bool, out func(*Type)) {
+	short, long := min(len(left), len(right)), max(len(left), len(right))
+	if short > 0 && short*bits.Len(uint(long))*2 < long {
+		leftIsLong := len(left) >= len(right)
+		longRun, shortRun := right, left
+		if leftIsLong {
+			longRun, shortRun = left, right
+		}
+		for _, t := range shortRun {
+			i, _ := slices.BinarySearchFunc(longRun, t, CompareTypes)
+			for _, x := range longRun[:i] {
+				out(x)
+			}
+			longRun = longRun[i:]
+			out(t)
+			if len(longRun) > 0 && longRun[0] == t {
+				longRun = longRun[1:]
+				if !dedup {
+					out(t)
+				}
+			}
+		}
+		for _, x := range longRun {
+			out(x)
+		}
+		return
+	}
+	i, j := 0, 0
+	for i < len(left) && j < len(right) {
+		l, r := left[i], right[j]
+		if l == r {
+			out(l)
+			if !dedup {
+				out(r)
+			}
+			i++
+			j++
+		} else if CompareTypes(l, r) < 0 {
+			out(l)
+			i++
+		} else {
+			out(r)
+			j++
+		}
+	}
+	for ; i < len(left); i++ {
+		out(left[i])
+	}
+	for ; j < len(right); j++ {
+		out(right[j])
+	}
 }
 
 func (c *Checker) addNamedUnions(namedUnions []*Type, types []*Type) []*Type {
@@ -26544,7 +28075,7 @@ func (c *Checker) removeSubtypes(types []*Type, hasObjectTypes bool) []*Type {
 	// are no any and unknown types in the array. Thus, the only possible supertypes for primitive types are empty
 	// object types, and if none of those are present we can exclude primitive types from the subtype check.
 	hasEmptyObject := hasObjectTypes && core.Some(types, func(t *Type) bool {
-		return t.flags&TypeFlagsObject != 0 && !c.isGenericMappedType(t) && c.isEmptyResolvedType(c.resolveStructuredTypeMembers(t))
+		return t.flags&TypeFlagsObject != 0 && !c.isGenericMappedType(t) && c.isEmptyObjectType(t)
 	})
 	length := len(types)
 	i := length
@@ -26629,7 +28160,45 @@ func (c *Checker) intersectTypes(type1 *Type, type2 *Type) *Type {
 	case type2 == nil:
 		return type1
 	}
-	return c.getIntersectionType([]*Type{type1, type2})
+	pair := c.getTemporaryTypeArguments(2)
+	pair[0] = type1
+	pair[1] = type2
+	res := c.getIntersectionType(pair)
+	c.releaseTemporaryTypeArguments(pair)
+	return res
+}
+
+func (c *Checker) everyTypeIsPrimitiveOrObjectOrEmpty(t *Type) bool {
+	if t.flags&TypeFlagsUnion != 0 {
+		for _, sub := range t.Types() {
+			if !c.isPrimitiveOrObjectOrEmptyType(sub) {
+				return false
+			}
+		}
+		return true
+	}
+	return c.isPrimitiveOrObjectOrEmptyType(t)
+}
+
+func (c *Checker) someTypeIsStrictSubtypeOf(t *Type, target *Type) bool {
+	if t.flags&TypeFlagsUnion != 0 {
+		for _, sub := range t.Types() {
+			if c.isTypeStrictSubtypeOf(sub, target) {
+				return true
+			}
+		}
+		return false
+	}
+	return c.isTypeStrictSubtypeOf(t, target)
+}
+
+func (c *Checker) someContainsMissingType(types []*Type) bool {
+	for _, sub := range types {
+		if c.containsMissingType(sub) {
+			return true
+		}
+	}
+	return false
 }
 
 type IntersectionFlags uint32
@@ -26740,15 +28309,13 @@ func (c *Checker) getIntersectionTypeEx(types []*Type, flags IntersectionFlags, 
 			// We have an intersection T & P or P & T, where T is a type variable and P is a primitive type, the object type, or {}.
 			constraint := c.getBaseConstraintOfType(typeVariable)
 			// Check that T's constraint is similarly composed of primitive types, the object type, or {}.
-			if constraint != nil && everyType(constraint, c.isPrimitiveOrObjectOrEmptyType) {
+			if constraint != nil && c.everyTypeIsPrimitiveOrObjectOrEmpty(constraint) {
 				// If T's constraint is a subtype of P, simply return T. For example, given `T extends "a" | "b"`,
 				// the intersection `T & string` reduces to just T.
 				if c.isTypeStrictSubtypeOf(constraint, primitiveType) {
 					return typeVariable
 				}
-				if !(constraint.flags&TypeFlagsUnion != 0 && someType(constraint, func(n *Type) bool {
-					return c.isTypeStrictSubtypeOf(n, primitiveType)
-				})) {
+				if !(constraint.flags&TypeFlagsUnion != 0 && c.someTypeIsStrictSubtypeOf(constraint, primitiveType)) {
 					// No constituent of T's constraint is a subtype of P. If P is also not a subtype of T's constraint,
 					// then the constraint and P are unrelated, and the intersection reduces to never. For example, given
 					// `T extends "a" | "b"`, the intersection `T & number` reduces to never.
@@ -26778,25 +28345,33 @@ func (c *Checker) getIntersectionTypeEx(types []*Type, flags IntersectionFlags, 
 				result = c.getIntersectionTypeEx(typeSet, flags, alias)
 			case core.Every(typeSet, isUnionWithUndefined):
 				containedUndefinedType := c.undefinedType
-				if core.Some(typeSet, c.containsMissingType) {
+				if c.someContainsMissingType(typeSet) {
 					containedUndefinedType = c.missingType
 				}
 				c.filterTypes(typeSet, isNotUndefinedType)
-				result = c.getUnionTypeEx([]*Type{c.getIntersectionTypeEx(typeSet, flags, nil /*alias*/), containedUndefinedType}, UnionReductionLiteral, alias, nil /*origin*/)
+				pair := c.getTemporaryTypeArguments(2)
+				pair[0] = c.getIntersectionTypeEx(typeSet, flags, nil /*alias*/)
+				pair[1] = containedUndefinedType
+				result = c.getUnionTypeEx(pair, UnionReductionLiteral, alias, nil /*origin*/)
+				c.releaseTemporaryTypeArguments(pair)
 			case core.Every(typeSet, isUnionWithNull):
 				c.filterTypes(typeSet, isNotNullType)
-				result = c.getUnionTypeEx([]*Type{c.getIntersectionTypeEx(typeSet, flags, nil /*alias*/), c.nullType}, UnionReductionLiteral, alias, nil /*origin*/)
+				pair := c.getTemporaryTypeArguments(2)
+				pair[0] = c.getIntersectionTypeEx(typeSet, flags, nil /*alias*/)
+				pair[1] = c.nullType
+				result = c.getUnionTypeEx(pair, UnionReductionLiteral, alias, nil /*origin*/)
+				c.releaseTemporaryTypeArguments(pair)
 			case len(typeSet) >= 3 && len(types) > 2:
 				// When we have three or more constituents, more than two inputs (to head off infinite reexpansion), some of which are unions, we employ a "divide and conquer" strategy
 				// where A & B & C & D is processed as (A & B) & (C & D). Since intersections of unions often produce far smaller
 				// unions of intersections than the full cartesian product (due to some intersections becoming `never`), this can
 				// dramatically reduce the overall work.
 				middle := len(typeSet) / 2
-				result = c.getIntersectionTypeEx([]*Type{
-					c.getIntersectionTypeEx(typeSet[:middle], flags, nil /*alias*/),
-					c.getIntersectionTypeEx(typeSet[middle:], flags, nil /*alias*/),
-				},
-					flags, alias)
+				pair := c.getTemporaryTypeArguments(2)
+				pair[0] = c.getIntersectionTypeEx(typeSet[:middle], flags, nil /*alias*/)
+				pair[1] = c.getIntersectionTypeEx(typeSet[middle:], flags, nil /*alias*/)
+				result = c.getIntersectionTypeEx(pair, flags, alias)
+				c.releaseTemporaryTypeArguments(pair)
 			default:
 				// We are attempting to construct a type of the form X & (A | B) & (C | D). Transform this into a type of
 				// the form X & A & C | X & A & D | X & B & C | X & B & D. If the estimated size of the resulting union type
@@ -27086,7 +28661,13 @@ func (c *Checker) isEmptyResolvedType(t *StructuredType) bool {
 func (c *Checker) isEmptyObjectType(t *Type) bool {
 	switch {
 	case t.flags&TypeFlagsObject != 0:
-		return !c.isGenericMappedType(t) && c.isEmptyResolvedType(c.resolveStructuredTypeMembers(t))
+		if c.isGenericMappedType(t) {
+			return false
+		}
+		if c.getReadyLazyMemberTable(t) != nil {
+			return t != c.anyFunctionType && len(t.AsStructuredType().getSignatures()) == 0 && len(t.AsStructuredType().getIndexInfos()) == 0 && !c.hasPropertiesOfStructuredType(t)
+		}
+		return c.isEmptyResolvedType(c.resolveStructuredTypeMembers(t))
 	case t.flags&TypeFlagsNonPrimitive != 0:
 		return true
 	case t.flags&TypeFlagsUnion != 0:
@@ -27350,7 +28931,7 @@ func (c *Checker) getLiteralTypeFromProperties(t *Type, include TypeFlags, inclu
 
 func (c *Checker) getLiteralTypeFromProperty(prop *ast.Symbol, include TypeFlags, includeNonPublic bool) *Type {
 	if includeNonPublic || getDeclarationModifierFlagsFromSymbol(prop)&ast.ModifierFlagsNonPublicAccessibilityModifier == 0 {
-		t := c.valueSymbolLinks.Get(c.getLateBoundSymbol(prop)).getNameType()
+		t := c.valueSymbolLinks.TryGet(c.getLateBoundSymbol(prop)).getNameType()
 		if t == nil {
 			if prop.Name() == ast.InternalSymbolNameDefault {
 				t = c.getStringLiteralType("default")
@@ -27578,29 +29159,65 @@ func (c *Checker) getIndexedAccessTypeOrUndefined(objectType *Type, indexType *T
 	// skipping straight to getPropertyTypeForIndexType gives errors with 'boolean' instead of 'true'.
 	apparentObjectType := c.getReducedApparentType(objectType)
 	if indexType.flags&TypeFlagsUnion != 0 && indexType.flags&TypeFlagsBoolean == 0 {
-		var propTypes []*Type
-		wasMissingProp := false
-		for _, t := range indexType.Types() {
-			propType := c.getPropertyTypeForIndexType(objectType, apparentObjectType, t, indexType, accessNode, accessFlags|core.IfElse(wasMissingProp, AccessFlagsSuppressNoImplicitAnyError, 0))
-			if propType != nil {
-				propTypes = append(propTypes, propType)
-			} else if accessNode == nil {
-				// If there's no error node, we can immediately stop, since error reporting is off
-				return nil
-			} else {
-				// Otherwise we set a flag and return at the end of the loop so we still mark all errors
-				wasMissingProp = true
+		if accessNode == nil && alias == nil {
+			memoKey := indexedAccessUnionKey{objectId: objectType.id, indexId: indexType.id, accessFlags: accessFlags}
+			if cached, ok := c.indexedAccessUnionMemo[memoKey]; ok {
+				return cached
 			}
+			typeCount := c.TypeCount
+			instCount := c.instantiationCount
+			totalInstCount := c.TotalInstantiationCount
+			impure := c.unionImpureCount
+			diagCount := c.diagnosticCount
+			result := c.getIndexedAccessTypeByUnionWorker(objectType, apparentObjectType, indexType, accessFlags, nil, nil)
+			created := c.TypeCount != typeCount && !(c.TypeCount == typeCount+1 && result != nil && result.id == TypeId(c.TypeCount))
+			instantiated := c.instantiationCount != instCount || c.TotalInstantiationCount != totalInstCount
+			wasImpure := c.unionImpureCount != impure
+			reported := c.diagnosticCount != diagCount
+			if !created && !instantiated && !wasImpure && !reported && result != c.errorType {
+				if c.indexedAccessUnionMemo == nil {
+					c.indexedAccessUnionMemo = make(map[indexedAccessUnionKey]*Type)
+				}
+				c.indexedAccessUnionMemo[memoKey] = result
+			}
+			return result
 		}
-		if wasMissingProp {
-			return nil
-		}
-		if accessFlags&AccessFlagsWriting != 0 {
-			return c.getIntersectionTypeEx(propTypes, IntersectionFlagsNone, alias)
-		}
-		return c.getUnionTypeEx(propTypes, UnionReductionLiteral, alias, nil)
+		return c.getIndexedAccessTypeByUnionWorker(objectType, apparentObjectType, indexType, accessFlags, accessNode, alias)
 	}
 	return c.getPropertyTypeForIndexType(objectType, apparentObjectType, indexType, indexType, accessNode, accessFlags|AccessFlagsCacheSymbol|AccessFlagsReportDeprecated)
+}
+
+type indexedAccessUnionKey struct {
+	objectId    TypeId
+	indexId     TypeId
+	accessFlags AccessFlags
+}
+
+func (c *Checker) getIndexedAccessTypeByUnionWorker(objectType *Type, apparentObjectType *Type, indexType *Type, accessFlags AccessFlags, accessNode *ast.Node, alias *TypeAlias) *Type {
+	propTypes := c.getTemporaryTypeArguments(0)
+	defer func() {
+		c.releaseTemporaryTypeArguments(propTypes)
+	}()
+	wasMissingProp := false
+	for _, t := range indexType.Types() {
+		propType := c.getPropertyTypeForIndexType(objectType, apparentObjectType, t, indexType, accessNode, accessFlags|core.IfElse(wasMissingProp, AccessFlagsSuppressNoImplicitAnyError, 0))
+		if propType != nil {
+			propTypes = append(propTypes, propType)
+		} else if accessNode == nil {
+			// If there's no error node, we can immediately stop, since error reporting is off
+			return nil
+		} else {
+			// Otherwise we set a flag and return at the end of the loop so we still mark all errors
+			wasMissingProp = true
+		}
+	}
+	if wasMissingProp {
+		return nil
+	}
+	if accessFlags&AccessFlagsWriting != 0 {
+		return c.getIntersectionTypeEx(propTypes, IntersectionFlagsNone, alias)
+	}
+	return c.getUnionTypeEx(propTypes, UnionReductionLiteral, alias, nil)
 }
 
 func (c *Checker) getPropertyTypeForIndexType(originalObjectType *Type, objectType *Type, indexType *Type, fullIndexType *Type, accessNode *ast.Node, accessFlags AccessFlags) *Type {
@@ -27968,7 +29585,7 @@ func (c *Checker) getPropertyNameFromIndex(indexType *Type, accessNode *ast.Node
 }
 
 func (c *Checker) isStringIndexSignatureOnlyTypeWorker(t *Type) bool {
-	return t.flags&TypeFlagsObject != 0 && !c.isGenericMappedType(t) && len(c.getPropertiesOfType(t)) == 0 && len(c.getIndexInfosOfType(t)) == 1 && c.getIndexInfoOfType(t, c.stringType) != nil ||
+	return t.flags&TypeFlagsObject != 0 && !c.isGenericMappedType(t) && !c.hasPropertiesOfStructuredType(t) && len(c.getIndexInfosOfType(t)) == 1 && c.getIndexInfoOfType(t, c.stringType) != nil ||
 		t.flags&TypeFlagsUnionOrIntersection != 0 && core.Every(t.Types(), c.isStringIndexSignatureOnlyType)
 }
 
@@ -28329,9 +29946,13 @@ func (c *Checker) markPropertyAsReferenced(prop *ast.Symbol, nodeForCheckWriteOn
 	}
 	target := prop
 	if prop.CheckFlags()&ast.CheckFlagsInstantiated != 0 {
-		target = c.valueSymbolLinks.Get(prop).target
+		if links := c.valueSymbolLinks.TryGet(prop); links != nil {
+			target = links.target
+		} else {
+			target = nil
+		}
 	}
-	c.symbolReferenceLinks.Get(target).referenceKinds |= ast.SymbolFlagsAll
+	target.AddReference(ast.SymbolFlagsAll)
 }
 
 func (c *Checker) expandSignatureParametersWithTupleMembers(signature *Signature, restType *TypeReference, restIndex int, restSymbol *ast.Symbol) []*ast.Symbol {
@@ -28464,7 +30085,7 @@ func (c *Checker) containsUndefinedType(t *Type) bool {
 }
 
 func (c *Checker) typeHasCallOrConstructSignatures(t *Type) bool {
-	return t.flags&TypeFlagsStructuredType != 0 && len(c.resolveStructuredTypeMembers(t).getSignatures()) != 0
+	return t.flags&TypeFlagsStructuredType != 0 && (len(c.getSignaturesOfStructuredType(t, SignatureKindCall)) != 0 || len(c.getSignaturesOfStructuredType(t, SignatureKindConstruct)) != 0)
 }
 
 func (c *Checker) getNormalizedType(t *Type, writing bool) *Type {
@@ -30427,7 +32048,7 @@ func (c *Checker) getContextualTypeForArgumentAtIndex(callTarget *ast.Node, argI
 	// If we're already in the process of resolving the given signature, don't resolve again as
 	// that could cause infinite recursion. Instead, return anySignature.
 	var signature *Signature
-	if c.signatureLinks.Get(callTarget).resolvedSignature == c.resolvingSignature {
+	if links := c.signatureLinks.TryGet(callTarget); links != nil && links.resolvedSignature == c.resolvingSignature {
 		signature = c.resolvingSignature
 	} else {
 		signature = c.getResolvedSignature(callTarget, nil, CheckModeNormal)
@@ -30573,7 +32194,7 @@ func (c *Checker) getContextualTypeForObjectLiteralElement(element *ast.Node, co
 			// in the type. It will just be "__computed", which does not appear in any
 			// SymbolTable.
 			symbol := c.getSymbolOfDeclaration(element)
-			return c.getTypeOfPropertyOfContextualTypeEx(t, symbol.Name(), c.valueSymbolLinks.Get(symbol).getNameType())
+			return c.getTypeOfPropertyOfContextualTypeEx(t, symbol.Name(), c.valueSymbolLinks.TryGet(symbol).getNameType())
 		}
 		if ast.HasDynamicName(element) {
 			name := ast.GetNameOfDeclaration(element)
@@ -30590,6 +32211,16 @@ func (c *Checker) getContextualTypeForObjectLiteralElement(element *ast.Node, co
 		if element.Name() != nil {
 			nameType := c.getLiteralTypeFromPropertyName(element.Name())
 			// We avoid calling getApplicableIndexInfo here because it performs potentially expensive intersection reduction.
+			if t.flags&TypeFlagsNever != 0 {
+				return t
+			}
+			if t.flags&TypeFlagsUnion == 0 {
+				indexInfo := c.findApplicableIndexInfo(c.getIndexInfosOfStructuredType(t), nameType)
+				if indexInfo == nil {
+					return nil
+				}
+				return indexInfo.valueType
+			}
 			return c.mapTypeEx(t, func(t *Type) *Type {
 				indexInfo := c.findApplicableIndexInfo(c.getIndexInfosOfStructuredType(t), nameType)
 				if indexInfo == nil {
@@ -31197,55 +32828,65 @@ func (c *Checker) getTypeOfPropertyOfContextualType(t *Type, name string) *Type 
 }
 
 func (c *Checker) getTypeOfPropertyOfContextualTypeEx(t *Type, name string, nameType *Type) *Type {
+	if t.flags&TypeFlagsNever != 0 {
+		return t
+	}
+	if t.flags&TypeFlagsUnion == 0 {
+		return c.getTypeOfPropertyOfContextualTypeWorker(t, name, nameType)
+	}
 	return c.mapTypeEx(t, func(t *Type) *Type {
-		if t.flags&TypeFlagsIntersection != 0 {
-			var types []*Type
-			var indexInfoCandidates []*Type
-			ignoreIndexInfos := false
-			for _, constituentType := range t.Types() {
-				if constituentType.flags&TypeFlagsObject == 0 {
-					continue
+		return c.getTypeOfPropertyOfContextualTypeWorker(t, name, nameType)
+	}, true /*noReductions*/)
+}
+
+func (c *Checker) getTypeOfPropertyOfContextualTypeWorker(t *Type, name string, nameType *Type) *Type {
+	if t.flags&TypeFlagsIntersection != 0 {
+		var types []*Type
+		var indexInfoCandidates []*Type
+		ignoreIndexInfos := false
+		for _, constituentType := range t.Types() {
+			if constituentType.flags&TypeFlagsObject == 0 {
+				continue
+			}
+			if c.isGenericMappedType(constituentType) && c.getMappedTypeNameTypeKind(constituentType) != MappedTypeNameTypeKindRemapping {
+				substitutedType := c.getIndexedMappedTypeSubstitutedTypeOfContextualType(constituentType, name, nameType)
+				types = c.appendContextualPropertyTypeConstituent(types, substitutedType)
+				continue
+			}
+			propertyType := c.getTypeOfConcretePropertyOfContextualType(constituentType, name)
+			if propertyType == nil {
+				if !ignoreIndexInfos {
+					indexInfoCandidates = append(indexInfoCandidates, constituentType)
 				}
-				if c.isGenericMappedType(constituentType) && c.getMappedTypeNameTypeKind(constituentType) != MappedTypeNameTypeKindRemapping {
-					substitutedType := c.getIndexedMappedTypeSubstitutedTypeOfContextualType(constituentType, name, nameType)
-					types = c.appendContextualPropertyTypeConstituent(types, substitutedType)
-					continue
-				}
-				propertyType := c.getTypeOfConcretePropertyOfContextualType(constituentType, name)
-				if propertyType == nil {
-					if !ignoreIndexInfos {
-						indexInfoCandidates = append(indexInfoCandidates, constituentType)
-					}
-					continue
-				}
-				ignoreIndexInfos = true
-				indexInfoCandidates = nil
-				types = c.appendContextualPropertyTypeConstituent(types, propertyType)
+				continue
 			}
-			for _, candidate := range indexInfoCandidates {
-				indexInfoType := c.getTypeFromIndexInfosOfContextualType(candidate, name, nameType)
-				types = c.appendContextualPropertyTypeConstituent(types, indexInfoType)
-			}
-			if len(types) == 0 {
-				return nil
-			}
-			if len(types) == 1 {
-				return types[0]
-			}
-			return c.getIntersectionType(types)
+			ignoreIndexInfos = true
+			indexInfoCandidates = nil
+			types = c.appendContextualPropertyTypeConstituent(types, propertyType)
 		}
-		if t.flags&TypeFlagsObject == 0 {
+		for _, candidate := range indexInfoCandidates {
+			indexInfoType := c.getTypeFromIndexInfosOfContextualType(candidate, name, nameType)
+			types = c.appendContextualPropertyTypeConstituent(types, indexInfoType)
+		}
+		if len(types) == 0 {
 			return nil
 		}
-		if c.isGenericMappedType(t) && c.getMappedTypeNameTypeKind(t) != MappedTypeNameTypeKindRemapping {
-			return c.getIndexedMappedTypeSubstitutedTypeOfContextualType(t, name, nameType)
+		if len(types) == 1 {
+			return types[0]
 		}
-		result := c.getTypeOfConcretePropertyOfContextualType(t, name)
-		if result != nil {
-			return result
-		}
-		return c.getTypeFromIndexInfosOfContextualType(t, name, nameType)
-	}, true /*noReductions*/)
+		return c.getIntersectionType(types)
+	}
+	if t.flags&TypeFlagsObject == 0 {
+		return nil
+	}
+	if c.isGenericMappedType(t) && c.getMappedTypeNameTypeKind(t) != MappedTypeNameTypeKindRemapping {
+		return c.getIndexedMappedTypeSubstitutedTypeOfContextualType(t, name, nameType)
+	}
+	result := c.getTypeOfConcretePropertyOfContextualType(t, name)
+	if result != nil {
+		return result
+	}
+	return c.getTypeFromIndexInfosOfContextualType(t, name, nameType)
 }
 
 func (c *Checker) getIndexedMappedTypeSubstitutedTypeOfContextualType(t *Type, name string, nameType *Type) *Type {
@@ -31787,8 +33428,7 @@ func (c *Checker) isFunctionObjectType(t *Type) bool {
 	}
 	// We do a quick check for a "bind" property before performing the more expensive subtype
 	// check. This gives us a quicker out in the common case where an object type is not a function.
-	resolved := c.resolveStructuredTypeMembers(t)
-	return len(resolved.getSignatures()) != 0 || resolved.members["bind"] != nil && c.isTypeSubtypeOf(t, c.globalFunctionType)
+	return c.typeHasCallOrConstructSignatures(t) || c.getMemberOfStructuredTypeEx(t, "bind", false /*instantiate*/) != nil && c.isTypeSubtypeOf(t, c.globalFunctionType)
 }
 
 func (c *Checker) getTypeWithFacts(t *Type, include TypeFacts) *Type {
@@ -32284,7 +33924,7 @@ func (c *Checker) getSymbolAtLocation(node *ast.Node, ignoreErrors bool) *ast.Sy
 			// member should more exactly be the kind of (declarationless) symbol we want.
 			// (See #44364 and #45031 for relevant implementation PRs)
 			if metaProp.KeywordToken == ast.KindImportKeyword && node.Text() == "meta" {
-				return c.getGlobalImportMetaExpressionType().AsObjectType().members["meta"]
+				return c.getGlobalImportMetaExpressionType().AsObjectType().getMember("meta")
 			}
 			// no other meta properties are valid syntax, thus no others should have symbols
 			return nil

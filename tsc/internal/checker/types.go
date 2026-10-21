@@ -10,6 +10,7 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/collections"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/evaluator"
+	"github.com/zeebo/xxh3"
 )
 
 //go:generate npx hereby generate:checker
@@ -194,21 +195,21 @@ type valueSymbolExtra struct {
 }
 
 func (links *ValueSymbolLinks) getWriteType() *Type {
-	if links.extra == nil {
+	if links == nil || links.extra == nil {
 		return nil
 	}
 	return links.extra.writeType
 }
 
 func (links *ValueSymbolLinks) getNameType() *Type {
-	if links.extra == nil {
+	if links == nil || links.extra == nil {
 		return nil
 	}
 	return links.extra.nameType
 }
 
 func (links *ValueSymbolLinks) getContainingType() *Type {
-	if links.extra == nil {
+	if links == nil || links.extra == nil {
 		return nil
 	}
 	return links.extra.containingType
@@ -439,6 +440,7 @@ type SymbolNodeLinks struct {
 
 type TypeNodeLinks struct {
 	resolvedType        *Type    // Resolved type associated with node
+	resolvedFlowType    *Type    // Result of applying getConditionalFlowTypeOfType to resolvedType
 	outerTypeParameters *[]*Type // Outer type parameters of anonymous object type
 }
 
@@ -715,6 +717,8 @@ const (
 	ObjectFlagsIdenticalBaseTypeCalculated = 1 << 27 // has had `getSingleBaseForNonAugmentingSubtype` invoked on it already
 	ObjectFlagsIdenticalBaseTypeExists     = 1 << 28 // has a defined cachedEquivalentBaseType member
 	ObjectFlagsFromTypeNode                = 1 << 29 // Originates in resolution of AST type node
+	ObjectFlagsHasGenericArgumentsComputed = 1 << 30 // HasGenericArguments flag has been computed
+	ObjectFlagsHasGenericArguments         = 1 << 31 // Non-deferred type reference has generic type arguments
 	// Flags that require TypeFlags.UnionOrIntersection or TypeFlags.Substitution
 	ObjectFlagsIsGenericTypeComputed = 1 << 22 // IsGenericObjectType flag has been computed
 	ObjectFlagsIsGenericObjectType   = 1 << 23 // Union or intersection contains generic object type
@@ -1114,7 +1118,7 @@ func (t *ConstrainedType) AsConstrainedType() *ConstrainedType { return t }
 
 type StructuredType struct {
 	ConstrainedType
-	members    ast.SymbolTable
+	members    *memberIndex
 	properties []*ast.Symbol
 	extra      *structuredTypeExtra
 }
@@ -1168,6 +1172,110 @@ func (t *StructuredType) Properties() []*ast.Symbol {
 	return t.properties
 }
 
+type memberIndex struct {
+	slots    []uint32
+	fallback ast.SymbolTable
+}
+
+// Property order is semantic. Keep it unchanged and index it with pointer-free
+// slots instead of retaining a second map of names and symbol pointers.
+func (c *Checker) newMemberIndex(members ast.SymbolTable, properties []*ast.Symbol, index *memberIndex) *memberIndex {
+	if len(members) != len(properties) || !symbolTableKeysMatchNames(members) {
+		if index == nil {
+			index = c.memberIndexArena.New()
+		}
+		index.fallback = members
+		return index
+	}
+	if index != nil {
+		index.fallback = nil
+	}
+	return c.newPropertyIndex(properties, index)
+}
+
+// Reports whether every symbol is stored under its own name. Checking the
+// table's pairs, rather than looking each property up by name, also rejects a
+// symbol aliased under a second key, which a name-keyed index would drop.
+func symbolTableKeysMatchNames(members ast.SymbolTable) bool {
+	for name, symbol := range members {
+		if symbol.Name() != name {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Checker) newPropertyIndex(properties []*ast.Symbol, index *memberIndex) *memberIndex {
+	if len(properties) <= 8 {
+		if index != nil {
+			c.memberIndexArena.Pop(index)
+		}
+		return nil
+	}
+	if uint64(len(properties)) > uint64(^uint32(0)) {
+		panic("Member index exhausted")
+	}
+	if index == nil {
+		index = c.memberIndexArena.New()
+	}
+	size := 1 << bits.Len(uint(len(properties))*2-1)
+	index.slots = c.memberIndexSlotsArena.NewSlice(size)
+	mask := uint64(size - 1)
+	for i, symbol := range properties {
+		slot := xxh3.HashString(symbol.Name()) & mask
+		for index.slots[slot] != 0 {
+			slot = (slot + 1) & mask
+		}
+		index.slots[slot] = uint32(i + 1)
+	}
+	return index
+}
+
+func (t *StructuredType) getMember(name string) *ast.Symbol {
+	if t.members == nil {
+		for _, symbol := range t.properties {
+			if symbol.Name() == name {
+				return symbol
+			}
+		}
+		return nil
+	}
+	if t.members.fallback != nil {
+		return t.members.fallback[name]
+	}
+	slots := t.members.slots
+	if len(slots) == 0 {
+		return nil
+	}
+	mask := uint64(len(slots) - 1)
+	slot := xxh3.HashString(name) & mask
+	for {
+		index := slots[slot]
+		if index == 0 {
+			return nil
+		}
+		symbol := t.properties[index-1]
+		if symbol.Name() == name {
+			return symbol
+		}
+		slot = (slot + 1) & mask
+	}
+}
+
+func (t *StructuredType) getMembers() ast.SymbolTable {
+	if t.members != nil && t.members.fallback != nil {
+		return t.members.fallback
+	}
+	if len(t.properties) == 0 {
+		return nil
+	}
+	members := make(ast.SymbolTable, len(t.properties))
+	for _, symbol := range t.properties {
+		members[symbol.Name()] = symbol
+	}
+	return members
+}
+
 // Except for tuple type references and reverse mapped types, all object types have an associated symbol.
 // Possible object type instances are listed in the following.
 
@@ -1212,10 +1320,30 @@ func (t *ObjectType) AsObjectType() *ObjectType { return t }
 
 // TypeReference (instantiation of an InterfaceType)
 
+type lazyMemberTable struct {
+	mapper            *TypeMapper
+	declared          ast.SymbolTable
+	baseTypes         []*Type
+	orderedProperties []*ast.Symbol
+	ready             bool
+}
+
+type lazyMappedTable struct {
+	typeParameter              *Type
+	modifiersType              *Type
+	templateModifiers          MappedTypeModifiers
+	shouldLinkPropDeclarations bool
+	members                    map[string]*ast.Symbol
+	indexInfos                 []*IndexInfo
+	indexInfosReady            bool
+	resolving                  bool
+}
+
 type TypeReference struct {
 	ObjectType
 	node                  *ast.Node // TypeReferenceNode | ArrayTypeNode | TupleTypeNode when deferred, else nil
 	resolvedTypeArguments []*Type
+	lazy                  *lazyMemberTable
 }
 
 func (t *TypeReference) AsTypeReference() *TypeReference { return t }
@@ -1229,9 +1357,12 @@ type InterfaceType struct {
 	thisType                    *Type   // The "this" type (nil if none)
 	baseTypesResolved           bool
 	declaredMembersResolved     bool
+	declaredPropertiesClean     bool
 	resolvedBaseConstructorType *Type
 	resolvedBaseTypes           []*Type
 	declaredMembers             ast.SymbolTable // Declared members
+	declaredProperties          []*ast.Symbol   // Sorted declared named properties when declaredPropertiesClean
+	declaredMemberIndex         *memberIndex    // Shared property index when len(declaredProperties) == len(declaredMembers)
 	declaredCallSignatures      []*Signature    // Declared call signatures
 	declaredConstructSignatures []*Signature    // Declared construct signatures
 	declaredIndexInfos          []*IndexInfo    // Declared index signatures
@@ -1326,6 +1457,7 @@ type MappedType struct {
 	templateType         *Type
 	modifiersType        *Type
 	resolvedApparentType *Type
+	lazy                 *lazyMappedTable
 	containsError        bool
 }
 
@@ -1362,7 +1494,7 @@ type EvolvingArrayType struct {
 type UnionOrIntersectionType struct {
 	StructuredType
 	types                                       []*Type
-	propertyCache                               ast.SymbolTable
+	propertyCache                               ast.SymbolTable // Augmented entries not shared with the non-augmented cache.
 	propertyCacheWithoutFunctionPropertyAugment ast.SymbolTable
 	resolvedProperties                          []*ast.Symbol
 }

@@ -33,6 +33,19 @@ func ApplyDebugStackLimit() {
 	rtdebug.SetMaxStack(n)
 }
 
+func SuspendGC() func() {
+	if os.Getenv("GOGC") != "" { //nolint:forbidigo
+		return nil
+	}
+	prev := rtdebug.SetGCPercent(-1)
+	if prev < 0 {
+		return nil
+	}
+	return func() {
+		rtdebug.SetGCPercent(prev)
+	}
+}
+
 func Filter[T any](slice []T, f func(T) bool) []T {
 	for i, value := range slice {
 		if !f(value) {
@@ -309,7 +322,10 @@ func Concatenate[T any](s1 []T, s2 []T) []T {
 	if len(s1) == 0 {
 		return s2
 	}
-	return slices.Concat(s1, s2)
+	result := make([]T, len(s1)+len(s2))
+	copy(result, s1)
+	copy(result[len(s1):], s2)
+	return result
 }
 
 func Splice[T any](s1 []T, start int, deleteCount int, items ...T) []T {

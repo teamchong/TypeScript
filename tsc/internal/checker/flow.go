@@ -2,6 +2,7 @@ package checker
 
 import (
 	"math"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1655,6 +1656,16 @@ var nonDottedNameCacheKey = CacheHashKey(xxh3.HashString128("?"))
 // leftmost identifier followed by zero or more property names separated by dots.
 // The result is nonDottedNameCacheKey if the reference isn't a dotted name.
 func (c *Checker) getFlowReferenceKey(f *FlowState) CacheHashKey {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		if c.writeFlowCacheKey(b, f.reference, f.declaredType, f.initialType, f.flowContainer) {
+			return b.releaseHash()
+		}
+		b.inlineLength = 0
+		b.overflowBuffer = b.overflowBuffer[:0]
+		wasmKeyBuilderPool = append(wasmKeyBuilderPool, b)
+		return nonDottedNameCacheKey
+	}
 	var b keyBuilder
 	if c.writeFlowCacheKey(&b, f.reference, f.declaredType, f.initialType, f.flowContainer) {
 		return b.hash()

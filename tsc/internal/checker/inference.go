@@ -27,8 +27,8 @@ type InferenceState struct {
 	expandingFlags    ExpandingFlags
 	propagationType   *Type
 	visited           map[InferenceKey]InferencePriority
-	sourceStack       []*Type
-	targetStack       []*Type
+	sourceStack       []relaterStackEntry
+	targetStack       []relaterStackEntry
 	next              *InferenceState
 }
 
@@ -42,7 +42,11 @@ func (c *Checker) getInferenceState() *InferenceState {
 }
 
 func (c *Checker) putInferenceState(n *InferenceState) {
-	clear(n.visited)
+	if len(n.visited) > 64 {
+		n.visited = nil
+	} else if len(n.visited) != 0 {
+		clear(n.visited)
+	}
 	*n = InferenceState{
 		inferences:  n.inferences[:0],
 		visited:     n.visited,
@@ -358,12 +362,12 @@ func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, acti
 	// We stop inferring and report a circularity if we encounter duplicate recursion identities on both
 	// the source side and the target side.
 	saveExpandingFlags := n.expandingFlags
-	n.sourceStack = append(n.sourceStack, source)
-	n.targetStack = append(n.targetStack, target)
-	if c.isDeeplyNestedType(source, n.sourceStack, 2) {
+	n.sourceStack = append(n.sourceStack, relaterStackEntry{t: source})
+	n.targetStack = append(n.targetStack, relaterStackEntry{t: target})
+	if n.expandingFlags&ExpandingFlagsSource == 0 && c.isDeeplyNestedOnStack(source, n.sourceStack, 2) {
 		n.expandingFlags |= ExpandingFlagsSource
 	}
-	if c.isDeeplyNestedType(target, n.targetStack, 2) {
+	if n.expandingFlags&ExpandingFlagsTarget == 0 && c.isDeeplyNestedOnStack(target, n.targetStack, 2) {
 		n.expandingFlags |= ExpandingFlagsTarget
 	}
 	if n.expandingFlags != ExpandingFlagsBoth {
@@ -1132,7 +1136,9 @@ func (c *Checker) resolveReverseMappedTypeMembers(t *Type) {
 		checkFlags := ast.CheckFlagsReverseMapped | core.IfElse(readonlyMask && c.isReadonlySymbol(prop), ast.CheckFlagsReadonly, 0)
 		inferredProp := c.newSymbolEx(ast.SymbolFlagsProperty|prop.Flags()&optionalMask, prop.Name(), checkFlags)
 		inferredProp.SetDeclarations(prop.Declarations())
-		c.valueSymbolLinks.Get(inferredProp).setNameType(c, c.valueSymbolLinks.Get(prop).getNameType())
+		if nameType := c.valueSymbolLinks.TryGet(prop).getNameType(); nameType != nil {
+			c.valueSymbolLinks.Get(inferredProp).setNameType(c, nameType)
+		}
 		links := c.ReverseMappedSymbolLinks.Get(inferredProp)
 		links.propertyType = c.getTypeOfSymbol(prop)
 		constraintTarget := r.constraintType.AsIndexType().target

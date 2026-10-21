@@ -15,10 +15,10 @@ import (
 // Atomic ids
 
 var (
-	nextNodeId        atomic.Uint64
-	nextSymbolId      atomic.Uint64
-	nextNodeBlockId   atomic.Uint64
-	nextSymbolBlockId atomic.Uint64
+	nextNodeId        atomic.Uint32
+	nextSymbolId      atomic.Uint32
+	nextNodeBlockId   atomic.Uint32
+	nextSymbolBlockId atomic.Uint32
 )
 
 func GetNodeId(node *Node) NodeId {
@@ -46,13 +46,13 @@ func GetSymbolId(symbol *Symbol) SymbolId {
 }
 
 const (
-	BlockIdOffset = 0x1_0000_0000_0000
+	BlockIdOffset = 0x4000_0000
 	BlockIdSize   = core.LinkPageSize
 )
 
 type NodeIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
@@ -72,8 +72,8 @@ func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
 }
 
 type SymbolIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *SymbolIdGenerator) GetSymbolId(symbol *Symbol) SymbolId {

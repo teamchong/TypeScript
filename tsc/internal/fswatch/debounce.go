@@ -1,6 +1,7 @@
 package fswatch
 
 import (
+	"runtime"
 	"sync"
 	"time"
 )
@@ -42,7 +43,9 @@ func newDebounce() *debounce {
 	d := &debounce{
 		callbacks: make(map[any]func()),
 	}
-	go d.loop()
+	if runtime.GOARCH != "wasm" {
+		go d.loop()
+	}
 	return d
 }
 

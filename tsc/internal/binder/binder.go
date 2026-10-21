@@ -113,7 +113,14 @@ func getBinder() *Binder {
 }
 
 func putBinder(b *Binder) {
-	*b = Binder{bindFunc: b.bindFunc}
+	*b = Binder{
+		bindFunc:                b.bindFunc,
+		symbolWithDataArena:     b.symbolWithDataArena,
+		symbolExtraArena:        b.symbolExtraArena,
+		flowNodeArena:           b.flowNodeArena,
+		flowListArena:           b.flowListArena,
+		singleDeclarationsArena: b.singleDeclarationsArena,
+	}
 	binderPool.Put(b)
 }
 
@@ -2543,7 +2550,7 @@ func (b *Binder) addDeclarationToSymbol(symbol *ast.Symbol, node *ast.Node, symb
 	symbol.SetFlags(symbol.Flags() | symbolFlags)
 	node.DeclarationData().Symbol = symbol
 	if symbol.Declarations() == nil {
-		symbol.SetDeclarations(b.newSingleDeclaration(node))
+		symbol.SetSingleDeclaration(node)
 	} else {
 		symbol.SetDeclarations(core.AppendIfUnique(symbol.Declarations(), node))
 	}

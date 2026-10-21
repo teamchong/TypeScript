@@ -39,6 +39,7 @@ type EmitInput struct {
 	WriteFile          compiler.WriteFile
 	CompileTimes       *CompileTimes
 	Testing            CommandLineTesting
+	ResumeGC           *func()
 	TestingMTimesCache *collections.SyncMap[tspath.PathKey, time.Time]
 	Tracing            *tracing.Tracing
 }
@@ -90,6 +91,10 @@ func EmitFilesAndReportErrors(input EmitInput) (result CompileAndEmitResult) {
 			bindStart := input.Sys.Now()
 			diags := input.ProgramLike.GetBindDiagnostics(ctx, file)
 			result.times.bindTime = input.Sys.Now().Sub(bindStart)
+			if input.ResumeGC != nil && *input.ResumeGC != nil {
+				(*input.ResumeGC)()
+				*input.ResumeGC = nil
+			}
 			return diags
 		},
 		func(ctx context.Context, file *ast.SourceFile) []*ast.Diagnostic {

@@ -37,6 +37,8 @@ export var ObjectFlags;
     ObjectFlags[ObjectFlags["IdenticalBaseTypeCalculated"] = 134217728] = "IdenticalBaseTypeCalculated";
     ObjectFlags[ObjectFlags["IdenticalBaseTypeExists"] = 268435456] = "IdenticalBaseTypeExists";
     ObjectFlags[ObjectFlags["FromTypeNode"] = 536870912] = "FromTypeNode";
+    ObjectFlags[ObjectFlags["HasGenericArgumentsComputed"] = 1073741824] = "HasGenericArgumentsComputed";
+    ObjectFlags[ObjectFlags["HasGenericArguments"] = -2147483648] = "HasGenericArguments";
     ObjectFlags[ObjectFlags["IsGenericTypeComputed"] = 4194304] = "IsGenericTypeComputed";
     ObjectFlags[ObjectFlags["IsGenericObjectType"] = 8388608] = "IsGenericObjectType";
     ObjectFlags[ObjectFlags["IsGenericIndexType"] = 16777216] = "IsGenericIndexType";
