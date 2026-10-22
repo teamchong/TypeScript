@@ -73,6 +73,7 @@ type TypeResolution struct {
 	target       TypeSystemEntity
 	propertyName TypeSystemPropertyName
 	result       bool
+	serial       uint32
 }
 
 // ContextualInfo
@@ -260,8 +261,9 @@ type FlowLoopKey struct {
 }
 
 type FlowLoopInfo struct {
-	key   FlowLoopKey
-	types []*Type
+	key    FlowLoopKey
+	types  []*Type
+	serial uint32
 }
 
 // InferenceFlags
@@ -710,6 +712,7 @@ type Checker struct {
 	inferMemoSteps                              uint32
 	inferLongTargets                            map[*Type]bool
 	inferMemoEntries                            map[CacheHashKey]*inferMemoEntry
+	flowMemo                                    flowMemo
 	indexedAccessUnionMemo                      map[indexedAccessUnionKey]*Type
 	globalObjectAugmentFilter                   [4]uint64
 	globalObjectFilterReady                     bool
@@ -970,7 +973,7 @@ type Checker struct {
 func NewChecker(program Program, tracer *Tracer) (*Checker, *sync.Mutex) {
 	program.BindSourceFiles()
 
-	c := &Checker{}
+	c := &Checker{flowMemo: newFlowMemo()}
 	c.id = nextCheckerID.Add(1)
 	c.tracer = tracer
 	c.program = program
@@ -7608,6 +7611,7 @@ func (c *Checker) getTypeOfExpression(node *ast.Node) *Type {
 	// If a type has been cached for the node, return it.
 	if cachedType := c.flowTypeCache[node]; cachedType != nil {
 		c.resolutionCycleCount++
+		c.flowMemo.addFlags(flowMemoFlagTypeCache)
 		return cachedType
 	}
 	startInvocationCount := c.flowInvocationCount
@@ -7618,6 +7622,7 @@ func (c *Checker) getTypeOfExpression(node *ast.Node) *Type {
 			c.flowTypeCache = make(map[*ast.Node]*Type)
 		}
 		c.flowTypeCache[node] = t
+		c.flowMemo.typeCacheEpoch = c.flowMemo.nextSerial()
 	}
 	return t
 }
@@ -7787,14 +7792,11 @@ func (c *Checker) checkExpressionCachedEx(node *ast.Node, checkMode CheckMode) *
 	links := c.typeNodeLinks.Get(node)
 	if links.resolvedType == nil {
 		// When computing a type that we're going to cache, we need to ignore any ongoing control flow
-		// analysis because variables may have transient types in indeterminable states. Moving flowLoopStart
-		// to the top of the stack ensures all transient types are computed from a known point.
 		saveFlowLoopStack := c.flowLoopStack
-		saveFlowTypeCache := c.flowTypeCache
+		saveFlowTypeCache := c.takeFlowTypeCache()
 		c.flowLoopStack = nil
-		c.flowTypeCache = nil
 		links.resolvedType = c.checkExpressionEx(node, checkMode)
-		c.flowTypeCache = saveFlowTypeCache
+		c.restoreFlowTypeCache(saveFlowTypeCache)
 		c.flowLoopStack = saveFlowLoopStack
 	}
 	return links.resolvedType
@@ -8693,26 +8695,22 @@ func (c *Checker) getResolvedSignature(node *ast.Node, candidatesOutArray *[]*Si
 		return cached
 	}
 	saveResolutionStart := c.resolutionStart
+	// If we haven't already done so, temporarily reset the resolution stack. This allows us to
+	// handle "inverted" situations where, for example, an API client asks for the type of a symbol
+	// containined in a function call argument whose contextual type depends on the symbol itself
+	// through resolution of the containing function call. By resetting the resolution stack we'll
+	// retry the symbol type resolution with the resolvingSignature marker in place to suppress
+	// the contextual type circularity.
 	if cached == nil {
-		// If we haven't already done so, temporarily reset the resolution stack. This allows us to
-		// handle "inverted" situations where, for example, an API client asks for the type of a symbol
-		// containined in a function call argument whose contextual type depends on the symbol itself
-		// through resolution of the containing function call. By resetting the resolution stack we'll
-		// retry the symbol type resolution with the resolvingSignature marker in place to suppress
-		// the contextual type circularity.
 		c.resolutionStart = len(c.typeResolutions)
 	} else if cached == c.resolvingSignature {
 		c.resolutionCycleCount++
+		c.flowMemo.taint(0)
 	}
 	links.resolvedSignature = c.resolvingSignature
 	result := c.resolveSignature(node, candidatesOutArray, checkMode)
 	c.resolutionStart = saveResolutionStart
-	// When CheckMode.SkipGenericFunctions is set we use resolvingSignature to indicate that call
-	// resolution should be deferred.
 	if result != c.resolvingSignature {
-		// if the signature resolution originated on a node that itself depends on the contextual type
-		// then it's possible that the resolved signature might not be the same as the one that would be computed in source order
-		// since resolving such signature leads to resolving the potential outer signature, its arguments and thus the very same signature
 		// it's possible that this inner resolution sets the resolvedSignature first.
 		// In such a case we ignore the local result and reuse the correct one that was cached.
 		if links.resolvedSignature != c.resolvingSignature {
@@ -19613,7 +19611,7 @@ func (c *Checker) pushTypeResolution(target TypeSystemEntity, propertyName TypeS
 		}
 		return false
 	}
-	c.typeResolutions = append(c.typeResolutions, TypeResolution{target: target, propertyName: propertyName, result: true})
+	c.typeResolutions = append(c.typeResolutions, TypeResolution{target: target, propertyName: propertyName, result: true, serial: c.flowMemo.sourceNow()})
 	return true
 }
 
@@ -19636,6 +19634,7 @@ func (c *Checker) findResolutionCycleStartIndex(target TypeSystemEntity, propert
 			return -1
 		}
 		if resolution.target == target && resolution.propertyName == propertyName {
+			c.flowMemo.taint(resolution.serial)
 			return i
 		}
 	}
@@ -32062,6 +32061,7 @@ func (c *Checker) getContextualTypeForArgumentAtIndex(callTarget *ast.Node, argI
 	var signature *Signature
 	if links := c.signatureLinks.TryGet(callTarget); links != nil && links.resolvedSignature == c.resolvingSignature {
 		c.resolutionCycleCount++
+		c.flowMemo.taint(0)
 		signature = c.resolvingSignature
 	} else {
 		signature = c.getResolvedSignature(callTarget, nil, CheckModeNormal)
@@ -33798,6 +33798,7 @@ func (c *Checker) getNarrowableTypeForReference(t *Type, reference *ast.Node, ch
 	// 'string | undefined' to give control flow analysis the opportunity to narrow to type 'string'.
 	substituteConstraints := checkMode&CheckModeInferential == 0 && someType(t, c.isGenericTypeWithUnionConstraint) && (c.isConstraintPosition(t, reference) || c.hasContextualTypeWithNoGenericTypes(reference, checkMode))
 	if substituteConstraints {
+		c.flowMemo.taint(0)
 		return c.mapType(t, c.getBaseConstraintOrType)
 	}
 	return t

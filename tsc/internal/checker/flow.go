@@ -34,8 +34,12 @@ func (c *Checker) newFlowType(t *Type, incomplete bool) FlowType {
 }
 
 type SharedFlow struct {
-	flow     *ast.FlowNode
-	flowType FlowType
+	flow      *ast.FlowNode
+	flowType  FlowType
+	transient uint32
+	reference uint32
+	height    uint16
+	flags     uint8
 }
 
 type FlowState struct {
@@ -47,6 +51,13 @@ type FlowState struct {
 	depth           int
 	sharedFlowStart int
 	reduceLabels    []*ast.FlowReduceLabelData
+	memoKey         CacheHashKey
+	memoKeyState    uint8
+	walkFloor       uint32
+	memoUsed        bool
+	memoAborted     bool
+	memoFaithful    bool
+	impureShared    uint32
 	next            *FlowState
 }
 
@@ -95,8 +106,21 @@ func (c *Checker) getFlowTypeOfReferenceEx(reference *ast.Node, declaredType *Ty
 	f.initialType = core.Coalesce(initialType, declaredType)
 	f.flowContainer = flowContainer
 	f.sharedFlowStart = len(c.sharedFlows)
+	f.walkFloor = c.flowMemo.nextSerial()
 	c.flowInvocationCount++
-	evolvedType := c.getTypeAtFlowNode(f, flowNode).t
+	c.flowMemoKey(f)
+	savedHeight := c.flowMemo.saveHeight()
+	flowType := c.getTypeAtFlowNode(f, flowNode)
+	if f.memoAborted {
+		c.sharedFlows = c.sharedFlows[:f.sharedFlowStart]
+		f.memoAborted = false
+		f.memoUsed = false
+		f.memoFaithful = true
+		f.impureShared = 0
+		flowType = c.getTypeAtFlowNode(f, flowNode)
+	}
+	c.flowMemo.restoreHeight(savedHeight)
+	evolvedType := flowType.t
 	c.sharedFlows = c.sharedFlows[:f.sharedFlowStart]
 	c.putFlowState(f)
 	// When the reference is 'x' in an 'x.length', 'x.push(value)', 'x.unshift(value)' or x[n] = value' operation,
@@ -116,7 +140,12 @@ func (c *Checker) getFlowTypeOfReferenceEx(reference *ast.Node, declaredType *Ty
 }
 
 func (c *Checker) getTypeAtFlowNode(f *FlowState, flow *ast.FlowNode) FlowType {
+	entryFlow := flow
 	if f.depth == 2000 {
+		if f.memoUsed {
+			f.memoAborted = true
+			return FlowType{t: c.errorType}
+		}
 		// We have made 2000 recursive invocations. To avoid overflowing the call stack we report an error
 		// and disable further control flow analysis in the containing function or module body.
 		if tr := c.tracer; tr != nil {
@@ -126,9 +155,28 @@ func (c *Checker) getTypeAtFlowNode(f *FlowState, flow *ast.FlowNode) FlowType {
 		c.reportFlowControlError(f.reference)
 		return FlowType{t: c.errorType}
 	}
-	f.depth++
+	entryDepth := f.depth
+	tracked := f.memoKeyState == 2
+	var frame flowFrame
+	if tracked {
+		frame = c.flowFrameBegin()
+	}
+	hasMemo := tracked && c.inlineLevel == 0 && !c.flowAnalysisDisabled && len(f.reduceLabels) == 0
+	var memo frameMemo
+	if hasMemo {
+		memo = frameMemo{
+			key:         f.memoKey,
+			checkpoints: uint32(len(c.flowMemo.checkpoints)),
+		}
+	}
+	f.depth = entryDepth + 1
 	var sharedFlow *ast.FlowNode
+	var steps uint32
+	var hit flowMemoHit
+	var hasHit bool
+	var t FlowType
 	for {
+		steps++
 		flags := flow.Flags
 		if flags&ast.FlowFlagsShared != 0 {
 			// We cache results of flow type resolution for shared nodes that were previously visited in
@@ -136,74 +184,133 @@ func (c *Checker) getTypeAtFlowNode(f *FlowState, flow *ast.FlowNode) FlowType {
 			// antecedent of more than one node.
 			for i := f.sharedFlowStart; i < len(c.sharedFlows); i++ {
 				if c.sharedFlows[i].flow == flow {
-					f.depth--
-					return c.sharedFlows[i].flowType
+					shared := c.sharedFlows[i]
+					f.depth = entryDepth
+					if tracked {
+						c.flowMemoConsume(shared.transient, shared.reference)
+						c.flowMemo.addFlags(shared.flags)
+						c.flowFrameEndWith(frame, shared.height)
+					}
+					if hasMemo {
+						c.flowMemo.checkpoints = c.flowMemo.checkpoints[:memo.checkpoints]
+					}
+					return shared.flowType
 				}
 			}
 			sharedFlow = flow
 		}
-		var t FlowType
-		switch {
-		case flags&ast.FlowFlagsAssignment != 0:
-			t = c.getTypeAtFlowAssignment(f, flow)
-			if t.isNil() {
-				flow = flow.Antecedent
-				continue
+		if hasMemo {
+			memoHit, endsIteration, ok := c.flowMemoAtNode(f, entryFlow, flow, flags, memo.key, entryDepth)
+			if ok {
+				if !endsIteration {
+					sharedFlow = nil
+				}
+				hit = memoHit
+				hasHit = true
+				t = FlowType{t: memoHit.t}
+				break
 			}
-		case flags&ast.FlowFlagsCall != 0:
-			t = c.getTypeAtFlowCall(f, flow)
-			if t.isNil() {
-				flow = flow.Antecedent
-				continue
-			}
-		case flags&ast.FlowFlagsCondition != 0:
-			t = c.getTypeAtFlowCondition(f, flow)
-		case flags&ast.FlowFlagsSwitchClause != 0:
-			t = c.getTypeAtSwitchClause(f, flow)
-		case flags&ast.FlowFlagsBranchLabel != 0:
-			antecedents := getBranchLabelAntecedents(flow, f.reduceLabels)
-			if antecedents.Next == nil {
-				flow = antecedents.Flow
-				continue
-			}
-			t = c.getTypeAtFlowBranchLabel(f, flow, antecedents)
-		case flags&ast.FlowFlagsLoopLabel != 0:
-			if flow.Antecedents.Next == nil {
-				flow = flow.Antecedents.Flow
-				continue
-			}
-			t = c.getTypeAtFlowLoopLabel(f, flow)
-		case flags&ast.FlowFlagsArrayMutation != 0:
-			t = c.getTypeAtFlowArrayMutation(f, flow)
-			if t.isNil() {
-				flow = flow.Antecedent
-				continue
-			}
-		case flags&ast.FlowFlagsReduceLabel != 0:
-			f.reduceLabels = append(f.reduceLabels, flow.Node.AsFlowReduceLabelData())
-			t = c.getTypeAtFlowNode(f, flow.Antecedent)
-			f.reduceLabels = f.reduceLabels[:len(f.reduceLabels)-1]
-		case flags&ast.FlowFlagsStart != 0:
-			// Check if we should continue with the control flow of the containing function.
-			container := flow.Node
-			if container != nil && container != f.flowContainer && !ast.IsPropertyAccessExpression(f.reference) && !ast.IsElementAccessExpression(f.reference) && !(f.reference.Kind == ast.KindThisKeyword && !ast.IsArrowFunction(container)) {
-				flow = container.FlowNodeData().FlowNode
-				continue
-			}
-			// At the top of the flow we have the initial type.
-			t = FlowType{t: f.initialType}
-		default:
-			// Unreachable code errors are reported in the binding phase. Here we
-			// simply return the non-auto declared type to reduce follow-on errors.
-			t = FlowType{t: c.convertAutoToAny(f.declaredType)}
 		}
-		if sharedFlow != nil {
-			// Record visited node and the associated type in the cache.
-			c.sharedFlows = append(c.sharedFlows, SharedFlow{flow: sharedFlow, flowType: t})
+		var next *ast.FlowNode
+		var done bool
+		t, next, done = c.getTypeAtFlowNodeStep(f, flow, flags)
+		if done {
+			break
 		}
-		f.depth--
-		return t
+		flow = next
 	}
+	f.depth = entryDepth
+	var taint frameTaint
+	var height uint16
+	if tracked {
+		if f.memoAborted {
+			c.flowFrameEnd(frame)
+			if hasMemo {
+				c.flowMemo.checkpoints = c.flowMemo.checkpoints[:memo.checkpoints]
+			}
+			return t
+		}
+		if hasHit {
+			f.memoUsed = true
+			c.flowMemo.raiseHeight(hit.height)
+		}
+		taint, height = c.flowFrameEnd(frame)
+		if sharedFlow != nil {
+			if taint.transient != flowMemoUnTainted {
+				f.impureShared++
+			}
+			c.sharedFlows = append(c.sharedFlows, SharedFlow{
+				flow:      sharedFlow,
+				flowType:  t,
+				transient: taint.transient,
+				reference: taint.reference,
+				height:    height,
+				flags:     taint.flags,
+			})
+		}
+		if hasMemo {
+			c.flowMemoFill(f, memo, entryFlow, flow, t, taint, height, steps, hasHit)
+			c.flowMemo.checkpoints = c.flowMemo.checkpoints[:memo.checkpoints]
+		}
+	} else if sharedFlow != nil {
+		// Record visited node and the associated type in the cache.
+		c.sharedFlows = append(c.sharedFlows, SharedFlow{flow: sharedFlow, flowType: t})
+	}
+	return t
+}
+
+func (c *Checker) getTypeAtFlowNodeStep(f *FlowState, flow *ast.FlowNode, flags ast.FlowFlags) (FlowType, *ast.FlowNode, bool) {
+	var t FlowType
+	switch {
+	case flags&ast.FlowFlagsAssignment != 0:
+		t = c.getTypeAtFlowAssignment(f, flow)
+		if t.isNil() {
+			return FlowType{}, flow.Antecedent, false
+		}
+	case flags&ast.FlowFlagsCall != 0:
+		t = c.getTypeAtFlowCall(f, flow)
+		if t.isNil() {
+			return FlowType{}, flow.Antecedent, false
+		}
+	case flags&ast.FlowFlagsCondition != 0:
+		t = c.getTypeAtFlowCondition(f, flow)
+	case flags&ast.FlowFlagsSwitchClause != 0:
+		t = c.getTypeAtSwitchClause(f, flow)
+	case flags&ast.FlowFlagsBranchLabel != 0:
+		antecedents := getBranchLabelAntecedents(flow, f.reduceLabels)
+		if antecedents.Next == nil {
+			return FlowType{}, antecedents.Flow, false
+		}
+		t = c.getTypeAtFlowBranchLabel(f, flow, antecedents)
+	case flags&ast.FlowFlagsLoopLabel != 0:
+		if flow.Antecedents.Next == nil {
+			return FlowType{}, flow.Antecedents.Flow, false
+		}
+		t = c.getTypeAtFlowLoopLabel(f, flow)
+	case flags&ast.FlowFlagsArrayMutation != 0:
+		t = c.getTypeAtFlowArrayMutation(f, flow)
+		if t.isNil() {
+			return FlowType{}, flow.Antecedent, false
+		}
+	case flags&ast.FlowFlagsReduceLabel != 0:
+		c.flowMemo.taint(0)
+		f.reduceLabels = append(f.reduceLabels, flow.Node.AsFlowReduceLabelData())
+		t = c.getTypeAtFlowNode(f, flow.Antecedent)
+		f.reduceLabels = f.reduceLabels[:len(f.reduceLabels)-1]
+	case flags&ast.FlowFlagsStart != 0:
+		// Check if we should continue with the control flow of the containing function.
+		container := flow.Node
+		if container != nil && container != f.flowContainer && !ast.IsPropertyAccessExpression(f.reference) && !ast.IsElementAccessExpression(f.reference) && !(f.reference.Kind == ast.KindThisKeyword && !ast.IsArrowFunction(container)) {
+			return FlowType{}, container.FlowNodeData().FlowNode, false
+		}
+		// At the top of the flow we have the initial type.
+		t = FlowType{t: f.initialType}
+	default:
+		// Unreachable code errors are reported in the binding phase. Here we
+		// simply return the non-auto declared type to reduce follow-on errors.
+		t = FlowType{t: c.convertAutoToAny(f.declaredType)}
+	}
+	return t, nil, true
 }
 
 func getBranchLabelAntecedents(flow *ast.FlowNode, reduceLabels []*ast.FlowReduceLabelData) *ast.FlowList {
@@ -228,6 +335,9 @@ func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) Flow
 		}
 		if getAssignmentTargetKind(node) == AssignmentKindCompound {
 			flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
+			if f.memoAborted {
+				return flowType
+			}
 			return c.newFlowType(c.getBaseTypeOfLiteralType(flowType.t), flowType.incomplete)
 		}
 		if f.declaredType == c.autoType || f.declaredType == c.autoArrayType {
@@ -260,7 +370,8 @@ func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) Flow
 		// A matching dotted name might also be an expando property on a function *expression*,
 		// in which case we continue control flow analysis back to the function's declaration
 		if ast.IsVariableDeclaration(node) && (ast.IsInJSFile(node) || ast.IsVarConstLike(node)) {
-			if init := node.Initializer(); init != nil && ast.IsFunctionExpressionOrArrowFunction(init) {
+			init := node.Initializer()
+			if init != nil && ast.IsFunctionExpressionOrArrowFunction(init) {
 				return c.getTypeAtFlowNode(f, flow.Antecedent)
 			}
 		}
@@ -268,7 +379,11 @@ func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) Flow
 	}
 	// for (const _ in ref) acts as a nonnull on ref
 	if ast.IsVariableDeclaration(node) && ast.IsForInStatement(node.Parent.Parent) && (c.isMatchingReference(f.reference, node.Parent.Parent.Expression()) || c.optionalChainContainsReference(node.Parent.Parent.Expression(), f.reference)) {
-		return FlowType{t: c.getNonNullableTypeIfNeeded(c.finalizeEvolvingArrayType(c.getTypeAtFlowNode(f, flow.Antecedent).t))}
+		flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
+		if f.memoAborted {
+			return flowType
+		}
+		return FlowType{t: c.getNonNullableTypeIfNeeded(c.finalizeEvolvingArrayType(flowType.t))}
 	}
 	// Assignment doesn't affect reference
 	return FlowType{}
@@ -276,8 +391,10 @@ func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) Flow
 
 func (c *Checker) getInitialOrAssignedType(f *FlowState, flow *ast.FlowNode) *Type {
 	if ast.IsVariableDeclaration(flow.Node) || ast.IsBindingElement(flow.Node) {
+		c.flowMemo.taintReference(f.walkFloor)
 		return c.getNarrowableTypeForReference(c.getInitialType(flow.Node), f.reference, CheckModeNormal)
 	}
+	c.flowMemo.taintReference(f.walkFloor)
 	return c.getNarrowableTypeForReference(c.getAssignedType(flow.Node), f.reference, CheckModeNormal)
 }
 
@@ -292,6 +409,9 @@ func (c *Checker) getTypeAtFlowCall(f *FlowState, flow *ast.FlowNode) FlowType {
 		predicate := c.getTypePredicateOfSignature(signature)
 		if predicate != nil && (predicate.kind == TypePredicateKindAssertsThis || predicate.kind == TypePredicateKindAssertsIdentifier) {
 			flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
+			if f.memoAborted {
+				return flowType
+			}
 			t := c.finalizeEvolvingArrayType(flowType.t)
 			var narrowedType *Type
 			switch {
@@ -354,7 +474,7 @@ func (c *Checker) narrowTypeByAssertion(f *FlowState, t *Type, expr *ast.Node) *
 
 func (c *Checker) getTypeAtFlowCondition(f *FlowState, flow *ast.FlowNode) FlowType {
 	flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
-	if flowType.t.flags&TypeFlagsNever != 0 {
+	if f.memoAborted || flowType.t.flags&TypeFlagsNever != 0 {
 		return flowType
 	}
 	// If we have an antecedent type (meaning we're reachable in some way), we first
@@ -388,7 +508,10 @@ func (c *Checker) narrowType(f *FlowState, t *Type, expr *ast.Node, assumeTrue b
 			symbol := c.getResolvedSymbol(expr)
 			if c.isConstantVariable(symbol) {
 				declaration := symbol.ValueDeclaration()
-				if declaration != nil && ast.IsVariableDeclaration(declaration) && declaration.Type() == nil && declaration.Initializer() != nil && c.isConstantReference(f.reference) {
+				if declaration != nil && ast.IsVariableDeclaration(declaration) && declaration.Type() == nil && declaration.Initializer() != nil && c.isConstantReferenceOfWalk(f) {
+					if c.inlineLevel == 1 {
+						c.flowMemo.taint(0)
+					}
 					c.inlineLevel++
 					result := c.narrowType(f, t, declaration.Initializer(), assumeTrue)
 					c.inlineLevel--
@@ -1061,6 +1184,9 @@ func (c *Checker) getTypeAtSwitchClause(f *FlowState, flow *ast.FlowNode) FlowTy
 	data := flow.Node.AsFlowSwitchClauseData()
 	expr := ast.SkipParentheses(data.SwitchStatement.Expression())
 	flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
+	if f.memoAborted {
+		return flowType
+	}
 	t := flowType.t
 	switch {
 	case c.isMatchingReference(f.reference, expr):
@@ -1264,7 +1390,10 @@ func (c *Checker) getTypeAtFlowBranchLabel(f *FlowState, flow *ast.FlowNode, ant
 			continue
 		}
 		flowType := c.getTypeAtFlowNode(f, antecedent)
-		// If the type at a particular antecedent path is the declared type and the
+		if f.memoAborted {
+			c.antecedentTypes = c.antecedentTypes[:antecedentStart]
+			return flowType
+		}
 		// reference is known to always be assigned (i.e. when declared and initial types
 		// are the same), there is no reason to process more antecedents since the only
 		// possible outcome is subtypes that will be removed in the final union type anyway.
@@ -1287,7 +1416,10 @@ func (c *Checker) getTypeAtFlowBranchLabel(f *FlowState, flow *ast.FlowNode, ant
 	}
 	if bypassFlow != nil {
 		flowType := c.getTypeAtFlowNode(f, bypassFlow)
-		// If the bypass flow contributes a type we haven't seen yet and the switch statement
+		if f.memoAborted {
+			c.antecedentTypes = c.antecedentTypes[:antecedentStart]
+			return flowType
+		}
 		// isn't exhaustive, process the bypass flow type. Since exhaustiveness checks increase
 		// the risk of circularities, we only want to perform them when they make a difference.
 		if flowType.t.flags&TypeFlagsNever == 0 && !slices.Contains(c.antecedentTypes[antecedentStart:], flowType.t) && !c.isExhaustiveSwitchStatement(bypassFlow.Node.AsFlowSwitchClauseData().SwitchStatement) {
@@ -1347,10 +1479,10 @@ func (c *Checker) getTypeAtFlowLoopLabel(f *FlowState, flow *ast.FlowNode) FlowT
 	// path that leads to the top.
 	for _, loopInfo := range c.flowLoopStack {
 		if loopInfo.key == key && len(loopInfo.types) != 0 {
+			c.flowMemo.taint(loopInfo.serial)
 			return c.newFlowType(c.getUnionOrEvolvingArrayType(f, loopInfo.types, UnionReductionLiteral), true /*incomplete*/)
 		}
 	}
-	// Add the flow loop junction and reference to the in-process stack and analyze
 	// each antecedent code path.
 	antecedentTypes := make([]*Type, 0, 4)
 	subtypeReduction := false
@@ -1361,18 +1493,22 @@ func (c *Checker) getTypeAtFlowLoopLabel(f *FlowState, flow *ast.FlowNode) FlowT
 			// The first antecedent of a loop junction is always the non-looping control
 			// flow path that leads to the top.
 			firstAntecedentType = c.getTypeAtFlowNode(f, list.Flow)
+			if f.memoAborted {
+				return firstAntecedentType
+			}
 			flowType = firstAntecedentType
 		} else {
 			// All but the first antecedent are the looping control flow paths that lead
 			// back to the loop junction. We track these on the flow loop stack.
-			c.flowLoopStack = append(c.flowLoopStack, FlowLoopInfo{key: key, types: antecedentTypes})
-			saveFlowTypeCache := c.flowTypeCache
-			c.flowTypeCache = nil
+			serial := c.flowMemo.nextSerial()
+			c.flowLoopStack = append(c.flowLoopStack, FlowLoopInfo{key: key, types: antecedentTypes, serial: serial})
+			saveFlowTypeCache := c.takeFlowTypeCache()
 			flowType = c.getTypeAtFlowNode(f, list.Flow)
-			c.flowTypeCache = saveFlowTypeCache
+			c.restoreFlowTypeCache(saveFlowTypeCache)
 			c.flowLoopStack = c.flowLoopStack[:len(c.flowLoopStack)-1]
-			// If we see a value appear in the cache it is a sign that control flow analysis
-			// was restarted and completed by checkExpressionCached. We can simply pick up
+			if f.memoAborted {
+				return flowType
+			}
 			// the resulting type and bail out.
 			if cached := c.flowLoopCache[key]; cached != nil {
 				return FlowType{t: cached}
@@ -1413,6 +1549,9 @@ func (c *Checker) getTypeAtFlowArrayMutation(f *FlowState, flow *ast.FlowNode) F
 		}
 		if c.isMatchingReference(f.reference, c.getReferenceCandidate(expr)) {
 			flowType := c.getTypeAtFlowNode(f, flow.Antecedent)
+			if f.memoAborted {
+				return flowType
+			}
 			if flowType.t.objectFlags&ObjectFlagsEvolvingArray != 0 {
 				evolvedType := flowType.t
 				if ast.IsCallExpression(node) {
@@ -1820,6 +1959,13 @@ func (c *Checker) getLiteralPropertyNameText(name *ast.Node) (string, bool) {
 		return evaluator.AnyToString(t.AsLiteralType().value), true
 	}
 	return "", false
+}
+
+func (c *Checker) isConstantReferenceOfWalk(f *FlowState) bool {
+	if ast.IsAccessExpression(f.reference) {
+		c.flowMemo.taintReference(f.walkFloor)
+	}
+	return c.isConstantReference(f.reference)
 }
 
 func (c *Checker) isConstantReference(node *ast.Node) bool {
