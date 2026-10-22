@@ -292,6 +292,7 @@ type InferenceContext struct {
 	inferredTypeParameters        []*Type          // Inferred type parameters for function result
 	intraExpressionInferenceSites []IntraExpressionInferenceSite
 	mapperStorage                 [2]InferenceTypeMapper
+	escaped                       bool
 }
 
 type InferenceInfo struct {
@@ -303,6 +304,7 @@ type InferenceInfo struct {
 	topLevel         bool              // True if all inferences are to top level occurrences
 	isFixed          bool              // True if inferences are fixed
 	impliedArity     int               // Implied arity (or -1)
+	candidateStorage [2]*Type
 }
 
 type InferencePriority int32
@@ -670,6 +672,7 @@ type Checker struct {
 	tupleTypes                                  map[CacheHashKey]*Type
 	unionTypes                                  map[CacheHashKey]*Type
 	unionOfUnionTypes                           map[UnionOfUnionKey]*Type
+	unionDiscriminants                          map[*UnionType]unionDiscriminant
 	intersectionTypes                           map[CacheHashKey]*Type
 	propertiesTypes                             map[PropertiesTypesKey]*Type
 	diagnostics                                 ast.DiagnosticsCollection
@@ -704,6 +707,7 @@ type Checker struct {
 	compositeMapperArena                        core.Arena[CompositeTypeMapper]
 	typeAliasArena                              core.Arena[TypeAlias]
 	freeTypeArgLists                            [][]*Type
+	freeSymbolLists                             [][]*ast.Symbol
 	unionFrontCache                             map[CacheHashKey]*Type
 	unionFrontSlots                             *[1024]unionFrontSlot
 	unionImpureCount                            uint32
@@ -722,7 +726,6 @@ type Checker struct {
 	freeNameSets                                []map[string]struct{}
 	freeInferenceContexts                       []*InferenceContext
 	freeInferenceInfos                          []*InferenceInfo
-	mapperEscapeCount                           uint32
 	templateScratchPool                         []*templateLiteralScratch
 	leafKeyBuilder                              keyBuilder
 	namedUnionMemberSet                         map[*Type]struct{}
@@ -7986,7 +7989,7 @@ func (c *Checker) getUniqueTypeParameters(context *InferenceContext, typeParamet
 		for _, tp := range newTypeParameters {
 			tp.AsTypeParameter().mapper = mapper
 		}
-		c.mapperEscapeCount++
+		markMapperEscaped(mapper)
 	}
 	return result
 }
@@ -9142,14 +9145,26 @@ func (c *Checker) acquireCallState() *CallState {
 	if n := len(c.freeCallStates); n > 0 {
 		s := c.freeCallStates[n-1]
 		c.freeCallStates = c.freeCallStates[:n-1]
-		*s = CallState{}
 		return s
 	}
 	return &CallState{}
 }
 
 func (c *Checker) releaseCallState(s *CallState) {
-	*s = CallState{}
+	var candidates []*Signature
+	if cap(s.candidates) <= 64 {
+		clear(s.candidates)
+		candidates = s.candidates[:0]
+	}
+	var candidatesForArgumentError []*Signature
+	if cap(s.candidatesForArgumentError) <= 64 {
+		clear(s.candidatesForArgumentError)
+		candidatesForArgumentError = s.candidatesForArgumentError[:0]
+	}
+	*s = CallState{
+		candidates:                 candidates,
+		candidatesForArgumentError: candidatesForArgumentError,
+	}
 	c.freeCallStates = append(c.freeCallStates, s)
 }
 
@@ -9177,11 +9192,12 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 			c.checkSourceElements(s.typeArguments)
 		}
 	}
-	s.candidates = c.reorderCandidates(signatures, callChainFlags)
 	if candidatesOutArray != nil {
+		s.candidates = c.reorderCandidatesInto(nil, signatures, callChainFlags)
 		*candidatesOutArray = s.candidates
+	} else {
+		s.candidates = c.reorderCandidatesInto(s.candidates[:0], signatures, callChainFlags)
 	}
-
 	if len(s.candidates) == 0 {
 		// In Strada we would error here, but no known repro doesn't have at least
 		// one other error in this codepath. Just return instead. See #54442
@@ -9283,13 +9299,32 @@ func (c *Checker) resolveCall(node *ast.Node, signatures []*Signature, candidate
 }
 
 func (c *Checker) reorderCandidates(signatures []*Signature, callChainFlags SignatureFlags) []*Signature {
+	return c.reorderCandidatesInto(nil, signatures, callChainFlags)
+}
+
+func (c *Checker) reorderCandidatesInto(dst []*Signature, signatures []*Signature, callChainFlags SignatureFlags) []*Signature {
+	if len(signatures) == 0 {
+		return dst[:0]
+	}
+	if len(signatures) == 1 {
+		sig := signatures[0]
+		if callChainFlags != 0 {
+			sig = c.getOptionalCallSignature(sig, callChainFlags)
+		}
+		return append(dst[:0], sig)
+	}
 	var lastParent *ast.Node
 	var lastSymbol *ast.Symbol
 	var index int
 	var cutoffIndex int
 	var spliceIndex int
 	specializedIndex := -1
-	result := make([]*Signature, 0, len(signatures))
+	var result []*Signature
+	if cap(dst) >= len(signatures) {
+		result = dst[:0]
+	} else {
+		result = make([]*Signature, 0, len(signatures))
+	}
 	for _, signature := range signatures {
 		var symbol *ast.Symbol
 		var parent *ast.Node
@@ -9351,7 +9386,8 @@ func (c *Checker) getOptionalCallSignature(signature *Signature, callChainFlags 
 }
 
 func (c *Checker) chooseOverload(s *CallState, relation *Relation) *Signature {
-	s.candidatesForArgumentError = nil
+	clear(s.candidatesForArgumentError)
+	s.candidatesForArgumentError = s.candidatesForArgumentError[:0]
 	s.candidateForArgumentArityError = nil
 	s.candidateForTypeArgumentError = nil
 	if s.isSingleNonGenericCandidate {
@@ -9360,7 +9396,7 @@ func (c *Checker) chooseOverload(s *CallState, relation *Relation) *Signature {
 			return nil
 		}
 		if !c.isSignatureApplicable(s.node, s.args, candidate, relation, CheckModeNormal, false /*reportErrors*/, nil /*diagnosticOutput*/) {
-			s.candidatesForArgumentError = []*Signature{candidate}
+			s.candidatesForArgumentError = append(s.candidatesForArgumentError[:0], candidate)
 			return nil
 		}
 		return candidate
@@ -19738,7 +19774,7 @@ func (c *Checker) getPropertiesOfObjectType(t *Type) []*ast.Symbol {
 
 func (c *Checker) getPropertiesOfUnionOrIntersectionType(t *Type) []*ast.Symbol {
 	d := t.AsUnionOrIntersectionType()
-	if d.resolvedProperties == nil {
+	if d.properties == nil {
 		checked := c.getTemporaryNameSet()
 		defer c.releaseTemporaryNameSet(checked)
 		props := []*ast.Symbol{}
@@ -19758,9 +19794,9 @@ func (c *Checker) getPropertiesOfUnionOrIntersectionType(t *Type) []*ast.Symbol 
 				break
 			}
 		}
-		d.resolvedProperties = props
+		d.properties = props
 	}
-	return d.resolvedProperties
+	return d.properties
 }
 
 func (c *Checker) getPropertyOfType(t *Type, name string) *ast.Symbol {
@@ -20596,7 +20632,7 @@ func (c *Checker) getSignatureInstantiation(sig *Signature, typeArguments []*Typ
 			newReturnSignature.setTypeParameters(c, inferredTypeParameters)
 			newReturnType := c.getOrCreateTypeFromSignature(newReturnSignature)
 			newReturnType.AsObjectType().mapper = instantiatedSignature.mapper
-			c.mapperEscapeCount++
+			markMapperEscaped(instantiatedSignature.mapper)
 			newInstantiatedSignature := c.cloneSignature(instantiatedSignature)
 			newInstantiatedSignature.resolvedReturnType = newReturnType
 			return newInstantiatedSignature
@@ -20609,7 +20645,7 @@ func (c *Checker) cloneSignature(sig *Signature) *Signature {
 	result := c.newSignature(sig.flags&SignatureFlagsPropagatingFlags, sig.declaration, sig.TypeParameters(), sig.ThisParameter(), sig.parameters, nil, nil, int(sig.minArgumentCount))
 	result.target = sig.target
 	result.mapper = sig.mapper
-	c.mapperEscapeCount++
+	markMapperEscaped(sig.mapper)
 	result.setComposite(c, sig.getComposite())
 	return result
 }
@@ -21934,7 +21970,7 @@ func (c *Checker) instantiateSignatureEx(sig *Signature, m *TypeMapper, eraseTyp
 		for _, tp := range freshTypeParameters {
 			tp.AsTypeParameter().mapper = m
 		}
-		c.mapperEscapeCount++
+		markMapperEscaped(m)
 	}
 	// Don't compute resolvedReturnType and resolvedTypePredicate now,
 	// because using `mapper` now could trigger inferences to become fixed. (See `createInferenceContext`.)
@@ -21944,7 +21980,7 @@ func (c *Checker) instantiateSignatureEx(sig *Signature, m *TypeMapper, eraseTyp
 		nil /*resolvedReturnType*/, nil /*resolvedTypePredicate*/, int(sig.minArgumentCount))
 	result.target = sig
 	result.mapper = m
-	c.mapperEscapeCount++
+	markMapperEscaped(m)
 	return result
 }
 
@@ -22122,7 +22158,7 @@ func (c *Checker) instantiateSymbol(symbol *ast.Symbol, m *TypeMapper) *ast.Symb
 	resultLinks := c.valueSymbolLinks.Get(result)
 	resultLinks.target = symbol
 	resultLinks.mapper = m
-	c.mapperEscapeCount++
+	markMapperEscaped(m)
 	if links != nil {
 		resultLinks.setNameType(c, links.getNameType())
 	}
@@ -22500,7 +22536,8 @@ func (c *Checker) resolveUnionTypeMembers(t *Type) {
 		return c.getSignaturesOfType(t, SignatureKindConstruct)
 	}))
 	indexInfos := c.getUnionIndexInfos(t.Types())
-	c.setStructuredTypeMembers(t, nil, callSignatures, constructSignatures, indexInfos)
+	t.objectFlags |= ObjectFlagsMembersResolved
+	c.setStructuredTypeSignatures(t.AsStructuredType(), callSignatures, constructSignatures, indexInfos)
 }
 
 func (c *Checker) getArrayMemberCallSignatures(t *Type) []*Signature {
@@ -22648,10 +22685,10 @@ func (c *Checker) combineUnionOrIntersectionMemberSignatures(left *Signature, ri
 		} else {
 			result.mapper = paramMapper
 		}
-		c.mapperEscapeCount++
+		markMapperEscaped(result.mapper)
 	} else if left.getComposite() != nil && left.getComposite().isUnion == isUnion {
 		result.mapper = left.mapper
-		c.mapperEscapeCount++
+		markMapperEscaped(result.mapper)
 	}
 	return result
 }
@@ -22766,7 +22803,8 @@ func (c *Checker) resolveIntersectionTypeMembers(t *Type) {
 			indexInfos = c.appendIndexInfo(indexInfos, info, false /*union*/)
 		}
 	}
-	c.setStructuredTypeMembers(t, nil, callSignatures, constructSignatures, indexInfos)
+	t.objectFlags |= ObjectFlagsMembersResolved
+	c.setStructuredTypeSignatures(t.AsStructuredType(), callSignatures, constructSignatures, indexInfos)
 }
 
 func (c *Checker) appendSignatures(signatures []*Signature, newSignatures []*Signature) []*Signature {
@@ -22921,10 +22959,13 @@ func (s *unionOrIntersectionPropertySources) isSynthetic() bool {
 
 // addProp adds prop to props if it is not already present, preserving
 // first-insertion order.
-func (s *unionOrIntersectionPropertySources) addProp(prop *ast.Symbol) {
+func (s *unionOrIntersectionPropertySources) addProp(c *Checker, prop *ast.Symbol) {
 	if s.propsByKey == nil {
 		if slices.Contains(s.props, prop) {
 			return
+		}
+		if s.props == nil {
+			s.props = c.getTemporarySymbolList()
 		}
 		s.props = append(s.props, prop)
 		if len(s.props) > orderedSetMapThreshold {
@@ -22989,9 +23030,9 @@ func (c *Checker) getUnionOrIntersectionPropertySources(containingType *Type, na
 						mergedInstantiations = singleProp.Parent() != nil && len(c.getLocalTypeParametersOfClassOrInterfaceOrTypeAlias(singleProp.Parent())) != 0
 					} else {
 						if len(sources.props) == 0 {
-							sources.addProp(singleProp)
+							sources.addProp(c, singleProp)
 						}
-						sources.addProp(prop)
+						sources.addProp(c, prop)
 					}
 					// classes created by mixins are represented as intersections
 					// and overriding a property in a derived class redefines it completely at runtime
@@ -23039,12 +23080,21 @@ func (c *Checker) getUnionOrIntersectionPropertySources(containingType *Type, na
 						if indexType == nil {
 							indexType = c.undefinedType
 						}
+						if indexTypes == nil {
+							indexTypes = c.getTemporaryTypeArguments(0)[:0]
+						}
 						indexTypes = append(indexTypes, indexType)
 					} else {
+						if indexTypes == nil {
+							indexTypes = c.getTemporaryTypeArguments(0)[:0]
+						}
 						indexTypes = append(indexTypes, indexInfo.valueType)
 					}
 				} else if isObjectLiteralType(t) && t.objectFlags&ObjectFlagsContainsSpread == 0 {
 					checkFlags |= ast.CheckFlagsWritePartial
+					if indexTypes == nil {
+						indexTypes = c.getTemporaryTypeArguments(0)[:0]
+					}
 					indexTypes = append(indexTypes, c.undefinedType)
 				} else {
 					checkFlags |= ast.CheckFlagsReadPartial
@@ -23053,6 +23103,10 @@ func (c *Checker) getUnionOrIntersectionPropertySources(containingType *Type, na
 		}
 	}
 	if singleProp == nil {
+		c.releaseTemporarySymbolList(sources.props)
+		if indexTypes != nil {
+			c.releaseTemporaryTypeArguments(indexTypes)
+		}
 		// No property was found
 		return false
 	}
@@ -23064,6 +23118,10 @@ func (c *Checker) getUnionOrIntersectionPropertySources(containingType *Type, na
 		// or has a different declaration in another constituent. If the private or protected declaration is
 		// for reading, we don't create a property.
 		if checkFlags&(ast.CheckFlagsContainsPrivate|ast.CheckFlagsContainsProtected) != 0 {
+			c.releaseTemporarySymbolList(sources.props)
+			if indexTypes != nil {
+				c.releaseTemporaryTypeArguments(indexTypes)
+			}
 			return false
 		}
 		// Otherwise, if the private or protected declaration is for writing, reduce accessibility to that of
@@ -23089,6 +23147,12 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 	if !c.getUnionOrIntersectionPropertySources(containingType, name, skipObjectFunctionPropertyAugment, &sources) {
 		return nil
 	}
+	defer func() {
+		c.releaseTemporarySymbolList(sources.props)
+		if sources.indexTypes != nil {
+			c.releaseTemporaryTypeArguments(sources.indexTypes)
+		}
+	}()
 	singleProp := sources.singleProp
 	indexTypes := sources.indexTypes
 	propFlags := sources.propFlags
@@ -23120,17 +23184,22 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 		links.setWriteType(c, c.getWriteTypeOfSymbol(singleProp))
 		return clone
 	}
-	if len(sources.props) == 0 {
-		sources.props = []*ast.Symbol{singleProp}
+	props := sources.props
+	var singlePropBuf [1]*ast.Symbol
+	if len(props) == 0 {
+		singlePropBuf[0] = sources.singleProp
+		props = singlePropBuf[:]
 	}
-	var declarations []*ast.Node
+	var declarationsBuf [8]*ast.Node
+	declarations := declarationsBuf[:0]
 	var firstType *Type
 	var nameType *Type
-	var propTypes []*Type
+	propTypes := c.getTemporaryTypeArguments(0)[:0]
+	defer c.releaseTemporaryTypeArguments(propTypes)
 	var writeTypes []*Type
 	var firstValueDeclaration *ast.Node
 	var hasNonUniformValueDeclaration bool
-	for _, prop := range sources.props {
+	for _, prop := range props {
 		if firstValueDeclaration == nil {
 			firstValueDeclaration = prop.ValueDeclaration()
 		} else if prop.ValueDeclaration() != nil && prop.ValueDeclaration() != firstValueDeclaration {
@@ -23164,7 +23233,11 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 	}
 	propTypes = append(propTypes, indexTypes...)
 	result := c.newSymbolEx(propFlags|optionalFlag, name, checkFlags|syntheticFlag)
-	result.SetDeclarations(declarations)
+	if len(declarations) == 1 {
+		result.SetSingleDeclaration(declarations[0])
+	} else if len(declarations) > 1 {
+		result.SetDeclarations(slices.Clone(declarations))
+	}
 	if !hasNonUniformValueDeclaration && firstValueDeclaration != nil {
 		result.SetValueDeclaration(firstValueDeclaration)
 		// Inherit information about parent type.
@@ -23178,7 +23251,7 @@ func (c *Checker) createUnionOrIntersectionProperty(containingType *Type, name s
 		result.SetCheckFlags(result.CheckFlags() | ast.CheckFlagsDeferredType)
 		deferred := c.deferredSymbolLinks.Get(result)
 		deferred.parent = containingType
-		deferred.constituents = propTypes
+		deferred.constituents = c.typeListArena.Clone(propTypes)
 		deferred.writeConstituents = writeTypes
 		return result
 	}
@@ -23449,6 +23522,12 @@ func (c *Checker) intersectionPropertyReducesToNever(t *Type, name string) bool 
 	if !c.getUnionOrIntersectionPropertySources(t, name, true /*skipObjectFunctionPropertyAugment*/, &sources) {
 		return false
 	}
+	defer func() {
+		c.releaseTemporarySymbolList(sources.props)
+		if sources.indexTypes != nil {
+			c.releaseTemporaryTypeArguments(sources.indexTypes)
+		}
+	}()
 	if !sources.isSynthetic() {
 		if !sources.mergedInstantiations {
 			return c.isNeverReducedProperty(sources.singleProp)
@@ -23456,15 +23535,19 @@ func (c *Checker) intersectionPropertyReducesToNever(t *Type, name string) bool 
 		prop := c.getUnionOrIntersectionProperty(t, name, true /*skipObjectFunctionPropertyAugment*/)
 		return prop != nil && c.isNeverReducedProperty(prop)
 	}
-	if len(sources.props) == 0 {
-		sources.props = []*ast.Symbol{sources.singleProp}
+	props := sources.props
+	var singlePropBuf [1]*ast.Symbol
+	if len(props) == 0 {
+		singlePropBuf[0] = sources.singleProp
+		props = singlePropBuf[:]
 	}
 	checkFlags := sources.checkFlags
 	var firstType *Type
 	var firstValueDeclaration *ast.Node
 	hasNonUniformValueDeclaration := false
-	propTypes := make([]*Type, 0, len(sources.props)+len(sources.indexTypes))
-	for _, prop := range sources.props {
+	propTypes := c.getTemporaryTypeArguments(0)[:0]
+	defer c.releaseTemporaryTypeArguments(propTypes)
+	for _, prop := range props {
 		if firstValueDeclaration == nil {
 			firstValueDeclaration = prop.ValueDeclaration()
 		} else if prop.ValueDeclaration() != nil && prop.ValueDeclaration() != firstValueDeclaration {
@@ -23940,11 +24023,24 @@ func (c *Checker) instantiateTypeWorker(t *Type, m *TypeMapper, alias *TypeAlias
 		if objectFlags&(ObjectFlagsReference|ObjectFlagsAnonymous|ObjectFlagsMapped) != 0 {
 			if objectFlags&ObjectFlagsReference != 0 && t.AsTypeReference().node == nil {
 				resolvedTypeArguments := t.AsTypeReference().resolvedTypeArguments
-				newTypeArguments := c.instantiateTypes(resolvedTypeArguments, m)
-				if core.Same(newTypeArguments, resolvedTypeArguments) {
+				newTypeArguments, changed := c.instantiateTypesTemp(resolvedTypeArguments, m)
+				if !changed {
 					return t
 				}
-				return c.createNormalizedTypeReference(t.Target(), newTypeArguments)
+				target := t.Target()
+				if target.objectFlags&ObjectFlagsTuple == 0 || target.AsTupleType().combinedFlags&ElementFlagsNonRequired == 0 {
+					id := getTypeListKey(newTypeArguments)
+					if inst, ok := target.AsInterfaceType().instantiations[id]; ok {
+						c.releaseTemporaryTypeArguments(newTypeArguments)
+						return inst
+					}
+					cloned := c.typeListArena.Clone(newTypeArguments)
+					c.releaseTemporaryTypeArguments(newTypeArguments)
+					return c.createTypeReference(target, cloned)
+				}
+				cloned := c.typeListArena.Clone(newTypeArguments)
+				c.releaseTemporaryTypeArguments(newTypeArguments)
+				return c.createNormalizedTypeReference(target, cloned)
 			}
 			if objectFlags&ObjectFlagsReverseMapped != 0 {
 				return c.instantiateReverseMappedType(t, m)
@@ -24245,7 +24341,7 @@ func (c *Checker) instantiateAnonymousType(t *Type, m *TypeMapper, alias *TypeAl
 		result.AsMappedType().typeParameter = freshTypeParameter
 		m = c.combineTypeMappers(newSimpleTypeMapper(origTypeParameter, freshTypeParameter), m)
 		freshTypeParameter.AsTypeParameter().mapper = m
-		c.mapperEscapeCount++
+		markMapperEscaped(m)
 	case t.objectFlags&ObjectFlagsInstantiationExpressionType != 0:
 		result.AsInstantiationExpressionType().node = t.AsInstantiationExpressionType().node
 	}
@@ -24259,7 +24355,7 @@ func (c *Checker) instantiateAnonymousType(t *Type, m *TypeMapper, alias *TypeAl
 	d := result.AsObjectType()
 	d.target = t
 	d.mapper = m
-	c.mapperEscapeCount++
+	markMapperEscaped(m)
 	return result
 }
 
@@ -24576,6 +24672,23 @@ func (c *Checker) getTemporaryTypeArguments(n int) []*Type {
 func (c *Checker) releaseTemporaryTypeArguments(s []*Type) {
 	clear(s)
 	c.freeTypeArgLists = append(c.freeTypeArgLists, s[:0])
+}
+
+func (c *Checker) getTemporarySymbolList() []*ast.Symbol {
+	if l := len(c.freeSymbolLists); l > 0 {
+		s := c.freeSymbolLists[l-1]
+		c.freeSymbolLists[l-1] = nil
+		c.freeSymbolLists = c.freeSymbolLists[:l-1]
+		return s[:0]
+	}
+	return make([]*ast.Symbol, 0, 8)
+}
+
+func (c *Checker) releaseTemporarySymbolList(s []*ast.Symbol) {
+	if s != nil {
+		clear(s)
+		c.freeSymbolLists = append(c.freeSymbolLists, s[:0])
+	}
 }
 
 func (c *Checker) instantiateTypeAlias(alias *TypeAlias, m *TypeMapper) *TypeAlias {
@@ -26036,17 +26149,39 @@ func (c *Checker) getTypeFromArrayOrTupleTypeNode(node *ast.Node) *Type {
 			} else {
 				links.resolvedType = c.createDeferredTypeReference(target, node, nil /*mapper*/, nil /*alias*/)
 			}
-		} else {
-			var elementTypes []*Type
-			if node.Kind == ast.KindArrayType {
-				elementTypes = []*Type{c.getTypeFromTypeNode(node.AsArrayTypeNode().ElementType)}
+		} else if node.Kind == ast.KindArrayType {
+			elemType := c.getTypeFromTypeNode(node.AsArrayTypeNode().ElementType)
+			var buf [1]*Type
+			buf[0] = elemType
+			id := getTypeListKey(buf[:])
+			if inst, ok := target.AsInterfaceType().instantiations[id]; ok {
+				links.resolvedType = inst
 			} else {
-				elementTypes = core.Map(node.Elements(), c.getTypeFromTypeNode)
+				links.resolvedType = c.createTypeReferenceEx(target, c.typeListArena.NewSlice1(elemType), ObjectFlagsFromTypeNode)
 			}
-			if target.objectFlags&ObjectFlagsTuple != 0 {
-				links.resolvedType = c.createNormalizedTupleTypeEx(target, elementTypes, ObjectFlagsFromTypeNode)
+		} else {
+			elements := node.Elements()
+			if target.objectFlags&ObjectFlagsTuple != 0 && target.AsTupleType().combinedFlags&ElementFlagsNonRequired == 0 {
+				elementTypes := c.getTemporaryTypeArguments(len(elements))
+				for i, e := range elements {
+					elementTypes[i] = c.getTypeFromTypeNode(e)
+				}
+				id := getTypeListKey(elementTypes)
+				if inst, ok := target.AsInterfaceType().instantiations[id]; ok {
+					c.releaseTemporaryTypeArguments(elementTypes)
+					links.resolvedType = inst
+				} else {
+					cloned := c.typeListArena.Clone(elementTypes)
+					c.releaseTemporaryTypeArguments(elementTypes)
+					links.resolvedType = c.createTypeReferenceEx(target, cloned, ObjectFlagsFromTypeNode)
+				}
 			} else {
-				links.resolvedType = c.createTypeReferenceEx(target, elementTypes, ObjectFlagsFromTypeNode)
+				elementTypes := core.Map(elements, c.getTypeFromTypeNode)
+				if target.objectFlags&ObjectFlagsTuple != 0 {
+					links.resolvedType = c.createNormalizedTupleTypeEx(target, elementTypes, ObjectFlagsFromTypeNode)
+				} else {
+					links.resolvedType = c.createTypeReferenceEx(target, elementTypes, ObjectFlagsFromTypeNode)
+				}
 			}
 		}
 	}
@@ -26066,7 +26201,18 @@ func (c *Checker) getArrayOrTupleTargetType(node *ast.Node) *Type {
 		}
 		return c.globalArrayType
 	}
-	return c.getTupleTargetType(core.Map(node.Elements(), c.getTupleElementInfo), readonly)
+	elements := node.Elements()
+	var stackBuf [16]TupleElementInfo
+	var elementInfos []TupleElementInfo
+	if len(elements) <= len(stackBuf) {
+		elementInfos = stackBuf[:len(elements)]
+	} else {
+		elementInfos = make([]TupleElementInfo, len(elements))
+	}
+	for i, e := range elements {
+		elementInfos[i] = c.getTupleElementInfo(e)
+	}
+	return c.getTupleTargetType(elementInfos, readonly)
 }
 
 func (c *Checker) isReadonlyTypeOperator(node *ast.Node) bool {
@@ -26239,85 +26385,105 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 		checkTuples := c.isSimpleTupleType(checkTypeNode) && c.isSimpleTupleType(extendsTypeNode) && len(checkTypeNode.Elements()) == len(extendsTypeNode.Elements())
 		checkTypeDeferred := c.isDeferredType(checkType, checkTuples)
 		var combinedMapper *TypeMapper
-		var context *InferenceContext
-		var nonFixingCombined *TypeMapper
-		var fixingCombined *TypeMapper
-		escapeBefore := c.mapperEscapeCount
-		if len(root.inferTypeParameters) != 0 {
-			// When we're looking at making an inference for an infer type, when we get its constraint, it'll automagically be
-			// instantiated with the context, so it doesn't need the mapper for the inference context - however the constraint
-			// may refer to another _root_, _uncloned_ `infer` type parameter [1], or to something mapped by `mapper` [2].
-			// [1] Eg, if we have `Foo<T, U extends T>` and `Foo<number, infer B>` - `B` is constrained to `T`, which, in turn, has been instantiated
-			// as `number`
-			// Conversely, if we have `Foo<infer A, infer B>`, `B` is still constrained to `T` and `T` is instantiated as `A`
-			// [2] Eg, if we have `Foo<T, U extends T>` and `Foo<Q, infer B>` where `Q` is mapped by `mapper` into `number` - `B` is constrained to `T`
-			// which is in turn instantiated as `Q`, which is in turn instantiated as `number`.
-			// So we need to:
-			//   * combine `context.nonFixingMapper` with `mapper` so their constraints can be instantiated in the context of `mapper` (otherwise they'd only get inference context information)
-			//   * incorporate all of the component mappers into the combined mapper for the true and false members
-			// This means we have two mappers that need applying:
-			//   * The original `mapper` used to create this conditional
-			//   * The mapper that maps the infer type parameter to its inference result (`context.mapper`)
-			context = c.acquireConditionalInferenceContext(root.inferTypeParameters)
-			if mapper != nil {
-				nonFixingCombined = c.combineTypeMappers(context.nonFixingMapper, mapper)
-				context.nonFixingMapper = nonFixingCombined
-			}
-			if !checkTypeDeferred {
+		if !checkTypeDeferred {
+			var context *InferenceContext
+			var nonFixingCombined *TypeMapper
+			var fixingCombined *TypeMapper
+			if len(root.inferTypeParameters) != 0 {
+				// When we're looking at making an inference for an `infer` type, when we get its constraint, it'll automagically be
+				// instantiated with the context, so it doesn't need the mapper for the inference context - however the constraint
+				// may refer to another _root_, _uncloned_ `infer` type parameter [1], or to something mapped by `mapper` [2].
+				// [1] Eg, if we have `Foo<T, U extends T>` and `Foo<number, infer B>` - `B` is constrained to `T`, which, in turn, has been instantiated
+				//     as `number`
+				//     Conversely, if we have `Foo<infer A, infer B>`, `B` is still constrained to `T` and `T` is instantiated as `A`
+				// [2] Eg, if we have `Foo<T, U extends T>` and `Foo<Q, infer B>` where `Q` is mapped by `mapper` into `number` - `B` is constrained to `T`
+				//     which is in turn instantiated as `Q`, which is in turn instantiated as `number`.
+				// So we need to:
+				//   * combine `context.nonFixingMapper` with `mapper` so their constraints can be instantiated in the context of `mapper` (otherwise they'd only get inference context information)
+				//   * incorporate all of the component mappers into the combined mapper for the true and false members
+				// This means we have two mappers that need applying:
+				//   * The original `mapper` used to create this conditional
+				//   * The mapper that maps the infer type parameter to its inference result (`context.mapper`)
+				context = c.acquireConditionalInferenceContext(root.inferTypeParameters)
+				if mapper != nil {
+					nonFixingCombined = c.combineTypeMappers(context.nonFixingMapper, mapper)
+					context.nonFixingMapper = nonFixingCombined
+				}
 				// We don't want inferences from constraints as they may cause us to eagerly resolve the
 				// conditional type instead of deferring resolution. Also, we always want strict function
 				// types rules (i.e. proper contravariance) for inferences.
 				c.inferTypes(context.inferences, checkType, extendsType, InferencePriorityNoConstraints|InferencePriorityAlwaysStrict, false)
+				// It's possible for 'infer T' type parameters to be given uninstantiated constraints when
+				// those type parameters are used in type references (see getInferredTypeParameterConstraint). For
+				// that reason we need context.mapper to be first in the combined mapper. See #42636 for examples.
+				if mapper != nil {
+					fixingCombined = c.combineTypeMappers(context.mapper, mapper)
+					combinedMapper = fixingCombined
+				} else {
+					combinedMapper = context.mapper
+				}
 			}
-			// It's possible for 'infer T' type parameters to be given uninstantiated constraints when
-			// those type parameters are used in type references (see getInferredTypeParameterConstraint). For
-			// that reason we need context.mapper to be first in the combined mapper. See #42636 for examples.
-			if mapper != nil {
-				fixingCombined = c.combineTypeMappers(context.mapper, mapper)
-				combinedMapper = fixingCombined
+			// Instantiate the extends type including inferences for 'infer T' type parameters
+			var inferredExtendsType *Type
+			if combinedMapper != nil {
+				inferredExtendsType = c.instantiateType(root.extendsType, combinedMapper)
 			} else {
-				combinedMapper = context.mapper
+				inferredExtendsType = extendsType
 			}
-		}
-		// Instantiate the extends type including inferences for 'infer T' type parameters
-		var inferredExtendsType *Type
-		if combinedMapper != nil {
-			inferredExtendsType = c.instantiateType(root.extendsType, combinedMapper)
-		} else {
-			inferredExtendsType = extendsType
-		}
-		// We attempt to resolve the conditional type only when the check and extends types are non-generic
-		if !checkTypeDeferred && !c.isDeferredType(inferredExtendsType, checkTuples) {
-			// Return falseType for a definitely false extends check. We check an instantiations of the two
-			// types with type parameters mapped to the wildcard type, the most permissive instantiations
-			// possible (the wildcard type is assignable to and from all types). If those are not related,
-			// then no instantiations will be and we can just return the false branch type.
-			if inferredExtendsType.flags&TypeFlagsAnyOrUnknown == 0 && (checkType.flags&TypeFlagsAny != 0 || !c.isTypeAssignableTo(c.getPermissiveInstantiation(checkType), c.getPermissiveInstantiation(inferredExtendsType))) {
-				// Return union of trueType and falseType for 'any' since it matches anything. Furthermore, for a
-				// distributive conditional type applied to the constraint of a type variable, include trueType if
-				// there are possible values of the check type that are also possible values of the extends type.
-				// We use a reverse assignability check as it is less expensive than the comparable relationship
-				// and avoids false positives of a non-empty intersection check.
-				usedCombinedMapper := false
-				if checkType.flags&TypeFlagsAny != 0 || forConstraint && inferredExtendsType.flags&TypeFlagsNever == 0 && someType(c.getPermissiveInstantiation(inferredExtendsType), func(t *Type) bool {
-					return c.isTypeAssignableTo(t, c.getPermissiveInstantiation(checkType))
-				}) {
-					usedCombinedMapper = true
-					extraTypes = append(extraTypes, c.instantiateType(c.getTypeFromTypeNode(root.node.TrueType), core.OrElse(combinedMapper, mapper)))
-				}
-				if context != nil && !usedCombinedMapper && c.mapperEscapeCount == escapeBefore {
-					c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
-				}
-				// If falseType is an immediately nested conditional type that isn't distributive or has an
-				// identical checkType, switch to that type and loop.
-				falseType := c.getTypeFromTypeNode(root.node.FalseType)
-				if falseType.flags&TypeFlagsConditional != 0 {
-					newRoot := falseType.AsConditionalType().root
-					if newRoot.node.Parent == root.node.AsNode() && (!newRoot.isDistributive || newRoot.checkType == root.checkType) {
-						root = newRoot
-						continue
+			// We attempt to resolve the conditional type only when the check and extends types are non-generic
+			if !c.isDeferredType(inferredExtendsType, checkTuples) {
+				// Return falseType for a definitely false extends check. We check an instantiations of the two
+				// types with type parameters mapped to the wildcard type, the most permissive instantiations
+				// possible (the wildcard type is assignable to and from all types). If those are not related,
+				// then no instantiations will be and we can just return the false branch type.
+				if inferredExtendsType.flags&TypeFlagsAnyOrUnknown == 0 && (checkType.flags&TypeFlagsAny != 0 || !c.isTypeAssignableTo(c.getPermissiveInstantiation(checkType), c.getPermissiveInstantiation(inferredExtendsType))) {
+					// Return union of trueType and falseType for 'any' since it matches anything. Furthermore, for a
+					// distributive conditional type applied to the constraint of a type variable, include trueType if
+					// there are possible values of the check type that are also possible values of the extends type.
+					// We use a reverse assignability check as it is less expensive than the comparable relationship
+					// and avoids false positives of a non-empty intersection check.
+					if checkType.flags&TypeFlagsAny != 0 || forConstraint && inferredExtendsType.flags&TypeFlagsNever == 0 && someType(c.getPermissiveInstantiation(inferredExtendsType), func(t *Type) bool {
+						return c.isTypeAssignableTo(t, c.getPermissiveInstantiation(checkType))
+					}) {
+						extraTypes = append(extraTypes, c.instantiateType(c.getTypeFromTypeNode(root.node.TrueType), core.OrElse(combinedMapper, mapper)))
 					}
-					if newRoot, newRootMapper := c.getTailRecursionRoot(falseType, mapper); newRoot != nil {
+					if context != nil && !context.escaped {
+						c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+					}
+					// If falseType is an immediately nested conditional type that isn't distributive or has an
+					// identical checkType, switch to that type and loop.
+					falseType := c.getTypeFromTypeNode(root.node.FalseType)
+					if falseType.flags&TypeFlagsConditional != 0 {
+						newRoot := falseType.AsConditionalType().root
+						if newRoot.node.Parent == root.node.AsNode() && (!newRoot.isDistributive || newRoot.checkType == root.checkType) {
+							root = newRoot
+							continue
+						}
+						if newRoot, newRootMapper := c.getTailRecursionRoot(falseType, mapper); newRoot != nil {
+							root = newRoot
+							mapper = newRootMapper
+							alias = nil
+							if newRoot.alias != nil {
+								tailCount++
+							}
+							continue
+						}
+					}
+					result = c.instantiateType(falseType, mapper)
+					break
+				}
+				// Return trueType for a definitely true extends check. We check instantiations of the two
+				// types with type parameters mapped to their restrictive form, i.e. a form of the type parameter
+				// that has no constraint. This ensures that, for example, the type
+				//   type Foo<T extends { x: any }> = T extends { x: string } ? string : number
+				// doesn't immediately resolve to 'string' instead of being deferred.
+				if inferredExtendsType.flags&TypeFlagsAnyOrUnknown != 0 || c.isTypeAssignableTo(c.getRestrictiveInstantiation(checkType), c.getRestrictiveInstantiation(inferredExtendsType)) {
+					trueType := c.getTypeFromTypeNode(root.node.TrueType)
+					trueMapper := core.OrElse(combinedMapper, mapper)
+					if newRoot, newRootMapper := c.getTailRecursionRoot(trueType, trueMapper); newRoot != nil {
+						if context != nil && !context.escaped {
+							c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+						}
 						root = newRoot
 						mapper = newRootMapper
 						alias = nil
@@ -26326,38 +26492,14 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 						}
 						continue
 					}
-				}
-				result = c.instantiateType(falseType, mapper)
-				break
-			}
-			// Return trueType for a definitely true extends check. We check instantiations of the two
-			// types with type parameters mapped to their restrictive form, i.e. a form of the type parameter
-			// that has no constraint. This ensures that, for example, the type
-			//   type Foo<T extends { x: any }> = T extends { x: string } ? string : number
-			// doesn't immediately resolve to 'string' instead of being deferred.
-			if inferredExtendsType.flags&TypeFlagsAnyOrUnknown != 0 || c.isTypeAssignableTo(c.getRestrictiveInstantiation(checkType), c.getRestrictiveInstantiation(inferredExtendsType)) {
-				trueType := c.getTypeFromTypeNode(root.node.TrueType)
-				trueMapper := core.OrElse(combinedMapper, mapper)
-				if newRoot, newRootMapper := c.getTailRecursionRoot(trueType, trueMapper); newRoot != nil {
-					if context != nil && c.mapperEscapeCount == escapeBefore {
+					result = c.instantiateType(trueType, trueMapper)
+					if context != nil && !context.escaped {
 						c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
 					}
-					root = newRoot
-					mapper = newRootMapper
-					alias = nil
-					if newRoot.alias != nil {
-						tailCount++
-					}
-					continue
+					break
 				}
-				result = c.instantiateType(trueType, trueMapper)
-				if context != nil && c.mapperEscapeCount == escapeBefore {
-					c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
-				}
-				break
 			}
 		}
-		// Return a deferred type for a check that is neither definitely true nor definitely false
 		result = c.newConditionalType(root, mapper, combinedMapper)
 		if alias != nil {
 			result.alias = alias
@@ -26394,7 +26536,7 @@ func (c *Checker) getTailRecursionRoot(newType *Type, newMapper *TypeMapper) (*C
 				tp := newRoot.outerTypeParameters[0]
 				newRootMapper = newSimpleTypeMapper(tp, mapParam(tp))
 			} else {
-				typeArguments := make([]*Type, len(newRoot.outerTypeParameters))
+				typeArguments := c.typeListArena.NewSlice(len(newRoot.outerTypeParameters))
 				for i, tp := range newRoot.outerTypeParameters {
 					typeArguments[i] = mapParam(tp)
 				}
@@ -26501,8 +26643,26 @@ func (c *Checker) getFalseTypeFromConditionalType(t *Type) *Type {
 func (c *Checker) getInferredTrueTypeFromConditionalType(t *Type) *Type {
 	d := t.AsConditionalType()
 	if d.resolvedInferredTrueType == nil {
-		if d.combinedMapper != nil {
-			d.resolvedInferredTrueType = c.instantiateType(c.getTypeFromTypeNode(d.root.node.TrueType), d.combinedMapper)
+		combinedMapper := d.combinedMapper
+		var context *InferenceContext
+		var nonFixingCombined *TypeMapper
+		var fixingCombined *TypeMapper
+		if combinedMapper == nil && len(d.root.inferTypeParameters) != 0 {
+			context = c.acquireConditionalInferenceContext(d.root.inferTypeParameters)
+			if d.mapper != nil {
+				nonFixingCombined = c.combineTypeMappers(context.nonFixingMapper, d.mapper)
+				context.nonFixingMapper = nonFixingCombined
+				fixingCombined = c.combineTypeMappers(context.mapper, d.mapper)
+				combinedMapper = fixingCombined
+			} else {
+				combinedMapper = context.mapper
+			}
+		}
+		if combinedMapper != nil {
+			d.resolvedInferredTrueType = c.instantiateType(c.getTypeFromTypeNode(d.root.node.TrueType), combinedMapper)
+			if context != nil && !context.escaped {
+				c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+			}
 		} else {
 			d.resolvedInferredTrueType = c.getTrueTypeFromConditionalType(t)
 		}
@@ -26679,7 +26839,16 @@ func (c *Checker) getTupleElementInfo(node *ast.Node) TupleElementInfo {
 }
 
 func (c *Checker) createTupleType(elementTypes []*Type) *Type {
-	elementInfos := core.Map(elementTypes, func(_ *Type) TupleElementInfo { return TupleElementInfo{flags: ElementFlagsRequired} })
+	var stackBuf [16]TupleElementInfo
+	var elementInfos []TupleElementInfo
+	if len(elementTypes) <= len(stackBuf) {
+		elementInfos = stackBuf[:len(elementTypes)]
+	} else {
+		elementInfos = make([]TupleElementInfo, len(elementTypes))
+	}
+	for i := range elementInfos {
+		elementInfos[i] = TupleElementInfo{flags: ElementFlagsRequired}
+	}
 	return c.createTupleTypeEx(elementTypes, elementInfos, false /*readonly*/)
 }
 
@@ -26765,7 +26934,7 @@ func (c *Checker) createTupleTargetType(elementInfos []TupleElementInfo, readonl
 	d.resolvedTypeArguments = d.TypeParameters()
 	d.declaredMembersResolved = true
 	d.declaredMembers = members
-	d.elementInfos = elementInfos
+	d.elementInfos = slices.Clone(elementInfos)
 	d.minLength = minLength
 	d.fixedLength = fixedLength
 	d.combinedFlags = combinedFlags
@@ -27107,7 +27276,7 @@ func (c *Checker) createDeferredTypeReference(target *Type, node *ast.Node, mapp
 	d := t.AsTypeReference()
 	d.target = target
 	d.mapper = mapper
-	c.mapperEscapeCount++
+	markMapperEscaped(mapper)
 	d.node = node
 	return t
 }
@@ -27230,7 +27399,8 @@ func (c *Checker) newConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 	data.extendsType = c.instantiateType(root.extendsType, mapper)
 	data.mapper = mapper
 	data.combinedMapper = combinedMapper
-	c.mapperEscapeCount++
+	markMapperEscaped(mapper)
+	markMapperEscaped(combinedMapper)
 	return c.newType(TypeFlagsConditional, ObjectFlagsNone, data.AsType(), typeKindConditional)
 }
 
@@ -27831,8 +28001,8 @@ func (c *Checker) getUnionTypeWorker(types []*Type, unionReduction UnionReductio
 		}
 	}
 	if origin == nil && includes&TypeFlagsUnion != 0 {
-		namedUnions := c.addNamedUnions(nil, types)
-		var reducedTypes []*Type
+		namedUnions := c.addNamedUnions(c.getTemporaryTypeArguments(0)[:0], types)
+		reducedTypes := c.getTemporaryTypeArguments(0)[:0]
 		if len(c.files) > 0 && (len(namedUnions) > 1 || len(typeSet) > 8) {
 			if c.namedUnionMemberSet == nil {
 				c.namedUnionMemberSet = make(map[*Type]struct{}, 64)
@@ -27857,7 +28027,10 @@ func (c *Checker) getUnionTypeWorker(types []*Type, unionReduction UnionReductio
 			}
 		}
 		if alias == nil && len(namedUnions) == 1 && len(reducedTypes) == 0 {
-			return namedUnions[0]
+			res := namedUnions[0]
+			c.releaseTemporaryTypeArguments(namedUnions)
+			c.releaseTemporaryTypeArguments(reducedTypes)
+			return res
 		}
 		// We create a denormalized origin type only when the union was created from one or more named unions
 		// (unions with alias symbols or origins) and when there is no overlap between those named unions.
@@ -27871,6 +28044,8 @@ func (c *Checker) getUnionTypeWorker(types []*Type, unionReduction UnionReductio
 			}
 			origin = c.newUnionType(ObjectFlagsNone, reducedTypes)
 		}
+		c.releaseTemporaryTypeArguments(namedUnions)
+		c.releaseTemporaryTypeArguments(reducedTypes)
 	}
 	objectFlags := core.IfElse(includes&TypeFlagsNotPrimitiveUnion != 0, ObjectFlagsNone, ObjectFlagsPrimitiveUnion) |
 		core.IfElse(includes&TypeFlagsIntersection != 0, ObjectFlagsContainsIntersections, ObjectFlagsNone)
@@ -28767,9 +28942,11 @@ func (c *Checker) unionContainsType(union *Type, t *Type, matchSymbol bool) bool
 
 func (c *Checker) getCrossProductIntersections(types []*Type, flags IntersectionFlags) []*Type {
 	count := c.getCrossProductUnionSize(types)
-	var intersections []*Type
+	intersections := make([]*Type, 0, count)
+	constituents := c.getTemporaryTypeArguments(len(types))
+	copy(constituents, types)
+	defer c.releaseTemporaryTypeArguments(constituents)
 	for i := range count {
-		constituents := slices.Clone(types)
 		n := i
 		for j := len(types) - 1; j >= 0; j-- {
 			if types[j].flags&TypeFlagsUnion != 0 {

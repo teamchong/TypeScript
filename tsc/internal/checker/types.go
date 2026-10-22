@@ -1169,7 +1169,10 @@ func (t *StructuredType) ensureExtra() *structuredTypeExtra {
 }
 
 func (t *StructuredType) Properties() []*ast.Symbol {
-	return t.properties
+	if t.flags&TypeFlagsObject != 0 {
+		return t.properties
+	}
+	return nil
 }
 
 type memberIndex struct {
@@ -1496,7 +1499,6 @@ type UnionOrIntersectionType struct {
 	types                                       []*Type
 	propertyCache                               ast.SymbolTable // Augmented entries not shared with the non-augmented cache.
 	propertyCacheWithoutFunctionPropertyAugment ast.SymbolTable
-	resolvedProperties                          []*ast.Symbol
 }
 
 func (t *UnionOrIntersectionType) AsUnionOrIntersectionType() *UnionOrIntersectionType { return t }
@@ -1511,9 +1513,7 @@ type UnionType struct {
 	UnionOrIntersectionType
 	resolvedReducedType *Type
 	regularType         *Type
-	origin              *Type           // Denormalized union, intersection, or index type in which union originates
-	keyPropertyName     string          // Property with unique unit type that exists in every object/intersection in union type
-	constituentMap      map[*Type]*Type // Constituents keyed by unit type discriminants
+	origin              *Type // Denormalized union, intersection, or index type in which union originates
 }
 
 // IntersectionType

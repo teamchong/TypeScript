@@ -1480,24 +1480,38 @@ func (c *Checker) getMatchingUnionConstituentForType(unionType *Type, t *Type) *
 	return c.getConstituentTypeForKeyType(unionType, propType)
 }
 
+type unionDiscriminant struct {
+	keyPropertyName string
+	constituentMap  map[*Type]*Type
+}
+
 // Return the name of a discriminant property for which it was possible and feasible to construct a map of
 // constituent types keyed by the literal types of the property by that name in each constituent type. Return
 // an empty string if no such discriminant property exists.
 func (c *Checker) getKeyPropertyName(t *Type) string {
-	u := t.AsUnionType()
-	if u.keyPropertyName == "" {
-		u.keyPropertyName, u.constituentMap = c.computeKeyPropertyNameAndMap(t)
-	}
-	if u.keyPropertyName == ast.InternalSymbolNameMissing {
+	types := t.Types()
+	if len(types) < 10 || t.objectFlags&ObjectFlagsPrimitiveUnion != 0 {
 		return ""
 	}
-	return u.keyPropertyName
+	u := t.AsUnionType()
+	disc, ok := c.unionDiscriminants[u]
+	if !ok {
+		disc.keyPropertyName, disc.constituentMap = c.computeKeyPropertyNameAndMap(t)
+		if c.unionDiscriminants == nil {
+			c.unionDiscriminants = make(map[*UnionType]unionDiscriminant)
+		}
+		c.unionDiscriminants[u] = disc
+	}
+	if disc.keyPropertyName == ast.InternalSymbolNameMissing {
+		return ""
+	}
+	return disc.keyPropertyName
 }
 
 // Given a union type for which getKeyPropertyName returned a non-empty string, return the constituent
 // that corresponds to the given key type for that property name.
 func (c *Checker) getConstituentTypeForKeyType(t *Type, keyType *Type) *Type {
-	result := t.AsUnionType().constituentMap[c.getRegularTypeOfLiteralType(keyType)]
+	result := c.unionDiscriminants[t.AsUnionType()].constituentMap[c.getRegularTypeOfLiteralType(keyType)]
 	if result != c.unknownType {
 		return result
 	}
@@ -2741,6 +2755,7 @@ func (c *Checker) templateLiteralTypesDefinitelyUnrelated(source *TemplateLitera
 func (c *Checker) isTypeMatchedByTemplateLiteralType(source *Type, target *TemplateLiteralType, compareTypes TypeComparer) bool {
 	inferences := c.inferTypesFromTemplateLiteralType(source, target, compareTypes)
 	if inferences != nil {
+		defer c.releaseTemporaryTypeArguments(inferences)
 		for i, inference := range inferences {
 			if !c.isValidTypeForTemplateLiteralPlaceholder(inference, target.types[i], compareTypes) {
 				return false
@@ -2754,15 +2769,21 @@ func (c *Checker) isTypeMatchedByTemplateLiteralType(source *Type, target *Templ
 func (c *Checker) inferTypesFromTemplateLiteralType(source *Type, target *TemplateLiteralType, compareTypes TypeComparer) []*Type {
 	switch {
 	case source.flags&TypeFlagsStringLiteral != 0:
-		return c.inferFromLiteralPartsToTemplateLiteral([]string{getStringLiteralValue(source)}, nil, target)
+		var sourceTexts [1]string
+		sourceTexts[0] = getStringLiteralValue(source)
+		return c.inferFromLiteralPartsToTemplateLiteral(sourceTexts[:], nil, target)
 	case source.flags&TypeFlagsTemplateLiteral != 0:
 		if slices.Equal(source.AsTemplateLiteralType().texts, target.texts) {
-			return core.MapIndex(source.AsTemplateLiteralType().types, func(s *Type, i int) *Type {
+			sourceTypes := source.AsTemplateLiteralType().types
+			matches := c.getTemporaryTypeArguments(len(sourceTypes))
+			for i, s := range sourceTypes {
 				if compareTypes(c.getBaseConstraintOrType(s), c.getBaseConstraintOrType(target.types[i]), false /*partialMatch*/) != TernaryFalse {
-					return s
+					matches[i] = s
+				} else {
+					matches[i] = c.getStringLikeTypeForType(s)
 				}
-				return c.getStringLikeTypeForType(s)
-			})
+			}
+			return matches
 		}
 		return c.inferFromLiteralPartsToTemplateLiteral(source.AsTemplateLiteralType().texts, source.AsTemplateLiteralType().types, target)
 	default:
@@ -2805,7 +2826,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 	remainingEndText := sourceEndText[:len(sourceEndText)-len(targetEndText)]
 	seg := 0
 	pos := len(targetStartText)
-	var matches []*Type
+	matches := c.getTemporaryTypeArguments(lastTargetIndex)[:0]
 	getSourceText := func(index int) string {
 		if index < lastSourceIndex {
 			return sourceTexts[index]
@@ -2817,7 +2838,13 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 		if s == seg {
 			matchType = c.getStringLiteralType(stringutil.CombineSurrogatePairs(getSourceText(s)[pos:p]))
 		} else {
-			matchTexts := make([]string, s-seg+1)
+			var matchTextsBuf [8]string
+			var matchTexts []string
+			if s-seg+1 <= len(matchTextsBuf) {
+				matchTexts = matchTextsBuf[:s-seg+1]
+			} else {
+				matchTexts = make([]string, s-seg+1)
+			}
 			matchTexts[0] = sourceTexts[seg][pos:]
 			copy(matchTexts[1:], sourceTexts[seg+1:s])
 			matchTexts[s-seg] = getSourceText(s)[:p]
@@ -2840,6 +2867,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 				}
 				s++
 				if s == len(sourceTexts) {
+					c.releaseTemporaryTypeArguments(matches)
 					return nil
 				}
 				p = 0
@@ -2868,6 +2896,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 		} else if seg < lastSourceIndex {
 			addMatch(seg+1, 0)
 		} else {
+			c.releaseTemporaryTypeArguments(matches)
 			return nil
 		}
 	}

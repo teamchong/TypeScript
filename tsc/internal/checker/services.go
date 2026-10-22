@@ -163,7 +163,7 @@ func (c *Checker) ForEachExportAndPropertyOfModule(moduleSymbol *ast.Symbol, cb 
 		}
 		return
 	}
-	for _, symbol := range resolved.properties {
+	for _, symbol := range resolved.Properties() {
 		cb(symbol, symbol.Name())
 	}
 }

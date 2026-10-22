@@ -10,9 +10,9 @@ import (
 // TypeMapper
 
 type TypeMapper struct {
-	kind TypeMapperKind
+	kind         TypeMapperKind
+	hasInference bool
 }
-
 type TypeMapperKind uint8
 
 const (
@@ -352,6 +352,7 @@ func newMergedTypeMapper(m1 *TypeMapper, m2 *TypeMapper) *TypeMapper {
 		m = &MergedTypeMapper{}
 	}
 	m.kind = TypeMapperKindMerged
+	m.hasInference = m1 != nil && m1.hasInference || m2 != nil && m2.hasInference
 	m.m1 = m1
 	m.m2 = m2
 	return &m.TypeMapper
@@ -378,6 +379,7 @@ func newCompositeTypeMapper(c *Checker, m1 *TypeMapper, m2 *TypeMapper) *TypeMap
 		m = &CompositeTypeMapper{}
 	}
 	m.kind = TypeMapperKindComposite
+	m.hasInference = m1 != nil && m1.hasInference || m2 != nil && m2.hasInference
 	m.c = c
 	m.m1 = m1
 	m.m2 = m2
@@ -403,10 +405,41 @@ type InferenceTypeMapper struct {
 
 func (c *Checker) initInferenceTypeMapper(m *InferenceTypeMapper, n *InferenceContext, fixing bool) *TypeMapper {
 	m.kind = TypeMapperKindInference
+	m.hasInference = true
 	m.c = c
 	m.n = n
 	m.fixing = fixing
 	return &m.TypeMapper
+}
+
+func markMapperEscaped(m *TypeMapper) {
+	if m != nil && m.hasInference {
+		markMapperEscapedSlow(m)
+	}
+}
+
+func markMapperEscapedSlow(m *TypeMapper) {
+	m.hasInference = false
+	switch m.kind {
+	case TypeMapperKindInference:
+		castTypeMapper[InferenceTypeMapper](m, TypeMapperKindInference).n.escaped = true
+	case TypeMapperKindMerged:
+		merged := castTypeMapper[MergedTypeMapper](m, TypeMapperKindMerged)
+		if merged.m1 != nil && merged.m1.hasInference {
+			markMapperEscapedSlow(merged.m1)
+		}
+		if merged.m2 != nil && merged.m2.hasInference {
+			markMapperEscapedSlow(merged.m2)
+		}
+	case TypeMapperKindComposite:
+		comp := castTypeMapper[CompositeTypeMapper](m, TypeMapperKindComposite)
+		if comp.m1 != nil && comp.m1.hasInference {
+			markMapperEscapedSlow(comp.m1)
+		}
+		if comp.m2 != nil && comp.m2.hasInference {
+			markMapperEscapedSlow(comp.m2)
+		}
+	}
 }
 
 func (m *InferenceTypeMapper) Map(t *Type) *Type {

@@ -300,8 +300,10 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 					return
 				}
 				if n.priority < inference.priority {
-					inference.candidates = nil
-					inference.contraCandidates = nil
+					clear(inference.candidates)
+					inference.candidates = inference.candidates[:0]
+					clear(inference.contraCandidates)
+					inference.contraCandidates = inference.contraCandidates[:0]
 					inference.topLevel = true
 					inference.priority = n.priority
 				}
@@ -705,6 +707,9 @@ func (c *Checker) inferToConditionalType(n *InferenceState, source *Type, target
 
 func (c *Checker) inferToTemplateLiteralType(n *InferenceState, source *Type, target *TemplateLiteralType) {
 	matches := c.inferTypesFromTemplateLiteralType(source, target, c.compareTypesAssignable)
+	if matches != nil {
+		defer c.releaseTemporaryTypeArguments(matches)
+	}
 	types := target.types
 	// When the target template literal contains only placeholders (meaning that inference is intended to extract
 	// single characters and remainder strings) and inference fails to produce matches, we want to infer 'never' for
@@ -1398,6 +1403,7 @@ func (c *Checker) newInferenceContext(typeParameters []*Type, signature *Signatu
 	inferences := make([]*InferenceInfo, len(typeParameters))
 	for i, tp := range typeParameters {
 		infos[i] = InferenceInfo{typeParameter: tp, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+		infos[i].candidates = infos[i].candidateStorage[:0]
 		inferences[i] = &infos[i]
 	}
 	return c.newInferenceContextWorker(inferences, signature, flags, compareTypes)
@@ -1415,6 +1421,7 @@ func (c *Checker) acquireConditionalInferenceContext(typeParameters []*Type) *In
 		n.outerReturnMapper = nil
 		n.inferredTypeParameters = nil
 		n.intraExpressionInferenceSites = nil
+		n.escaped = false
 		n.mapper = c.initInferenceTypeMapper(&n.mapperStorage[0], n, true /*fixing*/)
 		n.nonFixingMapper = c.initInferenceTypeMapper(&n.mapperStorage[1], n, false /*fixing*/)
 	} else {
@@ -1862,7 +1869,9 @@ func (c *Checker) isSkipDirectInferenceNode(node *ast.Node) bool {
 }
 
 func newInferenceInfo(typeParameter *Type) *InferenceInfo {
-	return &InferenceInfo{typeParameter: typeParameter, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+	info := &InferenceInfo{typeParameter: typeParameter, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+	info.candidates = info.candidateStorage[:0]
+	return info
 }
 
 func cloneInferenceInfo(info *InferenceInfo) *InferenceInfo {

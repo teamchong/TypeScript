@@ -49,7 +49,25 @@ func SuspendGC() func() {
 func Filter[T any](slice []T, f func(T) bool) []T {
 	for i, value := range slice {
 		if !f(value) {
-			result := slices.Clone(slice[:i])
+			if i == 0 {
+				for i++; i < len(slice); i++ {
+					value = slice[i]
+					if f(value) {
+						result := make([]T, 1, len(slice)-i)
+						result[0] = value
+						for i++; i < len(slice); i++ {
+							value = slice[i]
+							if f(value) {
+								result = append(result, value)
+							}
+						}
+						return result
+					}
+				}
+				return slice[:0:0]
+			}
+			result := make([]T, i, len(slice)-1)
+			copy(result, slice[:i])
 			for i++; i < len(slice); i++ {
 				value = slice[i]
 				if f(value) {
@@ -77,7 +95,25 @@ func FilterSeq[T any](slice []T, f func(T) bool) iter.Seq[T] {
 func FilterIndex[T any](slice []T, f func(T, int, []T) bool) []T {
 	for i, value := range slice {
 		if !f(value, i, slice) {
-			result := slices.Clone(slice[:i])
+			if i == 0 {
+				for i++; i < len(slice); i++ {
+					value = slice[i]
+					if f(value, i, slice) {
+						result := make([]T, 1, len(slice)-i)
+						result[0] = value
+						for i++; i < len(slice); i++ {
+							value = slice[i]
+							if f(value, i, slice) {
+								result = append(result, value)
+							}
+						}
+						return result
+					}
+				}
+				return slice[:0:0]
+			}
+			result := make([]T, i, len(slice)-1)
+			copy(result, slice[:i])
 			for i++; i < len(slice); i++ {
 				value = slice[i]
 				if f(value, i, slice) {
@@ -841,7 +877,8 @@ func Deduplicate[T comparable](slice []T) []T {
 	if len(slice) > 1 {
 		for i, value := range slice {
 			if slices.Contains(slice[:i], value) {
-				result := slices.Clone(slice[:i])
+				result := make([]T, i, len(slice)-1)
+				copy(result, slice[:i])
 				for i++; i < len(slice); i++ {
 					value = slice[i]
 					if !slices.Contains(result, value) {
