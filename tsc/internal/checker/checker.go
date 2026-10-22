@@ -705,6 +705,7 @@ type Checker struct {
 	typeAliasArena                              core.Arena[TypeAlias]
 	freeTypeArgLists                            [][]*Type
 	unionFrontCache                             map[CacheHashKey]*Type
+	unionFrontSlots                             *[1024]unionFrontSlot
 	unionImpureCount                            uint32
 	diagnosticCount                             uint32
 	instantiationCountResets                    uint32
@@ -719,6 +720,11 @@ type Checker struct {
 	freeTypeSets                                *temporaryTypeSet
 	freePropertyCounts                          *temporaryPropertyCounts
 	freeNameSets                                []map[string]struct{}
+	freeInferenceContexts                       []*InferenceContext
+	freeInferenceInfos                          []*InferenceInfo
+	mapperEscapeCount                           uint32
+	templateScratchPool                         []*templateLiteralScratch
+	leafKeyBuilder                              keyBuilder
 	namedUnionMemberSet                         map[*Type]struct{}
 	unionRunStarts                              []int
 	unionRunBounds                              []int
@@ -870,8 +876,8 @@ type Checker struct {
 	flowTypeCache                               map[*ast.Node]*Type
 	lastFlowNode                                *ast.FlowNode
 	lastFlowNodeReachable                       bool
-	flowNodeReachable                           map[*ast.FlowNode]bool
-	flowNodePostSuper                           map[*ast.FlowNode]bool
+	flowNodeReachable                           map[uintptr]bool
+	flowNodePostSuper                           map[uintptr]bool
 	renamedBindingElementsInTypes               []*ast.Node
 	contextualInfos                             []ContextualInfo
 	inferenceContextInfos                       []InferenceContextInfo
@@ -1122,8 +1128,8 @@ func NewChecker(program Program, tracer *Tracer) (*Checker, *sync.Mutex) {
 	c.zeroBigIntType = c.getBigIntLiteralType(jsnum.PseudoBigInt{})
 	c.typeofType = c.getUnionType(core.Map(slices.Sorted(maps.Keys(typeofNEFacts)), c.getStringLiteralType))
 	c.flowLoopCache = make(map[FlowLoopKey]*Type)
-	c.flowNodeReachable = make(map[*ast.FlowNode]bool)
-	c.flowNodePostSuper = make(map[*ast.FlowNode]bool)
+	c.flowNodeReachable = make(map[uintptr]bool)
+	c.flowNodePostSuper = make(map[uintptr]bool)
 	c.subtypeRelation, c.strictSubtypeRelation, c.assignableRelation, c.comparableRelation, c.identityRelation = newRelations()
 	c.enumRelation = make(map[EnumRelationKey]RelationComparisonResult)
 	c.moduleImportAttributesTypes = make(map[*ast.Symbol]*Type)
@@ -2345,6 +2351,8 @@ func (c *Checker) checkSourceFile(ctx context.Context, sourceFile *ast.SourceFil
 		}
 		c.produceDeferredDiagnostics()
 		c.reportedUnreachableNodes.Clear()
+		clear(c.flowNodeReachable)
+		clear(c.flowNodePostSuper)
 		links.typeChecked = true
 	}
 	if checkUnused && !links.unusedChecked {
@@ -7978,6 +7986,7 @@ func (c *Checker) getUniqueTypeParameters(context *InferenceContext, typeParamet
 		for _, tp := range newTypeParameters {
 			tp.AsTypeParameter().mapper = mapper
 		}
+		c.mapperEscapeCount++
 	}
 	return result
 }
@@ -18077,7 +18086,10 @@ func (b *keyBuilder) hash() CacheHashKey {
 	if b.overflowBuffer == nil {
 		return CacheHashKey(xxh3.Hash128(b.inlineBuffer[:b.inlineLength]))
 	}
-	return CacheHashKey(xxh3.Hash128(append(b.overflowBuffer, b.inlineBuffer[:b.inlineLength]...)))
+	if b.inlineLength > 0 {
+		b.spill()
+	}
+	return CacheHashKey(xxh3.Hash128(b.overflowBuffer))
 }
 
 // spill moves the buffered bytes onto the end of overflowBuffer, so the key's byte
@@ -18397,6 +18409,24 @@ func getTemplateTypeKey(texts []string, types []*Type) CacheHashKey {
 		return b.releaseHash()
 	}
 	var b keyBuilder
+	b.writeTypes(types)
+	b.writeByte('|')
+	for _, s := range texts {
+		b.writeInt(len(s))
+	}
+	b.writeByte('|')
+	for _, s := range texts {
+		b.writeString(s)
+	}
+	return b.hash()
+}
+
+func (c *Checker) getTemplateTypeKey(texts []string, types []*Type) CacheHashKey {
+	b := &c.leafKeyBuilder
+	b.inlineLength = 0
+	if b.overflowBuffer != nil {
+		b.overflowBuffer = b.overflowBuffer[:0]
+	}
 	b.writeTypes(types)
 	b.writeByte('|')
 	for _, s := range texts {
@@ -20566,6 +20596,7 @@ func (c *Checker) getSignatureInstantiation(sig *Signature, typeArguments []*Typ
 			newReturnSignature.setTypeParameters(c, inferredTypeParameters)
 			newReturnType := c.getOrCreateTypeFromSignature(newReturnSignature)
 			newReturnType.AsObjectType().mapper = instantiatedSignature.mapper
+			c.mapperEscapeCount++
 			newInstantiatedSignature := c.cloneSignature(instantiatedSignature)
 			newInstantiatedSignature.resolvedReturnType = newReturnType
 			return newInstantiatedSignature
@@ -20578,6 +20609,7 @@ func (c *Checker) cloneSignature(sig *Signature) *Signature {
 	result := c.newSignature(sig.flags&SignatureFlagsPropagatingFlags, sig.declaration, sig.TypeParameters(), sig.ThisParameter(), sig.parameters, nil, nil, int(sig.minArgumentCount))
 	result.target = sig.target
 	result.mapper = sig.mapper
+	c.mapperEscapeCount++
 	result.setComposite(c, sig.getComposite())
 	return result
 }
@@ -21902,6 +21934,7 @@ func (c *Checker) instantiateSignatureEx(sig *Signature, m *TypeMapper, eraseTyp
 		for _, tp := range freshTypeParameters {
 			tp.AsTypeParameter().mapper = m
 		}
+		c.mapperEscapeCount++
 	}
 	// Don't compute resolvedReturnType and resolvedTypePredicate now,
 	// because using `mapper` now could trigger inferences to become fixed. (See `createInferenceContext`.)
@@ -21911,6 +21944,7 @@ func (c *Checker) instantiateSignatureEx(sig *Signature, m *TypeMapper, eraseTyp
 		nil /*resolvedReturnType*/, nil /*resolvedTypePredicate*/, int(sig.minArgumentCount))
 	result.target = sig
 	result.mapper = m
+	c.mapperEscapeCount++
 	return result
 }
 
@@ -22088,6 +22122,7 @@ func (c *Checker) instantiateSymbol(symbol *ast.Symbol, m *TypeMapper) *ast.Symb
 	resultLinks := c.valueSymbolLinks.Get(result)
 	resultLinks.target = symbol
 	resultLinks.mapper = m
+	c.mapperEscapeCount++
 	if links != nil {
 		resultLinks.setNameType(c, links.getNameType())
 	}
@@ -22613,8 +22648,10 @@ func (c *Checker) combineUnionOrIntersectionMemberSignatures(left *Signature, ri
 		} else {
 			result.mapper = paramMapper
 		}
+		c.mapperEscapeCount++
 	} else if left.getComposite() != nil && left.getComposite().isUnion == isUnion {
 		result.mapper = left.mapper
+		c.mapperEscapeCount++
 	}
 	return result
 }
@@ -24208,6 +24245,7 @@ func (c *Checker) instantiateAnonymousType(t *Type, m *TypeMapper, alias *TypeAl
 		result.AsMappedType().typeParameter = freshTypeParameter
 		m = c.combineTypeMappers(newSimpleTypeMapper(origTypeParameter, freshTypeParameter), m)
 		freshTypeParameter.AsTypeParameter().mapper = m
+		c.mapperEscapeCount++
 	case t.objectFlags&ObjectFlagsInstantiationExpressionType != 0:
 		result.AsInstantiationExpressionType().node = t.AsInstantiationExpressionType().node
 	}
@@ -24221,6 +24259,7 @@ func (c *Checker) instantiateAnonymousType(t *Type, m *TypeMapper, alias *TypeAl
 	d := result.AsObjectType()
 	d.target = t
 	d.mapper = m
+	c.mapperEscapeCount++
 	return result
 }
 
@@ -26200,6 +26239,10 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 		checkTuples := c.isSimpleTupleType(checkTypeNode) && c.isSimpleTupleType(extendsTypeNode) && len(checkTypeNode.Elements()) == len(extendsTypeNode.Elements())
 		checkTypeDeferred := c.isDeferredType(checkType, checkTuples)
 		var combinedMapper *TypeMapper
+		var context *InferenceContext
+		var nonFixingCombined *TypeMapper
+		var fixingCombined *TypeMapper
+		escapeBefore := c.mapperEscapeCount
 		if len(root.inferTypeParameters) != 0 {
 			// When we're looking at making an inference for an infer type, when we get its constraint, it'll automagically be
 			// instantiated with the context, so it doesn't need the mapper for the inference context - however the constraint
@@ -26210,14 +26253,15 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 			// [2] Eg, if we have `Foo<T, U extends T>` and `Foo<Q, infer B>` where `Q` is mapped by `mapper` into `number` - `B` is constrained to `T`
 			// which is in turn instantiated as `Q`, which is in turn instantiated as `number`.
 			// So we need to:
-			//    * combine `context.nonFixingMapper` with `mapper` so their constraints can be instantiated in the context of `mapper` (otherwise they'd only get inference context information)
-			//    * incorporate all of the component mappers into the combined mapper for the true and false members
+			//   * combine `context.nonFixingMapper` with `mapper` so their constraints can be instantiated in the context of `mapper` (otherwise they'd only get inference context information)
+			//   * incorporate all of the component mappers into the combined mapper for the true and false members
 			// This means we have two mappers that need applying:
-			//    * The original `mapper` used to create this conditional
-			//    * The mapper that maps the infer type parameter to its inference result (`context.mapper`)
-			context := c.newInferenceContext(root.inferTypeParameters, nil /*signature*/, InferenceFlagsNone, nil)
+			//   * The original `mapper` used to create this conditional
+			//   * The mapper that maps the infer type parameter to its inference result (`context.mapper`)
+			context = c.acquireConditionalInferenceContext(root.inferTypeParameters)
 			if mapper != nil {
-				context.nonFixingMapper = c.combineTypeMappers(context.nonFixingMapper, mapper)
+				nonFixingCombined = c.combineTypeMappers(context.nonFixingMapper, mapper)
+				context.nonFixingMapper = nonFixingCombined
 			}
 			if !checkTypeDeferred {
 				// We don't want inferences from constraints as they may cause us to eagerly resolve the
@@ -26225,11 +26269,12 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 				// types rules (i.e. proper contravariance) for inferences.
 				c.inferTypes(context.inferences, checkType, extendsType, InferencePriorityNoConstraints|InferencePriorityAlwaysStrict, false)
 			}
-			// It's possible for 'infer T' type parameters to be given uninstantiated constraints when the
+			// It's possible for 'infer T' type parameters to be given uninstantiated constraints when
 			// those type parameters are used in type references (see getInferredTypeParameterConstraint). For
 			// that reason we need context.mapper to be first in the combined mapper. See #42636 for examples.
 			if mapper != nil {
-				combinedMapper = c.combineTypeMappers(context.mapper, mapper)
+				fixingCombined = c.combineTypeMappers(context.mapper, mapper)
+				combinedMapper = fixingCombined
 			} else {
 				combinedMapper = context.mapper
 			}
@@ -26253,10 +26298,15 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 				// there are possible values of the check type that are also possible values of the extends type.
 				// We use a reverse assignability check as it is less expensive than the comparable relationship
 				// and avoids false positives of a non-empty intersection check.
+				usedCombinedMapper := false
 				if checkType.flags&TypeFlagsAny != 0 || forConstraint && inferredExtendsType.flags&TypeFlagsNever == 0 && someType(c.getPermissiveInstantiation(inferredExtendsType), func(t *Type) bool {
 					return c.isTypeAssignableTo(t, c.getPermissiveInstantiation(checkType))
 				}) {
+					usedCombinedMapper = true
 					extraTypes = append(extraTypes, c.instantiateType(c.getTypeFromTypeNode(root.node.TrueType), core.OrElse(combinedMapper, mapper)))
+				}
+				if context != nil && !usedCombinedMapper && c.mapperEscapeCount == escapeBefore {
+					c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
 				}
 				// If falseType is an immediately nested conditional type that isn't distributive or has an
 				// identical checkType, switch to that type and loop.
@@ -26289,6 +26339,9 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 				trueType := c.getTypeFromTypeNode(root.node.TrueType)
 				trueMapper := core.OrElse(combinedMapper, mapper)
 				if newRoot, newRootMapper := c.getTailRecursionRoot(trueType, trueMapper); newRoot != nil {
+					if context != nil && c.mapperEscapeCount == escapeBefore {
+						c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+					}
 					root = newRoot
 					mapper = newRootMapper
 					alias = nil
@@ -26298,6 +26351,9 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 					continue
 				}
 				result = c.instantiateType(trueType, trueMapper)
+				if context != nil && c.mapperEscapeCount == escapeBefore {
+					c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+				}
 				break
 			}
 		}
@@ -26324,9 +26380,26 @@ func (c *Checker) getTailRecursionRoot(newType *Type, newMapper *TypeMapper) (*C
 	if newType.flags&TypeFlagsConditional != 0 && newMapper != nil {
 		newRoot := newType.AsConditionalType().root
 		if len(newRoot.outerTypeParameters) != 0 {
-			typeParamMapper := c.combineTypeMappers(newType.AsConditionalType().mapper, newMapper)
-			typeArguments := core.Map(newRoot.outerTypeParameters, typeParamMapper.Map)
-			newRootMapper := newTypeMapper(newRoot.outerTypeParameters, typeArguments)
+			m1 := newType.AsConditionalType().mapper
+			mapParam := func(tp *Type) *Type {
+				if m1 != nil {
+					if t1 := m1.Map(tp); t1 != tp {
+						return c.instantiateType(t1, newMapper)
+					}
+				}
+				return newMapper.Map(tp)
+			}
+			var newRootMapper *TypeMapper
+			if len(newRoot.outerTypeParameters) == 1 {
+				tp := newRoot.outerTypeParameters[0]
+				newRootMapper = newSimpleTypeMapper(tp, mapParam(tp))
+			} else {
+				typeArguments := make([]*Type, len(newRoot.outerTypeParameters))
+				for i, tp := range newRoot.outerTypeParameters {
+					typeArguments[i] = mapParam(tp)
+				}
+				newRootMapper = newArrayTypeMapper(newRoot.outerTypeParameters, typeArguments)
+			}
 			var newCheckType *Type
 			if newRoot.isDistributive {
 				newCheckType = getMappedType(newRoot.checkType, newRootMapper)
@@ -27034,6 +27107,7 @@ func (c *Checker) createDeferredTypeReference(target *Type, node *ast.Node, mapp
 	d := t.AsTypeReference()
 	d.target = target
 	d.mapper = mapper
+	c.mapperEscapeCount++
 	d.node = node
 	return t
 }
@@ -27156,6 +27230,7 @@ func (c *Checker) newConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 	data.extendsType = c.instantiateType(root.extendsType, mapper)
 	data.mapper = mapper
 	data.combinedMapper = combinedMapper
+	c.mapperEscapeCount++
 	return c.newType(TypeFlagsConditional, ObjectFlagsNone, data.AsType(), typeKindConditional)
 }
 
@@ -27555,6 +27630,59 @@ func (c *Checker) getUnionType(types []*Type) *Type {
 // expression constructs such as array literals and the || and ?: operators). Named types can
 // circularly reference themselves and therefore cannot be subtype reduced during their declaration.
 // For example, "type Item = string | (() => Item" is a named type that circularly references itself.
+const unionFrontMaxWords = 8
+
+type unionFrontSlot struct {
+	key    [unionFrontMaxWords]uint32
+	result *Type
+	meta   uint16
+}
+
+func makeUnionFrontSlotKey(types []*Type, unionReduction UnionReduction, alias *TypeAlias) ([unionFrontMaxWords]uint32, uint16, uint32, bool) {
+	var key [unionFrontMaxWords]uint32
+	hasAlias := alias != nil
+	extra := 0
+	var aliasSymID uint64
+	if hasAlias {
+		aliasSymID = uint64(ast.GetSymbolId(alias.symbol))
+		if aliasSymID >= (1 << 32) {
+			return key, 0, 0, false
+		}
+		extra = 1 + len(alias.typeArguments)
+	}
+	if len(types)+extra > unionFrontMaxWords {
+		return key, 0, 0, false
+	}
+	var h uint64 = uint64(unionReduction)
+	n := 0
+	for _, t := range types {
+		w := uint32(t.id)
+		key[n] = w
+		n++
+		h = (h ^ uint64(w)) * 0x9e3779b97f4a7c15
+	}
+	if hasAlias {
+		w := uint32(aliasSymID)
+		key[n] = w
+		n++
+		h = (h ^ uint64(w)) * 0x9e3779b97f4a7c15
+		for _, t := range alias.typeArguments {
+			w := uint32(t.id)
+			key[n] = w
+			n++
+			h = (h ^ uint64(w)) * 0x9e3779b97f4a7c15
+		}
+	}
+	h ^= h >> 29
+	meta := uint16(1 | (uint16(unionReduction) << 1) | (uint16(len(types)) << 3))
+	if hasAlias {
+		meta |= 1 << 7
+	}
+	h ^= uint64(meta)
+	h *= 0x9e3779b97f4a7c15
+	return key, meta, uint32(h >> (64 - 10)), true
+}
+
 func getUnionFrontKey(types []*Type, unionReduction UnionReduction, alias *TypeAlias) CacheHashKey {
 	if alias == nil {
 		if key, ok := packedTypeListKey(packedUnionFrontKeyTag|uint64(unionReduction), types, false); ok {
@@ -27598,6 +27726,29 @@ func (c *Checker) getUnionTypeEx(types []*Type, unionReduction UnionReduction, a
 		return t
 	}
 	if origin == nil && (alias == nil || alias.symbol != nil) {
+		if slotKey, meta, idx, ok := makeUnionFrontSlotKey(types, unionReduction, alias); ok {
+			if c.unionFrontSlots != nil {
+				slot := &c.unionFrontSlots[idx]
+				if slot.meta == meta && slot.key == slotKey {
+					return slot.result
+				}
+			}
+			typeCount := c.TypeCount
+			instCount := c.instantiationCount
+			totalInstCount := c.TotalInstantiationCount
+			impure := c.unionImpureCount
+			result := c.getUnionTypeWorker(types, unionReduction, alias, nil)
+			created := c.TypeCount != typeCount && !(c.TypeCount == typeCount+1 && result.id == TypeId(c.TypeCount))
+			instantiated := c.instantiationCount != instCount || c.TotalInstantiationCount != totalInstCount
+			wasImpure := c.unionImpureCount != impure
+			if !created && !instantiated && !wasImpure && result != c.errorType {
+				if c.unionFrontSlots == nil {
+					c.unionFrontSlots = new([1024]unionFrontSlot)
+				}
+				c.unionFrontSlots[idx] = unionFrontSlot{key: slotKey, result: result, meta: meta}
+			}
+			return result
+		}
 		key := getUnionFrontKey(types, unionReduction, alias)
 		if cached := c.unionFrontCache[key]; cached != nil {
 			return cached
@@ -31406,6 +31557,42 @@ const (
 	maxTemplateLiteralTypeSpans  = 100_000
 )
 
+type templateLiteralScratch struct {
+	buf      []byte
+	newTypes []*Type
+	newTexts []string
+}
+
+func (c *Checker) acquireTemplateScratch() *templateLiteralScratch {
+	if n := len(c.templateScratchPool); n > 0 {
+		s := c.templateScratchPool[n-1]
+		c.templateScratchPool = c.templateScratchPool[:n-1]
+		return s
+	}
+	return &templateLiteralScratch{}
+}
+
+func (c *Checker) releaseTemplateScratch(s *templateLiteralScratch, buf []byte, newTypes []*Type, newTexts []string) {
+	if cap(buf) <= 65536 {
+		s.buf = buf[:0]
+	} else {
+		s.buf = nil
+	}
+	clear(newTypes)
+	if cap(newTypes) <= 4096 {
+		s.newTypes = newTypes[:0]
+	} else {
+		s.newTypes = nil
+	}
+	clear(newTexts)
+	if cap(newTexts) <= 4096 {
+		s.newTexts = newTexts[:0]
+	} else {
+		s.newTexts = nil
+	}
+	c.templateScratchPool = append(c.templateScratchPool, s)
+}
+
 func (c *Checker) getTemplateLiteralType(texts []string, types []*Type) *Type {
 	unionIndex := core.FindIndex(types, func(t *Type) bool {
 		return t.flags&(TypeFlagsNever|TypeFlagsUnion) != 0
@@ -31421,10 +31608,45 @@ func (c *Checker) getTemplateLiteralType(texts []string, types []*Type) *Type {
 	if slices.Contains(types, c.wildcardType) {
 		return c.wildcardType
 	}
-	var newTypes []*Type
-	var newTexts []string
-	var sb strings.Builder
-	sb.WriteString(texts[0])
+	scratch := c.acquireTemplateScratch()
+	buf := scratch.buf[:0]
+	newTypes := scratch.newTypes[:0]
+	newTexts := scratch.newTexts[:0]
+	curStr := texts[0]
+	usingBuf := false
+	appendStr := func(s string) {
+		if len(s) == 0 {
+			return
+		}
+		if !usingBuf {
+			if len(curStr) == 0 {
+				curStr = s
+				return
+			}
+			buf = append(buf[:0], curStr...)
+			buf = append(buf, s...)
+			usingBuf = true
+		} else {
+			buf = append(buf, s...)
+		}
+	}
+	curLen := func() int {
+		if usingBuf {
+			return len(buf)
+		}
+		return len(curStr)
+	}
+	flushStr := func() string {
+		if !usingBuf {
+			return stringutil.CombineSurrogatePairs(curStr)
+		}
+		for i := range buf {
+			if buf[i] == 0xed {
+				return stringutil.CombineSurrogatePairs(string(buf))
+			}
+		}
+		return string(buf)
+	}
 	textLength := 0 // combined length of the segments already moved into newTexts
 	tooLarge := false
 	var addSpans func([]string, []*Type) bool
@@ -31432,24 +31654,24 @@ func (c *Checker) getTemplateLiteralType(texts []string, types []*Type) *Type {
 		for i, t := range types {
 			switch {
 			case t.flags&(TypeFlagsLiteral|TypeFlagsNull|TypeFlagsUndefined) != 0:
-				sb.WriteString(c.getTemplateStringForType(t))
-				sb.WriteString(texts[i+1])
+				appendStr(c.getTemplateStringForType(t))
+				appendStr(texts[i+1])
 			case t.flags&TypeFlagsTemplateLiteral != 0:
-				sb.WriteString(t.AsTemplateLiteralType().texts[0])
+				appendStr(t.AsTemplateLiteralType().texts[0])
 				if !addSpans(t.AsTemplateLiteralType().texts, t.AsTemplateLiteralType().types) {
 					return false
 				}
-				sb.WriteString(texts[i+1])
+				appendStr(texts[i+1])
 			case c.isGenericIndexType(t) || c.isPatternLiteralPlaceholderType(t):
 				newTypes = append(newTypes, t)
-				newTexts = append(newTexts, stringutil.CombineSurrogatePairs(sb.String()))
-				textLength += sb.Len()
-				sb.Reset()
-				sb.WriteString(texts[i+1])
+				newTexts = append(newTexts, flushStr())
+				textLength += curLen()
+				curStr = texts[i+1]
+				usingBuf = false
 			default:
 				return false
 			}
-			if textLength+sb.Len() > maxTemplateLiteralTypeLength || len(newTypes) > maxTemplateLiteralTypeSpans {
+			if textLength+curLen() > maxTemplateLiteralTypeLength || len(newTypes) > maxTemplateLiteralTypeSpans {
 				tooLarge = true
 				return false
 			}
@@ -31457,6 +31679,7 @@ func (c *Checker) getTemplateLiteralType(texts []string, types []*Type) *Type {
 		return true
 	}
 	if !addSpans(texts, types) {
+		c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
 		if tooLarge {
 			c.error(c.currentNode, diagnostics.Type_instantiation_is_excessively_deep_and_possibly_infinite)
 			return c.errorType
@@ -31464,24 +31687,51 @@ func (c *Checker) getTemplateLiteralType(texts []string, types []*Type) *Type {
 		return c.stringType
 	}
 	if len(newTypes) == 0 {
-		return c.getStringLiteralType(stringutil.CombineSurrogatePairs(sb.String()))
+		if !usingBuf {
+			s := stringutil.CombineSurrogatePairs(curStr)
+			c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
+			return c.getStringLiteralType(s)
+		}
+		hasSurrogate := false
+		for i := range buf {
+			if buf[i] == 0xed {
+				hasSurrogate = true
+				break
+			}
+		}
+		if !hasSurrogate {
+			if t := c.stringLiteralTypes[string(buf)]; t != nil {
+				c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
+				return t
+			}
+			s := string(buf)
+			c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
+			return c.getStringLiteralType(s)
+		}
+		s := stringutil.CombineSurrogatePairs(string(buf))
+		c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
+		return c.getStringLiteralType(s)
 	}
-	newTexts = append(newTexts, stringutil.CombineSurrogatePairs(sb.String()))
+	newTexts = append(newTexts, flushStr())
 	if core.Every(newTexts, func(t string) bool { return t == "" }) {
 		if core.Every(newTypes, func(t *Type) bool { return t.flags&TypeFlagsString != 0 }) {
+			c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
 			return c.stringType
 		}
-		// Normalize `${Mapping<xxx>}` into Mapping<xxx>
+		// Normalize `${Mapping<xxx>}` into `Mapping<xxx>`
 		if len(newTypes) == 1 && c.isPatternLiteralType(newTypes[0]) {
-			return newTypes[0]
+			res := newTypes[0]
+			c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
+			return res
 		}
 	}
-	key := getTemplateTypeKey(newTexts, newTypes)
+	key := c.getTemplateTypeKey(newTexts, newTypes)
 	t := c.templateLiteralTypes[key]
 	if t == nil {
-		t = c.newTemplateLiteralType(newTexts, newTypes)
+		t = c.newTemplateLiteralType(slices.Clone(newTexts), slices.Clone(newTypes))
 		c.templateLiteralTypes[key] = t
 	}
+	c.releaseTemplateScratch(scratch, buf, newTypes, newTexts)
 	return t
 }
 

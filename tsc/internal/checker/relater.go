@@ -107,9 +107,169 @@ type Relation struct {
 	packedShift   uint8
 }
 
+type simpleRelationSlot struct {
+	lo     uint32
+	hi     uint32
+	packed uint32
+}
+
+type simpleRelationMap struct {
+	slots []simpleRelationSlot
+	count uint32
+	shift uint8
+}
+
+func (m *simpleRelationMap) get(key uint64) uint32 {
+	if len(m.slots) == 0 {
+		return 0
+	}
+	lo, hi := uint32(key), uint32(key>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
+	for {
+		s := m.slots[i]
+		if s.packed == 0 {
+			return 0
+		}
+		if s.lo == lo && s.hi == hi {
+			return s.packed
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *simpleRelationMap) slot(key uint64) *simpleRelationSlot {
+	if len(m.slots) == 0 {
+		m.slots = make([]simpleRelationSlot, 64)
+		m.shift = 64 - 6
+	} else if int(m.count+1)*8 > len(m.slots)*7 {
+		m.grow()
+	}
+	lo, hi := uint32(key), uint32(key>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
+	for {
+		s := &m.slots[i]
+		if s.packed == 0 {
+			s.lo = lo
+			s.hi = hi
+			m.count++
+			return s
+		}
+		if s.lo == lo && s.hi == hi {
+			return s
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *simpleRelationMap) grow() {
+	old := m.slots
+	newCap := len(old) * 2
+	m.shift--
+	if len(old) <= 16384 {
+		newCap = len(old) * 4
+		m.shift--
+	}
+	m.slots = make([]simpleRelationSlot, newCap)
+	mask := uint32(newCap - 1)
+	for _, s := range old {
+		if s.packed == 0 {
+			continue
+		}
+		key := uint64(s.hi)<<32 | uint64(s.lo)
+		i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
+		for m.slots[i].packed != 0 {
+			i = (i + 1) & mask
+		}
+		m.slots[i] = s
+	}
+}
+
+type genericRelationSlot struct {
+	lo0    uint32
+	lo1    uint32
+	hi0    uint32
+	hi1    uint32
+	packed uint32
+}
+
+type genericRelationMap struct {
+	slots []genericRelationSlot
+	count uint32
+	shift uint8
+}
+
+func (m *genericRelationMap) get(key CacheHashKey) uint32 {
+	if len(m.slots) == 0 {
+		return 0
+	}
+	lo0, lo1 := uint32(key.Lo), uint32(key.Lo>>32)
+	hi0, hi1 := uint32(key.Hi), uint32(key.Hi>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32(key.Lo >> m.shift)
+	for {
+		s := m.slots[i]
+		if s.packed == 0 {
+			return 0
+		}
+		if s.lo0 == lo0 && s.lo1 == lo1 && s.hi0 == hi0 && s.hi1 == hi1 {
+			return s.packed
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *genericRelationMap) slot(key CacheHashKey) *genericRelationSlot {
+	if len(m.slots) == 0 {
+		m.slots = make([]genericRelationSlot, 32)
+		m.shift = 64 - 5
+	} else if int(m.count+1)*4 > len(m.slots)*3 {
+		m.grow()
+	}
+	lo0, lo1 := uint32(key.Lo), uint32(key.Lo>>32)
+	hi0, hi1 := uint32(key.Hi), uint32(key.Hi>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32(key.Lo >> m.shift)
+	for {
+		s := &m.slots[i]
+		if s.packed == 0 {
+			s.lo0 = lo0
+			s.lo1 = lo1
+			s.hi0 = hi0
+			s.hi1 = hi1
+			m.count++
+			return s
+		}
+		if s.lo0 == lo0 && s.lo1 == lo1 && s.hi0 == hi0 && s.hi1 == hi1 {
+			return s
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *genericRelationMap) grow() {
+	old := m.slots
+	newCap := len(old) * 2
+	m.slots = make([]genericRelationSlot, newCap)
+	m.shift--
+	mask := uint32(newCap - 1)
+	for _, s := range old {
+		if s.packed == 0 {
+			continue
+		}
+		lo := uint64(s.lo1)<<32 | uint64(s.lo0)
+		i := uint32(lo >> m.shift)
+		for m.slots[i].packed != 0 {
+			i = (i + 1) & mask
+		}
+		m.slots[i] = s
+	}
+}
+
 type packedRelationCache struct {
-	genericResults map[CacheHashKey]uint32
-	simpleResults  [4]map[uint64]uint32
+	genericResults genericRelationMap
+	simpleResults  [4]simpleRelationMap
 	counts         [packedRelationCount]int
 }
 
@@ -137,20 +297,38 @@ func (r *Relation) getPacked(key relationKey) uint32 {
 		return 0
 	}
 	if key.generic {
-		return r.packedResults.genericResults[key.value]
+		return r.packedResults.genericResults.get(key.value)
 	}
-	return r.packedResults.simpleResults[key.value.Hi][key.value.Lo]
+	return r.packedResults.simpleResults[key.value.Hi].get(key.value.Lo)
 }
 
 func (r *Relation) get(key relationKey) RelationComparisonResult {
-	packed := r.getPacked(key)
-	if packed == 0 {
+	if r.packedResults == nil {
 		return RelationComparisonResultNone
 	}
-	result := RelationComparisonResult(packed>>r.packedShift) & relationComparisonResultMask
+	if key.generic {
+		s := r.packedResults.genericResults.get(key.value)
+		if s == 0 {
+			return RelationComparisonResultNone
+		}
+		result := RelationComparisonResult(s>>r.packedShift) & relationComparisonResultMask
+		if result != RelationComparisonResultNone {
+			return result
+		}
+		return r.deriveAndSetPacked(key, s)
+	}
+	s := r.packedResults.simpleResults[key.value.Hi].get(key.value.Lo)
+	if s == 0 {
+		return RelationComparisonResultNone
+	}
+	result := RelationComparisonResult(s>>r.packedShift) & relationComparisonResultMask
 	if result != RelationComparisonResultNone {
 		return result
 	}
+	return r.deriveAndSetPacked(key, s)
+}
+
+func (r *Relation) deriveAndSetPacked(key relationKey, packed uint32) RelationComparisonResult {
 	// A failure in a laxer relation implies failure in this relation. Align each
 	// slot's failure and overflow bits with its respective slot marker, then keep
 	// failures that did not result from an overflow. The mask excludes this and
@@ -159,7 +337,7 @@ func (r *Relation) get(key relationKey) RelationComparisonResult {
 	if failedSlots := ((packed >> relationComparisonResultFailedBitShift) &^ (packed >> relationComparisonResultOverflowBitShift)) & laxerSlots; failedSlots != 0 {
 		// The lowest set marker is the nearest laxer relation with a usable failure.
 		shift := bits.TrailingZeros32(failedSlots)
-		result = RelationComparisonResult(packed>>shift) & relationComparisonResultMask
+		result := RelationComparisonResult(packed>>shift) & relationComparisonResultMask
 		return r.setPacked(key, packed, result)
 	}
 	// A success in a stricter relation implies success in this relation. Align
@@ -169,14 +347,33 @@ func (r *Relation) get(key relationKey) RelationComparisonResult {
 	if succeededSlots := (packed >> relationComparisonResultSucceededBitShift) & stricterSlots; succeededSlots != 0 {
 		// Prefer the strictest available success, matching the previous scan order.
 		shift := bits.TrailingZeros32(succeededSlots)
-		result = RelationComparisonResult(packed>>shift) & relationComparisonResultMask
+		result := RelationComparisonResult(packed>>shift) & relationComparisonResultMask
 		return r.setPacked(key, packed, result)
 	}
 	return RelationComparisonResultNone
 }
 
-func (r *Relation) set(key relationKey, result RelationComparisonResult) {
-	r.setPacked(key, r.getPacked(key), result)
+func (r *Relation) set(key relationKey, result RelationComparisonResult) RelationComparisonResult {
+	if r.packedResults == nil {
+		r.packedResults = &packedRelationCache{}
+	}
+	result &= relationComparisonResultMask
+	shiftedResult := uint32(result) << r.packedShift
+	mask := uint32(relationComparisonResultMask) << r.packedShift
+	if key.generic {
+		slot := r.packedResults.genericResults.slot(key.value)
+		if slot.packed&mask == 0 {
+			r.packedResults.counts[r.packedShift/packedRelationResultBits]++
+		}
+		slot.packed = slot.packed&^mask | shiftedResult
+	} else {
+		slot := r.packedResults.simpleResults[key.value.Hi].slot(key.value.Lo)
+		if slot.packed&mask == 0 {
+			r.packedResults.counts[r.packedShift/packedRelationResultBits]++
+		}
+		slot.packed = slot.packed&^mask | shiftedResult
+	}
+	return result
 }
 
 const relationComparisonResultMask = RelationComparisonResultSucceeded |
@@ -195,29 +392,7 @@ const (
 )
 
 func (r *Relation) setPacked(key relationKey, packed uint32, result RelationComparisonResult) RelationComparisonResult {
-	if r.packedResults == nil {
-		r.packedResults = &packedRelationCache{}
-	}
-	result &= relationComparisonResultMask
-	shiftedResult := uint32(result&relationComparisonResultMask) << r.packedShift
-	mask := uint32(relationComparisonResultMask) << r.packedShift
-	if packed&mask == 0 {
-		r.packedResults.counts[r.packedShift/packedRelationResultBits]++
-	}
-	newPacked := packed&^mask | shiftedResult
-	if key.generic {
-		if r.packedResults.genericResults == nil {
-			r.packedResults.genericResults = make(map[CacheHashKey]uint32)
-		}
-		r.packedResults.genericResults[key.value] = newPacked
-	} else {
-		results := &r.packedResults.simpleResults[key.value.Hi]
-		if *results == nil {
-			*results = make(map[uint64]uint32)
-		}
-		(*results)[key.value.Lo] = newPacked
-	}
-	return result
+	return r.set(key, result)
 }
 
 func (r *Relation) size() int {

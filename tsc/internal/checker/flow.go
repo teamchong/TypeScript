@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
@@ -2684,11 +2685,12 @@ func (c *Checker) isReachableFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 		flags := flow.Flags
 		if flags&ast.FlowFlagsShared != 0 {
 			if !noCacheCheck && len(f.reduceLabels) == 0 {
-				if reachable, ok := c.flowNodeReachable[flow]; ok {
+				key := uintptr(unsafe.Pointer(flow))
+				if reachable, ok := c.flowNodeReachable[key]; ok {
 					return reachable
 				}
 				reachable := c.isReachableFlowNodeWorker(f, flow, true /*noCacheCheck*/)
-				c.flowNodeReachable[flow] = reachable
+				c.flowNodeReachable[key] = reachable
 				return reachable
 			}
 			noCacheCheck = false
@@ -2770,11 +2772,13 @@ func (c *Checker) isPostSuperFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 		flags := flow.Flags
 		if flags&ast.FlowFlagsShared != 0 {
 			if !noCacheCheck {
-				if postSuper, ok := c.flowNodePostSuper[flow]; ok {
+				key := uintptr(unsafe.Pointer(flow))
+				if postSuper, ok := c.flowNodePostSuper[key]; ok {
 					return postSuper
 				}
 				postSuper := c.isPostSuperFlowNodeWorker(f, flow, true /*noCacheCheck*/)
-				c.flowNodePostSuper[flow] = postSuper
+				c.flowNodePostSuper[key] = postSuper
+				return postSuper
 			}
 			noCacheCheck = false
 		}

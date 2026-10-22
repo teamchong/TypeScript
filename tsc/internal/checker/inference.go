@@ -1394,14 +1394,94 @@ func (c *Checker) newInferenceContext(typeParameters []*Type, signature *Signatu
 	if compareTypes == nil {
 		compareTypes = c.compareTypesAssignable
 	}
-	return c.newInferenceContextWorker(core.Map(typeParameters, newInferenceInfo), signature, flags, compareTypes)
+	infos := make([]InferenceInfo, len(typeParameters))
+	inferences := make([]*InferenceInfo, len(typeParameters))
+	for i, tp := range typeParameters {
+		infos[i] = InferenceInfo{typeParameter: tp, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+		inferences[i] = &infos[i]
+	}
+	return c.newInferenceContextWorker(inferences, signature, flags, compareTypes)
+}
+
+func (c *Checker) acquireConditionalInferenceContext(typeParameters []*Type) *InferenceContext {
+	var n *InferenceContext
+	if l := len(c.freeInferenceContexts); l > 0 {
+		n = c.freeInferenceContexts[l-1]
+		c.freeInferenceContexts = c.freeInferenceContexts[:l-1]
+		n.signature = nil
+		n.flags = InferenceFlagsNone
+		n.compareTypes = c.compareTypesAssignable
+		n.returnMapper = nil
+		n.outerReturnMapper = nil
+		n.inferredTypeParameters = nil
+		n.intraExpressionInferenceSites = nil
+		n.mapper = c.initInferenceTypeMapper(&n.mapperStorage[0], n, true /*fixing*/)
+		n.nonFixingMapper = c.initInferenceTypeMapper(&n.mapperStorage[1], n, false /*fixing*/)
+	} else {
+		n = c.newInferenceContextWorker(nil, nil, InferenceFlagsNone, c.compareTypesAssignable)
+	}
+	inferences := n.inferences[:0]
+	for _, tp := range typeParameters {
+		var info *InferenceInfo
+		if l := len(c.freeInferenceInfos); l > 0 {
+			info = c.freeInferenceInfos[l-1]
+			c.freeInferenceInfos = c.freeInferenceInfos[:l-1]
+			info.typeParameter = tp
+			info.inferredType = nil
+			info.priority = InferencePriorityMaxValue
+			info.topLevel = true
+			info.isFixed = false
+			info.impliedArity = -1
+		} else {
+			info = newInferenceInfo(tp)
+		}
+		inferences = append(inferences, info)
+	}
+	n.inferences = inferences
+	return n
+}
+
+func (c *Checker) releaseConditionalInferenceContext(n *InferenceContext, fixingCombined *TypeMapper, nonFixingCombined *TypeMapper) {
+	if fixingCombined != nil && fixingCombined.kind == TypeMapperKindComposite {
+		c.compositeMapperArena.Pop(castTypeMapper[CompositeTypeMapper](fixingCombined, TypeMapperKindComposite))
+	}
+	if nonFixingCombined != nil && nonFixingCombined.kind == TypeMapperKindComposite {
+		c.compositeMapperArena.Pop(castTypeMapper[CompositeTypeMapper](nonFixingCombined, TypeMapperKindComposite))
+	}
+	for i, info := range n.inferences {
+		clear(info.candidates)
+		info.candidates = info.candidates[:0]
+		clear(info.contraCandidates)
+		info.contraCandidates = info.contraCandidates[:0]
+		info.typeParameter = nil
+		info.inferredType = nil
+		c.freeInferenceInfos = append(c.freeInferenceInfos, info)
+		n.inferences[i] = nil
+	}
+	n.inferences = n.inferences[:0]
+	c.freeInferenceContexts = append(c.freeInferenceContexts, n)
 }
 
 func (c *Checker) cloneInferenceContext(n *InferenceContext, extraFlags InferenceFlags) *InferenceContext {
 	if n == nil {
 		return nil
 	}
-	return c.newInferenceContextWorker(core.Map(n.inferences, cloneInferenceInfo), n.signature, n.flags|extraFlags, n.compareTypes)
+	infos := make([]InferenceInfo, len(n.inferences))
+	inferences := make([]*InferenceInfo, len(n.inferences))
+	for i, info := range n.inferences {
+		infos[i] = InferenceInfo{
+			typeParameter:    info.typeParameter,
+			candidates:       slices.Clone(info.candidates),
+			contraCandidates: slices.Clone(info.contraCandidates),
+			inferredType:     info.inferredType,
+			priority:         info.priority,
+			topLevel:         info.topLevel,
+			isFixed:          info.isFixed,
+			impliedArity:     info.impliedArity,
+		}
+		inferences[i] = &infos[i]
+	}
+	return c.newInferenceContextWorker(inferences, n.signature, n.flags|extraFlags, n.compareTypes)
 }
 
 func (c *Checker) cloneInferredPartOfContext(n *InferenceContext) *InferenceContext {
@@ -1409,7 +1489,22 @@ func (c *Checker) cloneInferredPartOfContext(n *InferenceContext) *InferenceCont
 	if len(inferences) == 0 {
 		return nil
 	}
-	return c.newInferenceContextWorker(core.Map(inferences, cloneInferenceInfo), n.signature, n.flags, n.compareTypes)
+	infos := make([]InferenceInfo, len(inferences))
+	cloned := make([]*InferenceInfo, len(inferences))
+	for i, info := range inferences {
+		infos[i] = InferenceInfo{
+			typeParameter:    info.typeParameter,
+			candidates:       slices.Clone(info.candidates),
+			contraCandidates: slices.Clone(info.contraCandidates),
+			inferredType:     info.inferredType,
+			priority:         info.priority,
+			topLevel:         info.topLevel,
+			isFixed:          info.isFixed,
+			impliedArity:     info.impliedArity,
+		}
+		cloned[i] = &infos[i]
+	}
+	return c.newInferenceContextWorker(cloned, n.signature, n.flags, n.compareTypes)
 }
 
 func (c *Checker) newInferenceContextWorker(inferences []*InferenceInfo, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
