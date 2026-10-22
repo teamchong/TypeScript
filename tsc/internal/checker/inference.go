@@ -8,12 +8,16 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/jsnum"
 )
 
-type InferenceKey struct {
-	source        TypeId
-	target        TypeId
-	priority      InferencePriority
-	contravariant bool
-	bivariant     bool
+type inferInfoOutcome struct {
+	candidates       []*Type
+	contraCandidates []*Type
+	priority         InferencePriority
+	topLevel         bool
+}
+
+type inferMemoEntry struct {
+	infos   []inferInfoOutcome
+	cleared bool
 }
 
 type InferenceState struct {
@@ -24,9 +28,10 @@ type InferenceState struct {
 	inferencePriority InferencePriority
 	contravariant     bool
 	bivariant         bool
+	clearedInferences bool
 	expandingFlags    ExpandingFlags
 	propagationType   *Type
-	visited           map[InferenceKey]InferencePriority
+	visited           map[uint64]InferencePriority
 	sourceStack       []relaterStackEntry
 	targetStack       []relaterStackEntry
 	next              *InferenceState
@@ -57,6 +62,11 @@ func (c *Checker) putInferenceState(n *InferenceState) {
 	c.freeinferenceState = n
 }
 
+const (
+	inferMemoMaxInfos = 8
+	inferMemoMinSteps = 16
+)
+
 func (c *Checker) inferTypes(inferences []*InferenceInfo, originalSource *Type, originalTarget *Type, priority InferencePriority, contravariant bool) {
 	n := c.getInferenceState()
 	n.inferences = inferences
@@ -65,11 +75,115 @@ func (c *Checker) inferTypes(inferences []*InferenceInfo, originalSource *Type, 
 	n.priority = priority
 	n.inferencePriority = InferencePriorityMaxValue
 	n.contravariant = contravariant
-	c.inferFromTypes(n, originalSource, originalTarget)
+	c.inferFromTypesMemo(n, originalSource, originalTarget)
 	c.putInferenceState(n)
 }
 
+func (c *Checker) inferFromTypesMemo(n *InferenceState, source *Type, target *Type) {
+	if !c.inferLongTargets[target] {
+		stepsBefore := c.inferMemoSteps
+		c.inferFromTypes(n, source, target)
+		if c.inferMemoSteps-stepsBefore >= inferMemoMinSteps {
+			if c.inferLongTargets == nil {
+				c.inferLongTargets = make(map[*Type]bool)
+			}
+			c.inferLongTargets[target] = true
+		}
+		return
+	}
+	inferences := n.inferences
+	if c.skipDirectInferenceNodes.Len() != 0 || len(inferences) > inferMemoMaxInfos {
+		c.inferFromTypes(n, source, target)
+		return
+	}
+	var b keyBuilder
+	b.writeUint32(uint32(source.id))
+	b.writeUint32(uint32(target.id))
+	b.writeUint32(uint32(n.priority))
+	b.writeByte(core.IfElse(n.contravariant, byte(1), byte(0)))
+	b.writeUint32(uint32(len(inferences)))
+	for _, info := range inferences {
+		var tpId uint32
+		if info.typeParameter != nil {
+			tpId = uint32(info.typeParameter.id)
+		}
+		b.writeUint32(tpId)
+		b.writeUint32(uint32(info.priority))
+		b.writeByte(core.IfElse(info.topLevel, byte(1), byte(0)) | core.IfElse(info.isFixed, byte(2), byte(0)))
+		b.writeUint32(uint32(info.impliedArity))
+		b.writeUint32(uint32(len(info.candidates)))
+		b.writeTypes(info.candidates)
+		b.writeUint32(uint32(len(info.contraCandidates)))
+		b.writeTypes(info.contraCandidates)
+	}
+	key := b.hash()
+	if entry := c.inferMemoEntries[key]; entry != nil {
+		for i, info := range inferences {
+			outcome := &entry.infos[i]
+			info.candidates = append(info.candidates[:0], outcome.candidates...)
+			info.contraCandidates = append(info.contraCandidates[:0], outcome.contraCandidates...)
+			info.priority = outcome.priority
+			info.topLevel = outcome.topLevel
+		}
+		if entry.cleared {
+			clearCachedInferences(inferences)
+		}
+		return
+	}
+	inInstantiation := len(c.activeMappers) != 0
+	resetsBefore := c.instantiationCountResets
+	cyclesBefore := c.resolutionCycleCount
+	var hasFailedResolution bool
+	for i := c.resolutionStart; i < len(c.typeResolutions); i++ {
+		if !c.typeResolutions[i].result {
+			hasFailedResolution = true
+			break
+		}
+	}
+	typeCount := c.TypeCount
+	symbolCount := c.SymbolCount
+	sigCount := c.SignatureCount
+	instCount := c.instantiationCount
+	totalInstCount := c.TotalInstantiationCount
+	diagCount := c.diagnosticCount
+	impureCount := c.unionImpureCount
+	stepsBefore := c.inferMemoSteps
+	c.inferFromTypes(n, source, target)
+	steps := c.inferMemoSteps - stepsBefore
+	if steps >= inferMemoMinSteps &&
+		!inInstantiation &&
+		!hasFailedResolution &&
+		c.instantiationCountResets == resetsBefore &&
+		c.resolutionCycleCount == cyclesBefore &&
+		c.TypeCount == typeCount &&
+		c.SymbolCount == symbolCount &&
+		c.SignatureCount == sigCount &&
+		c.instantiationCount == instCount &&
+		c.TotalInstantiationCount == totalInstCount &&
+		c.diagnosticCount == diagCount &&
+		c.unionImpureCount == impureCount &&
+		c.skipDirectInferenceNodes.Len() == 0 {
+		outcomes := make([]inferInfoOutcome, len(inferences))
+		for i, info := range inferences {
+			outcomes[i] = inferInfoOutcome{
+				candidates:       slices.Clone(info.candidates),
+				contraCandidates: slices.Clone(info.contraCandidates),
+				priority:         info.priority,
+				topLevel:         info.topLevel,
+			}
+		}
+		if c.inferMemoEntries == nil {
+			c.inferMemoEntries = make(map[CacheHashKey]*inferMemoEntry)
+		}
+		c.inferMemoEntries[key] = &inferMemoEntry{
+			infos:   outcomes,
+			cleared: n.clearedInferences,
+		}
+	}
+}
+
 func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) {
+	c.inferMemoSteps++
 	if !c.couldContainTypeVariables(target) || c.isNoInferType(target) {
 		return
 	}
@@ -197,15 +311,18 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 					if n.contravariant && !n.bivariant {
 						if !slices.Contains(inference.contraCandidates, candidate) {
 							inference.contraCandidates = append(inference.contraCandidates, candidate)
+							n.clearedInferences = true
 							clearCachedInferences(n.inferences)
 						}
 					} else if !slices.Contains(inference.candidates, candidate) {
 						inference.candidates = append(inference.candidates, candidate)
+						n.clearedInferences = true
 						clearCachedInferences(n.inferences)
 					}
 				}
 				if n.priority&InferencePriorityReturnType == 0 && target.flags&TypeFlagsTypeParameter != 0 && inference.topLevel && !c.isTypeParameterAtTopLevel(n.originalTarget, target, 0) {
 					inference.topLevel = false
+					n.clearedInferences = true
 					clearCachedInferences(n.inferences)
 				}
 			}
@@ -348,13 +465,21 @@ func (c *Checker) inferFromContravariantTypesIfStrictFunctionTypes(n *InferenceS
 // such that we would go on inferring forever, even though we would never infer
 // between the same pair of types.
 func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, action func(c *Checker, n *InferenceState, source *Type, target *Type)) {
-	key := InferenceKey{source: source.id, target: target.id, priority: n.priority, contravariant: n.contravariant, bivariant: n.bivariant}
+	var flags uint64
+	if n.contravariant {
+		flags |= 1 << 11
+	}
+	if n.bivariant {
+		flags |= 1 << 12
+	}
+	flags |= uint64(n.priority) & 0x7ff
+	key := uint64(source.id) | (uint64(target.id) << 25) | (flags << 50)
 	if status, ok := n.visited[key]; ok {
 		n.inferencePriority = min(n.inferencePriority, status)
 		return
 	}
 	if n.visited == nil {
-		n.visited = make(map[InferenceKey]InferencePriority)
+		n.visited = make(map[uint64]InferencePriority)
 	}
 	n.visited[key] = InferencePriorityCircularity
 	saveInferencePriority := n.inferencePriority

@@ -705,6 +705,11 @@ type Checker struct {
 	unionFrontCache                             map[CacheHashKey]*Type
 	unionImpureCount                            uint32
 	diagnosticCount                             uint32
+	instantiationCountResets                    uint32
+	resolutionCycleCount                        uint32
+	inferMemoSteps                              uint32
+	inferLongTargets                            map[*Type]bool
+	inferMemoEntries                            map[CacheHashKey]*inferMemoEntry
 	indexedAccessUnionMemo                      map[indexedAccessUnionKey]*Type
 	globalObjectAugmentFilter                   [4]uint64
 	globalObjectFilterReady                     bool
@@ -2367,6 +2372,7 @@ func (c *Checker) checkSourceElement(node *ast.Node) bool {
 		saveWithinUnreachableCode := c.withinUnreachableCode
 		c.currentNode = node
 		c.instantiationCount = 0
+		c.instantiationCountResets++
 		c.checkSourceElementWorker(node)
 		c.currentNode = saveCurrentNode
 		c.withinUnreachableCode = saveWithinUnreachableCode
@@ -2630,6 +2636,7 @@ func (c *Checker) checkDeferredNode(node *ast.Node) {
 	saveCurrentNode := c.currentNode
 	c.currentNode = node
 	c.instantiationCount = 0
+	c.instantiationCountResets++
 	switch node.Kind {
 	case ast.KindCallExpression, ast.KindNewExpression, ast.KindTaggedTemplateExpression, ast.KindDecorator, ast.KindJsxOpeningElement:
 		// These node kinds are deferred checked when overload resolution fails. To save on work,
@@ -7600,6 +7607,7 @@ func (c *Checker) getTypeOfExpression(node *ast.Node) *Type {
 	}
 	// If a type has been cached for the node, return it.
 	if cachedType := c.flowTypeCache[node]; cachedType != nil {
+		c.resolutionCycleCount++
 		return cachedType
 	}
 	startInvocationCount := c.flowInvocationCount
@@ -7819,6 +7827,7 @@ func (c *Checker) checkExpressionEx(node *ast.Node, checkMode CheckMode) *Type {
 	saveCurrentNode := c.currentNode
 	c.currentNode = node
 	c.instantiationCount = 0
+	c.instantiationCountResets++
 	uninstantiatedType := c.checkExpressionWorker(node, checkMode)
 	t := c.instantiateTypeWithSingleGenericCallSignature(node, uninstantiatedType, checkMode)
 	if isConstEnumObjectType(t) {
@@ -8692,6 +8701,8 @@ func (c *Checker) getResolvedSignature(node *ast.Node, candidatesOutArray *[]*Si
 		// retry the symbol type resolution with the resolvingSignature marker in place to suppress
 		// the contextual type circularity.
 		c.resolutionStart = len(c.typeResolutions)
+	} else if cached == c.resolvingSignature {
+		c.resolutionCycleCount++
 	}
 	links.resolvedSignature = c.resolvingSignature
 	result := c.resolveSignature(node, candidatesOutArray, checkMode)
@@ -19596,6 +19607,7 @@ func (c *Checker) pushTypeResolution(target TypeSystemEntity, propertyName TypeS
 	resolutionCycleStartIndex := c.findResolutionCycleStartIndex(target, propertyName)
 	if resolutionCycleStartIndex >= 0 {
 		// A cycle was found
+		c.resolutionCycleCount++
 		for i := resolutionCycleStartIndex; i < len(c.typeResolutions); i++ {
 			c.typeResolutions[i].result = false
 		}
@@ -32049,6 +32061,7 @@ func (c *Checker) getContextualTypeForArgumentAtIndex(callTarget *ast.Node, argI
 	// that could cause infinite recursion. Instead, return anySignature.
 	var signature *Signature
 	if links := c.signatureLinks.TryGet(callTarget); links != nil && links.resolvedSignature == c.resolvingSignature {
+		c.resolutionCycleCount++
 		signature = c.resolvingSignature
 	} else {
 		signature = c.getResolvedSignature(callTarget, nil, CheckModeNormal)
