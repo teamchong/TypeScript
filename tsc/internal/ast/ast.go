@@ -47,6 +47,9 @@ func visitNodes(v Visitor, nodes []*Node) bool {
 
 func visitNodeList(v Visitor, nodeList *NodeList) bool {
 	if nodeList != nil {
+		if cap(nodeList.Nodes) == lazySentinelCap {
+			return visitNodes(v, nodeList.forceLazy())
+		}
 		return visitNodes(v, nodeList.Nodes)
 	}
 	return false
@@ -141,15 +144,16 @@ func (list *NodeList) Pos() int { return list.Loc.Pos() }
 func (list *NodeList) End() int { return list.Loc.End() }
 
 func (list *NodeList) HasTrailingComma() bool {
-	if len(list.Nodes) == 0 {
+	nodes := list.Slice()
+	if len(nodes) == 0 {
 		return false
 	}
-	last := list.Nodes[len(list.Nodes)-1]
+	last := nodes[len(nodes)-1]
 	return last.End() < list.End()
 }
 
 func (list *NodeList) Clone(f NodeFactoryCoercible) *NodeList {
-	result := f.AsNodeFactory().NewNodeList(list.Nodes)
+	result := f.AsNodeFactory().NewNodeList(list.Slice())
 	result.Loc = list.Loc
 	return result
 }
@@ -555,6 +559,9 @@ func (n *Node) MemberList() *NodeList {
 func (n *Node) Members() []*Node {
 	list := n.MemberList()
 	if list != nil {
+		if cap(list.Nodes) == lazySentinelCap {
+			return list.forceLazy()
+		}
 		return list.Nodes
 	}
 	return nil
@@ -2446,7 +2453,7 @@ type SourceFile struct {
 	SymbolCount           int
 	PatternAmbientModules []*PatternAmbientModule
 	GlobalExports         SymbolTable
-
+	LazyLists             []*LazyNodeList
 	// Fields set by ECMALineMap
 
 	ecmaLineMapMu sync.RWMutex

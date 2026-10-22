@@ -29,6 +29,7 @@ type symbolData struct {
 	extra            *symbolExtra
 	declLen          uint16
 	declCap          uint16
+	lazyState        uint32
 }
 
 type symbolExtra struct {
@@ -105,6 +106,9 @@ func (s *Symbol) ValueDeclaration() *Node { return s.data.valueDeclaration }
 func (s *Symbol) Parent() *Symbol         { return s.data.parent }
 
 func (s *Symbol) Members() SymbolTable {
+	if s.data.lazyState != 0 {
+		return s.membersSlow()
+	}
 	if s.data.extra == nil {
 		return nil
 	}
@@ -112,6 +116,9 @@ func (s *Symbol) Members() SymbolTable {
 }
 
 func (s *Symbol) Exports() SymbolTable {
+	if s.data.lazyState != 0 {
+		return s.exportsSlow()
+	}
 	if s.data.extra == nil {
 		return nil
 	}

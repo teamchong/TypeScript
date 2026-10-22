@@ -96,7 +96,7 @@ func (v *NodeVisitor) VisitNodes(nodes *NodeList) *NodeList {
 		return nodes
 	}
 
-	if result, changed := v.VisitSlice(nodes.Nodes); changed {
+	if result, changed := v.VisitSlice(nodes.Slice()); changed {
 		list := v.Factory.NewNodeList(result)
 		list.Loc = nodes.Loc
 		return list

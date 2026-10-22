@@ -72,6 +72,7 @@ type Binder struct {
 	inAssignmentPattern     bool
 	seenParseError          bool
 	symbolCount             int
+	isLazy                  bool
 	notConstEnumOnlyModules collections.Set[*ast.Symbol]
 	symbolWithDataArena     core.Arena[ast.SymbolWithData]
 	symbolExtraArena        ast.SymbolExtraArena
@@ -98,6 +99,10 @@ func BindSourceFile(file *ast.SourceFile) {
 	if !file.IsBound() {
 		bindSourceFile(file)
 	}
+}
+
+func init() {
+	ast.SetLazyBindHook(bindLazyList)
 }
 
 var binderPool = sync.Pool{
@@ -133,6 +138,9 @@ func bindSourceFile(file *ast.SourceFile) {
 		b.bind(file.AsNode())
 		b.bindDeferredExpandoAssignments()
 		file.SymbolCount = b.symbolCount
+		for _, lazy := range file.LazyLists {
+			lazy.MarkUnbound(file)
+		}
 	})
 }
 
@@ -1743,6 +1751,9 @@ func (b *Binder) bindChildren(node *ast.Node) {
 	case ast.KindObjectLiteralExpression, ast.KindArrayLiteralExpression, ast.KindPropertyAssignment, ast.KindSpreadElement:
 		b.inAssignmentPattern = saveInAssignmentPattern
 		b.bindEachChild(node)
+	case ast.KindInterfaceDeclaration, ast.KindClassDeclaration, ast.KindClassExpression, ast.KindTypeLiteral:
+		b.bindEachChild(node)
+		b.bindLazyMemberList(node)
 	default:
 		b.bindEachChild(node)
 	}
@@ -1757,6 +1768,63 @@ func (b *Binder) bindEach(nodes []*ast.Node) {
 	for _, node := range nodes {
 		b.bind(node)
 	}
+}
+
+func (b *Binder) bindLazyMemberList(node *ast.Node) {
+	list := node.MemberList()
+	if !list.IsLazy() {
+		return
+	}
+	lazy := list.AsLazy()
+	if lazy.State() != ast.LazyListPending {
+		return
+	}
+	symbol := node.Symbol()
+	plain := symbol != nil &&
+		b.currentFlow != b.unreachableFlow &&
+		b.currentBreakTarget == nil &&
+		b.currentContinueTarget == nil &&
+		b.currentReturnTarget == nil &&
+		b.currentTrueTarget == nil &&
+		b.currentFalseTarget == nil &&
+		b.currentExceptionTarget == nil &&
+		b.preSwitchCaseFlow == nil &&
+		b.activeLabelList == nil &&
+		!b.inAssignmentPattern
+	if !plain {
+		nodes := lazy.ParseNow(b.file)
+		b.bindEach(nodes)
+		for _, nested := range lazy.NestedLazyLists() {
+			nested.MarkUnbound(b.file)
+		}
+		lazy.SetNestedLazyLists(nil)
+		return
+	}
+	lazy.Defer(b.file, &ast.LazyBindContext{
+		Container:           b.container,
+		ThisContainer:       b.thisContainer,
+		BlockScopeContainer: b.blockScopeContainer,
+		CurrentFlow:         b.currentFlow,
+		UnreachableFlow:     b.unreachableFlow,
+	})
+	symbol.SetHasLazyMembers()
+}
+
+func bindLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, nodes []*ast.Node) {
+	ctx := lazy.BindCtx
+	if ctx == nil {
+		return
+	}
+	b := getBinder()
+	defer putBinder(b)
+	b.file = file
+	b.isLazy = true
+	b.container = ctx.Container
+	b.thisContainer = ctx.ThisContainer
+	b.blockScopeContainer = ctx.BlockScopeContainer
+	b.currentFlow = ctx.CurrentFlow
+	b.unreachableFlow = ctx.UnreachableFlow
+	b.bindEach(nodes)
 }
 
 func (b *Binder) bindNodeList(nodeList *ast.NodeList) {
@@ -2749,7 +2817,9 @@ func (b *Binder) createDiagnosticForNode(node *ast.Node, message *diagnostics.Me
 }
 
 func (b *Binder) addDiagnostic(diagnostic *ast.Diagnostic) {
-	b.file.SetBindDiagnostics(append(b.file.BindDiagnostics(), diagnostic))
+	if !b.isLazy {
+		b.file.SetBindDiagnostics(append(b.file.BindDiagnostics(), diagnostic))
+	}
 }
 
 func isSignedNumericLiteral(node *ast.Node) bool {

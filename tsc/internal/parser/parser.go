@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
@@ -99,6 +100,8 @@ type Parser struct {
 	setParentFromContext ast.Visitor
 	reparsedClones       []*ast.Node
 	freeNodeLists        [][]*ast.Node
+	lazyDts              bool
+	lazyLists            []*ast.LazyNodeList
 }
 
 func newParser() *Parser {
@@ -121,6 +124,16 @@ var parserPool = sync.Pool{
 	New: func() any {
 		return newParser()
 	},
+}
+
+var lazyDtsEnabled atomic.Bool
+
+func EnableLazyDts(enabled bool) {
+	lazyDtsEnabled.Store(enabled)
+}
+
+func init() {
+	ast.SetLazyParseHook(reparseLazyList)
 }
 
 func getParser() *Parser {
@@ -456,6 +469,7 @@ func (p *Parser) parseSourceFileWorker() *ast.SourceFile {
 	isDeclarationFile := p.opts.FileName.IsDeclarationFile()
 	if isDeclarationFile {
 		p.contextFlags |= ast.NodeFlagsAmbient
+		p.lazyDts = lazyDtsEnabled.Load()
 	}
 	pos := p.nodePos()
 	statements := p.parseListIndex(PCSourceElements, (*Parser).parseToplevelStatement)
@@ -508,6 +522,10 @@ func (p *Parser) finishSourceFile(result *ast.SourceFile, isDeclarationFile bool
 	slices.SortFunc(p.reparsedClones, ast.CompareNodePositions)
 	result.ReparsedClones = slices.Clone(p.reparsedClones)
 	ast.SetExternalModuleIndicator(result, p.opts.ExternalModuleIndicatorOptions)
+	if len(p.lazyLists) > 0 {
+		result.LazyLists = slices.Clone(p.lazyLists)
+		p.lazyLists = nil
+	}
 }
 
 func (p *Parser) createJSDocCache() map[*ast.Node][]*ast.Node {
@@ -681,6 +699,272 @@ func (p *Parser) parseList(kind ParsingContext, parseElement func(p *Parser) *as
 	pos := p.nodePos()
 	nodes := p.parseListWorker(kind, parseElement, nil)
 	return p.newNodeList(core.NewTextRange(pos, p.nodePos()), nodes)
+}
+
+const lazyListMaxText = 65536
+
+func (p *Parser) parseMemberList(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
+	if p.lazyDts && p.contextFlags&ast.NodeFlagsJSDoc == 0 && p.token != ast.KindCloseBraceToken {
+		return p.parseMemberListLazily(kind, parseElement)
+	}
+	return p.parseList(kind, parseElement)
+}
+
+func (p *Parser) parseMemberListLazily(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
+	if !p.hasParseError &&
+		!p.scanner.HasPrecedingJSDocWithSeeOrLink() &&
+		!p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+		if lastTokenEnd, ok := scanBalancedBraces(p.sourceText, p.scanner.TokenStart(), kind == PCClassMembers); ok {
+			startPos := p.nodePos()
+			contextFlags := p.contextFlags
+			parsingContexts := p.parsingContexts
+			beforeCommentDirectives := len(p.scanner.CommentDirectives())
+			markState := p.mark()
+			p.scanner.ResetTokenState(lastTokenEnd)
+			p.nextToken()
+			if p.token == ast.KindCloseBraceToken &&
+				!p.hasParseError &&
+				len(p.scanner.CommentDirectives()) == beforeCommentDirectives &&
+				!p.scanner.HasPrecedingJSDocWithSeeOrLink() &&
+				!p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+				loc := core.NewTextRange(startPos, p.nodePos())
+				lazy := ast.NewLazyNodeList(loc, uint8(kind), contextFlags, uint32(parsingContexts))
+				p.lazyLists = append(p.lazyLists, lazy)
+				return &lazy.NodeList
+			}
+			p.rewind(markState)
+		}
+	}
+	return p.parseList(kind, parseElement)
+}
+
+func scanBalancedBraces(text string, startPos int, isClass bool) (int, bool) {
+	maxEnd := min(len(text), startPos+lazyListMaxText)
+	i := startPos
+	depth := 0
+	parenDepth := 0
+	bracketDepth := 0
+	lastTokenEnd := startPos
+	for i < maxEnd {
+		c := text[i]
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			i++
+		case '}':
+			if depth == 0 {
+				if parenDepth != 0 || bracketDepth != 0 || lastTokenEnd == startPos {
+					return 0, false
+				}
+				return lastTokenEnd, true
+			}
+			depth--
+			i++
+			lastTokenEnd = i
+		case '{':
+			if isClass && depth == 0 && parenDepth == 0 && bracketDepth == 0 {
+				return 0, false
+			}
+			depth++
+			i++
+			lastTokenEnd = i
+		case '(':
+			parenDepth++
+			i++
+			lastTokenEnd = i
+		case ')':
+			if parenDepth == 0 {
+				return 0, false
+			}
+			parenDepth--
+			i++
+			lastTokenEnd = i
+		case '[':
+			bracketDepth++
+			i++
+			lastTokenEnd = i
+		case ']':
+			if bracketDepth == 0 {
+				return 0, false
+			}
+			bracketDepth--
+			i++
+			lastTokenEnd = i
+		case '"', '\'':
+			quote := c
+			i++
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '\n' || ch == '\r' {
+					return 0, false
+				}
+				i++
+				if ch == quote {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != quote {
+				return 0, false
+			}
+			lastTokenEnd = i
+		case '`':
+			i++
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '$' && i+1 < maxEnd && text[i+1] == '{' {
+					return 0, false
+				}
+				i++
+				if ch == '`' {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != '`' {
+				return 0, false
+			}
+			lastTokenEnd = i
+		case '/':
+			if i+1 >= maxEnd {
+				return 0, false
+			}
+			next := text[i+1]
+			if next == '/' {
+				i += 2
+				for i < maxEnd && text[i] != '\n' {
+					if text[i] == '@' || text[i] == '/' {
+						return 0, false
+					}
+					i++
+				}
+			} else if next == '*' {
+				i += 2
+				closed := false
+				for i+1 < maxEnd {
+					if text[i] == '@' {
+						return 0, false
+					}
+					if text[i] == '*' && text[i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					return 0, false
+				}
+			} else {
+				return 0, false
+			}
+		case '@', '#':
+			return 0, false
+		case '=':
+			if i+1 < maxEnd && text[i+1] == '>' {
+				i += 2
+				lastTokenEnd = i
+				continue
+			}
+			if isClass && depth == 0 {
+				return 0, false
+			}
+			i++
+			lastTokenEnd = i
+		default:
+			if c >= 0x80 {
+				return 0, false
+			}
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' {
+				wordStart := i
+				i++
+				for i < maxEnd {
+					ch := text[i]
+					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+						i++
+					} else if ch >= 0x80 {
+						return 0, false
+					} else {
+						break
+					}
+				}
+				word := text[wordStart:i]
+				switch len(word) {
+				case 4:
+					if word == "this" || word == "void" {
+						return 0, false
+					}
+				case 5:
+					if word == "super" || word == "infer" || word == "async" || word == "await" || word == "yield" || word == "class" {
+						return 0, false
+					}
+				case 6:
+					if word == "import" || word == "delete" {
+						return 0, false
+					}
+				case 8:
+					if word == "function" {
+						return 0, false
+					}
+				case 9:
+					if word == "satisfies" {
+						return 0, false
+					}
+				}
+				lastTokenEnd = i
+			} else if c >= '0' && c <= '9' {
+				i++
+				for i < maxEnd {
+					ch := text[i]
+					if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == '.' {
+						i++
+					} else {
+						break
+					}
+				}
+				lastTokenEnd = i
+			} else {
+				i++
+				lastTokenEnd = i
+			}
+		}
+	}
+	return 0, false
+}
+
+func reparseLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, allowNestedLazy bool) []*ast.Node {
+	p := getParser()
+	defer putParser(p)
+	p.initializeState(file.ParseOptions(), file.Text(), file.ScriptKind)
+	p.lazyDts = allowNestedLazy && lazyDtsEnabled.Load()
+	p.scanner.ResetTokenState(lazy.Pos())
+	p.nextToken()
+	p.contextFlags = lazy.ContextFlags
+	p.parsingContexts = ParsingContexts(lazy.ParsingContexts)
+	var list *ast.NodeList
+	if ParsingContext(lazy.ParsingContext) == PCClassMembers {
+		list = p.parseList(PCClassMembers, (*Parser).parseClassElement)
+	} else {
+		list = p.parseList(PCTypeMembers, (*Parser).parseTypeMember)
+	}
+	owner := lazy.Owner
+	nodes := list.Nodes
+	for _, m := range nodes {
+		m.Parent = owner
+	}
+	if len(p.lazyLists) > 0 {
+		for _, nested := range p.lazyLists {
+			nested.File = file
+		}
+		lazy.SetNestedLazyLists(slices.Clone(p.lazyLists))
+		p.lazyLists = nil
+	}
+	return nodes
 }
 
 // Return a non-nil (but possibly empty) slice if parsing was successful, or nil if parseElement returned nil
@@ -1800,7 +2084,7 @@ func (p *Parser) parseClassDeclarationOrExpression(pos int, jsdoc jsdocScannerIn
 	if p.parseExpected(ast.KindOpenBraceToken) {
 		// ClassTail[Yield,Await] : (Modified) See 14.5
 		//      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
-		members = p.parseList(PCClassMembers, (*Parser).parseClassElement)
+		members = p.parseMemberList(PCClassMembers, (*Parser).parseClassElement)
 		p.parseExpected(ast.KindCloseBraceToken)
 	} else {
 		members = p.createMissingList()
@@ -1815,7 +2099,8 @@ func (p *Parser) parseClassDeclarationOrExpression(pos int, jsdoc jsdocScannerIn
 	} else {
 		result = p.factory.NewClassExpression(modifiers, name, typeParameters, heritageClauses, members)
 	}
-	p.finishNode(result, pos)
+	ast.SetLazyOwner(members, result)
+	result = p.finishNode(result, pos)
 	p.withJSDoc(result, jsdoc)
 	if result.Flags&ast.NodeFlagsJavaScriptFile != 0 {
 		p.checkJSSyntax(result)
@@ -2172,6 +2457,7 @@ func (p *Parser) parseInterfaceDeclaration(pos int, jsdoc jsdocScannerInfo, modi
 	heritageClauses := p.parseHeritageClauses(true /*isInterface*/)
 	members := p.parseObjectTypeMembers()
 	result := p.finishNode(p.factory.NewInterfaceDeclaration(modifiers, name, typeParameters, heritageClauses, members), pos)
+	ast.SetLazyOwner(members, result)
 	p.withJSDoc(result, jsdoc)
 	p.checkJSSyntax(result)
 	return result
@@ -3711,13 +3997,15 @@ func (p *Parser) parsePropertyOrMethodSignature(pos int, jsdoc jsdocScannerInfo,
 
 func (p *Parser) parseTypeLiteral() *ast.Node {
 	pos := p.nodePos()
-	result := p.finishNode(p.factory.NewTypeLiteralNode(p.parseObjectTypeMembers()), pos)
+	members := p.parseObjectTypeMembers()
+	result := p.finishNode(p.factory.NewTypeLiteralNode(members), pos)
+	ast.SetLazyOwner(members, result)
 	return result
 }
 
 func (p *Parser) parseObjectTypeMembers() *ast.NodeList {
 	if p.parseExpected(ast.KindOpenBraceToken) {
-		members := p.parseList(PCTypeMembers, (*Parser).parseTypeMember)
+		members := p.parseMemberList(PCTypeMembers, (*Parser).parseTypeMember)
 		p.parseExpected(ast.KindCloseBraceToken)
 		return members
 	}
