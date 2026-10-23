@@ -250,7 +250,7 @@ func (m *flowMemo) store(flow *ast.FlowNode, key CacheHashKey, t *Type, height u
 }
 
 func isFlowMemoCheckpoint(flow *ast.FlowNode) bool {
-	return ((uintptr(unsafe.Pointer(flow))>>4)*0x9E37_79B9_7F4A_7C15)&63 == 0
+	return (uint64(uintptr(unsafe.Pointer(flow)))*0x9E37_79B9_7F4A_7C15)>>62 == 0
 }
 
 func (c *Checker) flowMemoCreated() uint32 {
@@ -354,18 +354,18 @@ func (c *Checker) computeFlowMemoKey(f *FlowState) (CacheHashKey, bool) {
 			return CacheHashKey{}, false
 		}
 		if declared != 0 && initial < (1<<31) {
+			p := uint64(uintptr(unsafe.Pointer(sym)))
 			if f.flowContainer == nil {
 				return CacheHashKey{
 					Hi: uint64(declared) | (uint64(initial) << 32),
-					Lo: uint64(uintptr(unsafe.Pointer(sym))),
+					Lo: p,
 				}, true
 			}
-			if unsafe.Sizeof(uintptr(0)) == 4 {
-				return CacheHashKey{
-					Hi: uint64(declared) | (uint64(initial) << 32),
-					Lo: uint64(uint32(uintptr(unsafe.Pointer(sym)))) | (uint64(uint32(uintptr(unsafe.Pointer(f.flowContainer)))) << 32),
-				}, true
-			}
+			fc := uint64(uintptr(unsafe.Pointer(f.flowContainer))) * 0x9E37_79B9_7F4A_7C15
+			return CacheHashKey{
+				Hi: uint64(declared) | (uint64(initial) << 32),
+				Lo: p ^ bits.RotateLeft64(fc, 31),
+			}, true
 		}
 		var b [25]byte
 		b[0] = 'i'
@@ -386,12 +386,11 @@ func (c *Checker) computeFlowMemoKey(f *FlowState) (CacheHashKey, bool) {
 					Lo: 0,
 				}, true
 			}
-			if unsafe.Sizeof(uintptr(0)) == 4 {
-				return CacheHashKey{
-					Hi: uint64(declared) | (uint64(initial) << 32),
-					Lo: uint64(uint32(uintptr(unsafe.Pointer(f.flowContainer)))) << 32,
-				}, true
-			}
+			fc := uint64(uintptr(unsafe.Pointer(f.flowContainer))) * 0x9E37_79B9_7F4A_7C15
+			return CacheHashKey{
+				Hi: uint64(declared) | (uint64(initial) << 32),
+				Lo: bits.RotateLeft64(fc, 31),
+			}, true
 		}
 		var b [17]byte
 		b[0] = 't'
@@ -435,7 +434,7 @@ func (c *Checker) flowMemoRootSymbol(node *ast.Node) *ast.Symbol {
 		return nil
 	}
 	sym := links.resolvedSymbol
-	if sym == c.unknownSymbol || (node.Text() == "this" && ast.IsThisInTypeQuery(node)) {
+	if sym == c.unknownSymbol || (node.AsIdentifier().Text == "this" && ast.IsThisInTypeQuery(node)) {
 		return nil
 	}
 	return sym
@@ -488,7 +487,7 @@ func (c *Checker) flowMemoConsultOk(f *FlowState, hit flowMemoHit) bool {
 
 func (c *Checker) flowMemoAtNode(f *FlowState, entryFlow, flow *ast.FlowNode, flags ast.FlowFlags, key CacheHashKey, entryDepth int) (flowMemoHit, bool, bool) {
 	endsIteration := flags&(ast.FlowFlagsCondition|ast.FlowFlagsSwitchClause|ast.FlowFlagsArrayMutation|ast.FlowFlagsStart) != 0 ||
-		(flags&(ast.FlowFlagsBranchLabel|ast.FlowFlagsLoopLabel) != 0 && flow.Antecedents != nil && flow.Antecedents.Next != nil)
+		(flags&(ast.FlowFlagsBranchLabel|ast.FlowFlagsLoopLabel) != 0 && flow.Antecedents() != nil && flow.Antecedents().Next != nil)
 	if !endsIteration && flow != entryFlow {
 		if !isFlowMemoCheckpoint(flow) {
 			return flowMemoHit{}, false, false

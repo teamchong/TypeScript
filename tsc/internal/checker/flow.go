@@ -284,8 +284,8 @@ func (c *Checker) getTypeAtFlowNodeStep(f *FlowState, flow *ast.FlowNode, flags 
 		}
 		t = c.getTypeAtFlowBranchLabel(f, flow, antecedents)
 	case flags&ast.FlowFlagsLoopLabel != 0:
-		if flow.Antecedents.Next == nil {
-			return FlowType{}, flow.Antecedents.Flow, false
+		if flow.Antecedents().Next == nil {
+			return FlowType{}, flow.Antecedents().Flow, false
 		}
 		t = c.getTypeAtFlowLoopLabel(f, flow)
 	case flags&ast.FlowFlagsArrayMutation != 0:
@@ -323,7 +323,7 @@ func getBranchLabelAntecedents(flow *ast.FlowNode, reduceLabels []*ast.FlowReduc
 			return data.Antecedents
 		}
 	}
-	return flow.Antecedents
+	return flow.Antecedents()
 }
 
 func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) FlowType {
@@ -1488,7 +1488,7 @@ func (c *Checker) getTypeAtFlowLoopLabel(f *FlowState, flow *ast.FlowNode) FlowT
 	antecedentTypes := make([]*Type, 0, 4)
 	subtypeReduction := false
 	var firstAntecedentType FlowType
-	for list := flow.Antecedents; list != nil; list = list.Next {
+	for list := flow.Antecedents(); list != nil; list = list.Next {
 		var flowType FlowType
 		if firstAntecedentType.isNil() {
 			// The first antecedent of a loop junction is always the non-looping control
@@ -1760,11 +1760,12 @@ func (c *Checker) isMatchingReference(source *ast.Node, target *ast.Node) bool {
 	case ast.KindNonNullExpression, ast.KindParenthesizedExpression, ast.KindSatisfiesExpression:
 		return c.isMatchingReference(source.Expression(), target)
 	case ast.KindPropertyAccessExpression, ast.KindElementAccessExpression:
+		if !ast.IsAccessExpression(target) {
+			return false
+		}
 		if sourcePropertyName, ok := c.getAccessedPropertyName(source); ok {
-			if ast.IsAccessExpression(target) {
-				if targetPropertyName, ok := c.getAccessedPropertyName(target); ok {
-					return targetPropertyName == sourcePropertyName && c.isMatchingReference(source.Expression(), target.Expression())
-				}
+			if targetPropertyName, ok := c.getAccessedPropertyName(target); ok {
+				return targetPropertyName == sourcePropertyName && c.isMatchingReference(source.Expression(), target.Expression())
 			}
 		}
 		if ast.IsElementAccessExpression(source) && ast.IsElementAccessExpression(target) {
@@ -2668,10 +2669,26 @@ func (c *Checker) getFlowTypeInStaticBlocks(symbol *ast.Symbol, staticBlocks []*
 	return nil
 }
 
+type flowReachableSlot struct {
+	flow *ast.FlowNode
+	gen  uint32
+	val  bool
+}
+
 func (c *Checker) isReachableFlowNode(flow *ast.FlowNode) bool {
+	if flow == c.lastFlowNode {
+		return c.lastFlowNodeReachable
+	}
+	slot := &c.flowReachableSlots[(uintptr(unsafe.Pointer(flow))>>3)&2047]
+	if slot.flow == flow && slot.gen == c.flowReachableGen {
+		c.lastFlowNode = flow
+		c.lastFlowNodeReachable = slot.val
+		return slot.val
+	}
 	f := c.getFlowState()
 	result := c.isReachableFlowNodeWorker(f, flow, false /*noCacheCheck*/)
 	c.putFlowState(f)
+	*slot = flowReachableSlot{flow: flow, gen: c.flowReachableGen, val: result}
 	c.lastFlowNode = flow
 	c.lastFlowNodeReachable = result
 	return result
@@ -2683,18 +2700,18 @@ func (c *Checker) isReachableFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 			return c.lastFlowNodeReachable
 		}
 		flags := flow.Flags
-		if flags&ast.FlowFlagsShared != 0 {
-			if !noCacheCheck && len(f.reduceLabels) == 0 {
-				key := uintptr(unsafe.Pointer(flow))
-				if reachable, ok := c.flowNodeReachable[key]; ok {
-					return reachable
-				}
+		if !noCacheCheck && len(f.reduceLabels) == 0 {
+			slot := &c.flowReachableSlots[(uintptr(unsafe.Pointer(flow))>>3)&2047]
+			if slot.flow == flow && slot.gen == c.flowReachableGen {
+				return slot.val
+			}
+			if flags&ast.FlowFlagsShared != 0 {
 				reachable := c.isReachableFlowNodeWorker(f, flow, true /*noCacheCheck*/)
-				c.flowNodeReachable[key] = reachable
+				*slot = flowReachableSlot{flow: flow, gen: c.flowReachableGen, val: reachable}
 				return reachable
 			}
-			noCacheCheck = false
 		}
+		noCacheCheck = false
 		switch {
 		case flags&(ast.FlowFlagsAssignment|ast.FlowFlagsCondition|ast.FlowFlagsArrayMutation) != 0:
 			flow = flow.Antecedent
@@ -2719,11 +2736,11 @@ func (c *Checker) isReachableFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 			}
 			return false
 		case flags&ast.FlowFlagsLoopLabel != 0:
-			if flow.Antecedents == nil {
+			if flow.Antecedents() == nil {
 				return false
 			}
 			// A loop is reachable if the control flow path that leads to the top is reachable.
-			flow = flow.Antecedents.Flow
+			flow = flow.Antecedents().Flow
 		case flags&ast.FlowFlagsSwitchClause != 0:
 			// The control flow path representing an unmatched value in a switch statement with
 			// no default clause is unreachable if the switch statement is exhaustive.
@@ -2772,12 +2789,13 @@ func (c *Checker) isPostSuperFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 		flags := flow.Flags
 		if flags&ast.FlowFlagsShared != 0 {
 			if !noCacheCheck {
-				key := uintptr(unsafe.Pointer(flow))
-				if postSuper, ok := c.flowNodePostSuper[key]; ok {
-					return postSuper
+				gen := c.flowReachableGen + 1
+				slot := &c.flowReachableSlots[(uintptr(unsafe.Pointer(flow))>>3)&2047]
+				if slot.flow == flow && slot.gen == gen {
+					return slot.val
 				}
 				postSuper := c.isPostSuperFlowNodeWorker(f, flow, true /*noCacheCheck*/)
-				c.flowNodePostSuper[key] = postSuper
+				*slot = flowReachableSlot{flow: flow, gen: gen, val: postSuper}
 				return postSuper
 			}
 			noCacheCheck = false
@@ -2799,7 +2817,7 @@ func (c *Checker) isPostSuperFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 			return true
 		case flags&ast.FlowFlagsLoopLabel != 0:
 			// A loop is post-super if the control flow path that leads to the top is post-super.
-			flow = flow.Antecedents.Flow
+			flow = flow.Antecedents().Flow
 		case flags&ast.FlowFlagsReduceLabel != 0:
 			f.reduceLabels = append(f.reduceLabels, flow.Node.AsFlowReduceLabelData())
 			result := c.isPostSuperFlowNodeWorker(f, flow.Antecedent, false /*noCacheCheck*/)

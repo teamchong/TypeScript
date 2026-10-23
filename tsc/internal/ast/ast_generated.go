@@ -11059,628 +11059,284 @@ func (n *Node) propagateSubtreeFacts() SubtreeFacts {
 // ──────────────────────────────────────────────────────────────────────
 
 var nodeFlowNodeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindIdentifier:                 1,
-	KindQualifiedName:              2,
-	KindEmptyStatement:             3,
-	KindIfStatement:                4,
-	KindDoStatement:                5,
-	KindWhileStatement:             6,
-	KindForStatement:               7,
-	KindForInStatement:             8,
-	KindForOfStatement:             8,
-	KindBreakStatement:             9,
-	KindContinueStatement:          10,
-	KindReturnStatement:            11,
-	KindWithStatement:              12,
-	KindSwitchStatement:            13,
-	KindThrowStatement:             14,
-	KindTryStatement:               15,
-	KindDebuggerStatement:          16,
-	KindLabeledStatement:           17,
-	KindExpressionStatement:        18,
-	KindBlock:                      19,
-	KindVariableStatement:          20,
-	KindBindingElement:             21,
-	KindMissingDeclaration:         22,
-	KindFunctionDeclaration:        23,
-	KindClassDeclaration:           24,
-	KindInterfaceDeclaration:       25,
-	KindTypeAliasDeclaration:       26,
-	KindJSTypeAliasDeclaration:     26,
-	KindEnumDeclaration:            27,
-	KindModuleBlock:                28,
-	KindNotEmittedStatement:        29,
-	KindImportDeclaration:          30,
-	KindJSImportDeclaration:        30,
-	KindExportAssignment:           31,
-	KindNamespaceExportDeclaration: 32,
-	KindGetAccessor:                33,
-	KindSetAccessor:                34,
-	KindMethodDeclaration:          35,
-	KindNullKeyword:                36,
-	KindTrueKeyword:                36,
-	KindFalseKeyword:               36,
-	KindThisKeyword:                36,
-	KindSuperKeyword:               36,
-	KindImportKeyword:              36,
-	KindArrowFunction:              37,
-	KindFunctionExpression:         38,
-	KindPropertyAccessExpression:   39,
-	KindElementAccessExpression:    40,
-	KindMetaProperty:               41,
-	KindModuleDeclaration:          42,
-	KindImportEqualsDeclaration:    43,
-	KindExportDeclaration:          44,
+	KindIdentifier:                 uint8(unsafe.Offsetof(Identifier{}.FlowNodeBase)),
+	KindQualifiedName:              uint8(unsafe.Offsetof(QualifiedName{}.FlowNodeBase)),
+	KindEmptyStatement:             uint8(unsafe.Offsetof(EmptyStatement{}.FlowNodeBase)),
+	KindIfStatement:                uint8(unsafe.Offsetof(IfStatement{}.FlowNodeBase)),
+	KindDoStatement:                uint8(unsafe.Offsetof(DoStatement{}.FlowNodeBase)),
+	KindWhileStatement:             uint8(unsafe.Offsetof(WhileStatement{}.FlowNodeBase)),
+	KindForStatement:               uint8(unsafe.Offsetof(ForStatement{}.FlowNodeBase)),
+	KindForInStatement:             uint8(unsafe.Offsetof(ForInOrOfStatement{}.FlowNodeBase)),
+	KindForOfStatement:             uint8(unsafe.Offsetof(ForInOrOfStatement{}.FlowNodeBase)),
+	KindBreakStatement:             uint8(unsafe.Offsetof(BreakStatement{}.FlowNodeBase)),
+	KindContinueStatement:          uint8(unsafe.Offsetof(ContinueStatement{}.FlowNodeBase)),
+	KindReturnStatement:            uint8(unsafe.Offsetof(ReturnStatement{}.FlowNodeBase)),
+	KindWithStatement:              uint8(unsafe.Offsetof(WithStatement{}.FlowNodeBase)),
+	KindSwitchStatement:            uint8(unsafe.Offsetof(SwitchStatement{}.FlowNodeBase)),
+	KindThrowStatement:             uint8(unsafe.Offsetof(ThrowStatement{}.FlowNodeBase)),
+	KindTryStatement:               uint8(unsafe.Offsetof(TryStatement{}.FlowNodeBase)),
+	KindDebuggerStatement:          uint8(unsafe.Offsetof(DebuggerStatement{}.FlowNodeBase)),
+	KindLabeledStatement:           uint8(unsafe.Offsetof(LabeledStatement{}.FlowNodeBase)),
+	KindExpressionStatement:        uint8(unsafe.Offsetof(ExpressionStatement{}.FlowNodeBase)),
+	KindBlock:                      uint8(unsafe.Offsetof(Block{}.FlowNodeBase)),
+	KindVariableStatement:          uint8(unsafe.Offsetof(VariableStatement{}.FlowNodeBase)),
+	KindBindingElement:             uint8(unsafe.Offsetof(BindingElement{}.FlowNodeBase)),
+	KindMissingDeclaration:         uint8(unsafe.Offsetof(MissingDeclaration{}.FlowNodeBase)),
+	KindFunctionDeclaration:        uint8(unsafe.Offsetof(FunctionDeclaration{}.FlowNodeBase)),
+	KindClassDeclaration:           uint8(unsafe.Offsetof(ClassDeclaration{}.FlowNodeBase)),
+	KindInterfaceDeclaration:       uint8(unsafe.Offsetof(InterfaceDeclaration{}.FlowNodeBase)),
+	KindTypeAliasDeclaration:       uint8(unsafe.Offsetof(TypeAliasDeclaration{}.FlowNodeBase)),
+	KindJSTypeAliasDeclaration:     uint8(unsafe.Offsetof(TypeAliasDeclaration{}.FlowNodeBase)),
+	KindEnumDeclaration:            uint8(unsafe.Offsetof(EnumDeclaration{}.FlowNodeBase)),
+	KindModuleBlock:                uint8(unsafe.Offsetof(ModuleBlock{}.FlowNodeBase)),
+	KindNotEmittedStatement:        uint8(unsafe.Offsetof(NotEmittedStatement{}.FlowNodeBase)),
+	KindImportDeclaration:          uint8(unsafe.Offsetof(ImportDeclaration{}.FlowNodeBase)),
+	KindJSImportDeclaration:        uint8(unsafe.Offsetof(ImportDeclaration{}.FlowNodeBase)),
+	KindExportAssignment:           uint8(unsafe.Offsetof(ExportAssignment{}.FlowNodeBase)),
+	KindNamespaceExportDeclaration: uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.FlowNodeBase)),
+	KindGetAccessor:                uint8(unsafe.Offsetof(GetAccessorDeclaration{}.FlowNodeBase)),
+	KindSetAccessor:                uint8(unsafe.Offsetof(SetAccessorDeclaration{}.FlowNodeBase)),
+	KindMethodDeclaration:          uint8(unsafe.Offsetof(MethodDeclaration{}.FlowNodeBase)),
+	KindNullKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindTrueKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindFalseKeyword:               uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindThisKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindSuperKeyword:               uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindImportKeyword:              uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindArrowFunction:              uint8(unsafe.Offsetof(ArrowFunction{}.FlowNodeBase)),
+	KindFunctionExpression:         uint8(unsafe.Offsetof(FunctionExpression{}.FlowNodeBase)),
+	KindPropertyAccessExpression:   uint8(unsafe.Offsetof(PropertyAccessExpression{}.FlowNodeBase)),
+	KindElementAccessExpression:    uint8(unsafe.Offsetof(ElementAccessExpression{}.FlowNodeBase)),
+	KindMetaProperty:               uint8(unsafe.Offsetof(MetaProperty{}.FlowNodeBase)),
+	KindModuleDeclaration:          uint8(unsafe.Offsetof(ModuleDeclaration{}.FlowNodeBase)),
+	KindImportEqualsDeclaration:    uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.FlowNodeBase)),
+	KindExportDeclaration:          uint8(unsafe.Offsetof(ExportDeclaration{}.FlowNodeBase)),
 }
 
 func (n *Node) FlowNodeData() *FlowNodeBase {
-	switch nodeFlowNodeDataDispatch[n.Kind] {
-	case 1:
-		return (*Identifier)(unsafe.Pointer(n)).FlowNodeData()
-	case 2:
-		return (*QualifiedName)(unsafe.Pointer(n)).FlowNodeData()
-	case 3:
-		return (*EmptyStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 4:
-		return (*IfStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 5:
-		return (*DoStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 6:
-		return (*WhileStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 7:
-		return (*ForStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 8:
-		return (*ForInOrOfStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 9:
-		return (*BreakStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 10:
-		return (*ContinueStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 11:
-		return (*ReturnStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 12:
-		return (*WithStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 13:
-		return (*SwitchStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 14:
-		return (*ThrowStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 15:
-		return (*TryStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 16:
-		return (*DebuggerStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 17:
-		return (*LabeledStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 18:
-		return (*ExpressionStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 19:
-		return (*Block)(unsafe.Pointer(n)).FlowNodeData()
-	case 20:
-		return (*VariableStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 21:
-		return (*BindingElement)(unsafe.Pointer(n)).FlowNodeData()
-	case 22:
-		return (*MissingDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 23:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 24:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 25:
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 26:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 27:
-		return (*EnumDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 28:
-		return (*ModuleBlock)(unsafe.Pointer(n)).FlowNodeData()
-	case 29:
-		return (*NotEmittedStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 30:
-		return (*ImportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 31:
-		return (*ExportAssignment)(unsafe.Pointer(n)).FlowNodeData()
-	case 32:
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 33:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 34:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 35:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 36:
-		return (*KeywordExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 37:
-		return (*ArrowFunction)(unsafe.Pointer(n)).FlowNodeData()
-	case 38:
-		return (*FunctionExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 39:
-		return (*PropertyAccessExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 40:
-		return (*ElementAccessExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 41:
-		return (*MetaProperty)(unsafe.Pointer(n)).FlowNodeData()
-	case 42:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 43:
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 44:
-		return (*ExportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	default:
-		return nil
+	if offset := nodeFlowNodeDataDispatch[n.Kind]; offset != 0 {
+		return (*FlowNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeDeclarationDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:           1,
-	KindParameter:                     2,
-	KindBindingElement:                3,
-	KindMissingDeclaration:            4,
-	KindFunctionDeclaration:           5,
-	KindClassDeclaration:              6,
-	KindClassExpression:               7,
-	KindInterfaceDeclaration:          8,
-	KindTypeAliasDeclaration:          9,
-	KindJSTypeAliasDeclaration:        9,
-	KindEnumMember:                    10,
-	KindEnumDeclaration:               11,
-	KindNotEmittedTypeElement:         12,
-	KindImportDeclaration:             13,
-	KindJSImportDeclaration:           13,
-	KindNamespaceImport:               14,
-	KindExportAssignment:              15,
-	KindNamespaceExportDeclaration:    16,
-	KindNamespaceExport:               17,
-	KindExportSpecifier:               18,
-	KindCallSignature:                 19,
-	KindConstructSignature:            20,
-	KindConstructor:                   21,
-	KindGetAccessor:                   22,
-	KindSetAccessor:                   23,
-	KindIndexSignature:                24,
-	KindMethodSignature:               25,
-	KindMethodDeclaration:             26,
-	KindPropertySignature:             27,
-	KindPropertyDeclaration:           28,
-	KindSemicolonClassElement:         29,
-	KindClassStaticBlockDeclaration:   30,
-	KindNoSubstitutionTemplateLiteral: 31,
-	KindBinaryExpression:              32,
-	KindArrowFunction:                 33,
-	KindFunctionExpression:            34,
-	KindCallExpression:                35,
-	KindObjectLiteralExpression:       36,
-	KindSpreadAssignment:              37,
-	KindPropertyAssignment:            38,
-	KindShorthandPropertyAssignment:   39,
-	KindMappedType:                    40,
-	KindTypeLiteral:                   41,
-	KindNamedTupleMember:              42,
-	KindFunctionType:                  43,
-	KindConstructorType:               44,
-	KindJsxAttributes:                 45,
-	KindJsxAttribute:                  46,
-	KindJsxSpreadAttribute:            47,
-	KindJSDocSignature:                48,
-	KindSourceFile:                    49,
-	KindModuleDeclaration:             50,
-	KindImportEqualsDeclaration:       51,
-	KindExportDeclaration:             52,
-	KindImportClause:                  53,
-	KindImportSpecifier:               54,
-	KindTypeParameter:                 55,
-	KindJSDocTypeLiteral:              56,
+	KindVariableDeclaration:           uint8(unsafe.Offsetof(VariableDeclaration{}.DeclarationBase)),
+	KindParameter:                     uint8(unsafe.Offsetof(ParameterDeclaration{}.DeclarationBase)),
+	KindBindingElement:                uint8(unsafe.Offsetof(BindingElement{}.DeclarationBase)),
+	KindMissingDeclaration:            uint8(unsafe.Offsetof(MissingDeclaration{}.DeclarationBase)),
+	KindFunctionDeclaration:           uint8(unsafe.Offsetof(FunctionDeclaration{}.DeclarationBase)),
+	KindClassDeclaration:              uint8(unsafe.Offsetof(ClassDeclaration{}.DeclarationBase)),
+	KindClassExpression:               uint8(unsafe.Offsetof(ClassExpression{}.DeclarationBase)),
+	KindInterfaceDeclaration:          uint8(unsafe.Offsetof(InterfaceDeclaration{}.DeclarationBase)),
+	KindTypeAliasDeclaration:          uint8(unsafe.Offsetof(TypeAliasDeclaration{}.DeclarationBase)),
+	KindJSTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.DeclarationBase)),
+	KindEnumMember:                    uint8(unsafe.Offsetof(EnumMember{}.DeclarationBase)),
+	KindEnumDeclaration:               uint8(unsafe.Offsetof(EnumDeclaration{}.DeclarationBase)),
+	KindNotEmittedTypeElement:         uint8(unsafe.Offsetof(NotEmittedTypeElement{}.DeclarationBase)),
+	KindImportDeclaration:             uint8(unsafe.Offsetof(ImportDeclaration{}.DeclarationBase)),
+	KindJSImportDeclaration:           uint8(unsafe.Offsetof(ImportDeclaration{}.DeclarationBase)),
+	KindNamespaceImport:               uint8(unsafe.Offsetof(NamespaceImport{}.DeclarationBase)),
+	KindExportAssignment:              uint8(unsafe.Offsetof(ExportAssignment{}.DeclarationBase)),
+	KindNamespaceExportDeclaration:    uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.DeclarationBase)),
+	KindNamespaceExport:               uint8(unsafe.Offsetof(NamespaceExport{}.DeclarationBase)),
+	KindExportSpecifier:               uint8(unsafe.Offsetof(ExportSpecifier{}.DeclarationBase)),
+	KindCallSignature:                 uint8(unsafe.Offsetof(CallSignatureDeclaration{}.DeclarationBase)),
+	KindConstructSignature:            uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.DeclarationBase)),
+	KindConstructor:                   uint8(unsafe.Offsetof(ConstructorDeclaration{}.DeclarationBase)),
+	KindGetAccessor:                   uint8(unsafe.Offsetof(GetAccessorDeclaration{}.DeclarationBase)),
+	KindSetAccessor:                   uint8(unsafe.Offsetof(SetAccessorDeclaration{}.DeclarationBase)),
+	KindIndexSignature:                uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.DeclarationBase)),
+	KindMethodSignature:               uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.DeclarationBase)),
+	KindMethodDeclaration:             uint8(unsafe.Offsetof(MethodDeclaration{}.DeclarationBase)),
+	KindPropertySignature:             uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.DeclarationBase)),
+	KindPropertyDeclaration:           uint8(unsafe.Offsetof(PropertyDeclaration{}.DeclarationBase)),
+	KindSemicolonClassElement:         uint8(unsafe.Offsetof(SemicolonClassElement{}.DeclarationBase)),
+	KindClassStaticBlockDeclaration:   uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.DeclarationBase)),
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.DeclarationBase)),
+	KindBinaryExpression:              uint8(unsafe.Offsetof(BinaryExpression{}.DeclarationBase)),
+	KindArrowFunction:                 uint8(unsafe.Offsetof(ArrowFunction{}.DeclarationBase)),
+	KindFunctionExpression:            uint8(unsafe.Offsetof(FunctionExpression{}.DeclarationBase)),
+	KindCallExpression:                uint8(unsafe.Offsetof(CallExpression{}.DeclarationBase)),
+	KindObjectLiteralExpression:       uint8(unsafe.Offsetof(ObjectLiteralExpression{}.DeclarationBase)),
+	KindSpreadAssignment:              uint8(unsafe.Offsetof(SpreadAssignment{}.DeclarationBase)),
+	KindPropertyAssignment:            uint8(unsafe.Offsetof(PropertyAssignment{}.DeclarationBase)),
+	KindShorthandPropertyAssignment:   uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.DeclarationBase)),
+	KindMappedType:                    uint8(unsafe.Offsetof(MappedTypeNode{}.DeclarationBase)),
+	KindTypeLiteral:                   uint8(unsafe.Offsetof(TypeLiteralNode{}.DeclarationBase)),
+	KindNamedTupleMember:              uint8(unsafe.Offsetof(NamedTupleMember{}.DeclarationBase)),
+	KindFunctionType:                  uint8(unsafe.Offsetof(FunctionTypeNode{}.DeclarationBase)),
+	KindConstructorType:               uint8(unsafe.Offsetof(ConstructorTypeNode{}.DeclarationBase)),
+	KindJsxAttributes:                 uint8(unsafe.Offsetof(JsxAttributes{}.DeclarationBase)),
+	KindJsxAttribute:                  uint8(unsafe.Offsetof(JsxAttribute{}.DeclarationBase)),
+	KindJsxSpreadAttribute:            uint8(unsafe.Offsetof(JsxSpreadAttribute{}.DeclarationBase)),
+	KindJSDocSignature:                uint8(unsafe.Offsetof(JSDocSignature{}.DeclarationBase)),
+	KindSourceFile:                    uint8(unsafe.Offsetof(SourceFile{}.DeclarationBase)),
+	KindModuleDeclaration:             uint8(unsafe.Offsetof(ModuleDeclaration{}.DeclarationBase)),
+	KindImportEqualsDeclaration:       uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.DeclarationBase)),
+	KindExportDeclaration:             uint8(unsafe.Offsetof(ExportDeclaration{}.DeclarationBase)),
+	KindImportClause:                  uint8(unsafe.Offsetof(ImportClause{}.DeclarationBase)),
+	KindImportSpecifier:               uint8(unsafe.Offsetof(ImportSpecifier{}.DeclarationBase)),
+	KindTypeParameter:                 uint8(unsafe.Offsetof(TypeParameterDeclaration{}.DeclarationBase)),
+	KindJSDocTypeLiteral:              uint8(unsafe.Offsetof(JSDocTypeLiteral{}.DeclarationBase)),
 }
 
 func (n *Node) DeclarationData() *DeclarationBase {
-	switch nodeDeclarationDataDispatch[n.Kind] {
-	case 1:
-		return (*VariableDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 2:
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 3:
-		return (*BindingElement)(unsafe.Pointer(n)).DeclarationData()
-	case 4:
-		return (*MissingDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 5:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 6:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 7:
-		return (*ClassExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 8:
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 9:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 10:
-		return (*EnumMember)(unsafe.Pointer(n)).DeclarationData()
-	case 11:
-		return (*EnumDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 12:
-		return (*NotEmittedTypeElement)(unsafe.Pointer(n)).DeclarationData()
-	case 13:
-		return (*ImportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 14:
-		return (*NamespaceImport)(unsafe.Pointer(n)).DeclarationData()
-	case 15:
-		return (*ExportAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 16:
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 17:
-		return (*NamespaceExport)(unsafe.Pointer(n)).DeclarationData()
-	case 18:
-		return (*ExportSpecifier)(unsafe.Pointer(n)).DeclarationData()
-	case 19:
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 20:
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 21:
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 22:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 23:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 24:
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 25:
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 26:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 27:
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 28:
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 29:
-		return (*SemicolonClassElement)(unsafe.Pointer(n)).DeclarationData()
-	case 30:
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 31:
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).DeclarationData()
-	case 32:
-		return (*BinaryExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 33:
-		return (*ArrowFunction)(unsafe.Pointer(n)).DeclarationData()
-	case 34:
-		return (*FunctionExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 35:
-		return (*CallExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 36:
-		return (*ObjectLiteralExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 37:
-		return (*SpreadAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 38:
-		return (*PropertyAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 39:
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 40:
-		return (*MappedTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 41:
-		return (*TypeLiteralNode)(unsafe.Pointer(n)).DeclarationData()
-	case 42:
-		return (*NamedTupleMember)(unsafe.Pointer(n)).DeclarationData()
-	case 43:
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 44:
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 45:
-		return (*JsxAttributes)(unsafe.Pointer(n)).DeclarationData()
-	case 46:
-		return (*JsxAttribute)(unsafe.Pointer(n)).DeclarationData()
-	case 47:
-		return (*JsxSpreadAttribute)(unsafe.Pointer(n)).DeclarationData()
-	case 48:
-		return (*JSDocSignature)(unsafe.Pointer(n)).DeclarationData()
-	case 49:
-		return (*SourceFile)(unsafe.Pointer(n)).DeclarationData()
-	case 50:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 51:
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 52:
-		return (*ExportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 53:
-		return (*ImportClause)(unsafe.Pointer(n)).DeclarationData()
-	case 54:
-		return (*ImportSpecifier)(unsafe.Pointer(n)).DeclarationData()
-	case 55:
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 56:
-		return (*JSDocTypeLiteral)(unsafe.Pointer(n)).DeclarationData()
-	default:
-		return nil
+	if offset := nodeDeclarationDataDispatch[n.Kind]; offset != 0 {
+		return (*DeclarationBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeExportableDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:     1,
-	KindBindingElement:          2,
-	KindFunctionDeclaration:     3,
-	KindClassDeclaration:        4,
-	KindClassExpression:         5,
-	KindInterfaceDeclaration:    6,
-	KindTypeAliasDeclaration:    7,
-	KindJSTypeAliasDeclaration:  7,
-	KindEnumDeclaration:         8,
-	KindNamespaceImport:         9,
-	KindExportSpecifier:         10,
-	KindModuleDeclaration:       11,
-	KindImportEqualsDeclaration: 12,
-	KindImportClause:            13,
-	KindImportSpecifier:         14,
+	KindVariableDeclaration:     uint8(unsafe.Offsetof(VariableDeclaration{}.ExportableBase)),
+	KindBindingElement:          uint8(unsafe.Offsetof(BindingElement{}.ExportableBase)),
+	KindFunctionDeclaration:     uint8(unsafe.Offsetof(FunctionDeclaration{}.ExportableBase)),
+	KindClassDeclaration:        uint8(unsafe.Offsetof(ClassDeclaration{}.ExportableBase)),
+	KindClassExpression:         uint8(unsafe.Offsetof(ClassExpression{}.ExportableBase)),
+	KindInterfaceDeclaration:    uint8(unsafe.Offsetof(InterfaceDeclaration{}.ExportableBase)),
+	KindTypeAliasDeclaration:    uint8(unsafe.Offsetof(TypeAliasDeclaration{}.ExportableBase)),
+	KindJSTypeAliasDeclaration:  uint8(unsafe.Offsetof(TypeAliasDeclaration{}.ExportableBase)),
+	KindEnumDeclaration:         uint8(unsafe.Offsetof(EnumDeclaration{}.ExportableBase)),
+	KindNamespaceImport:         uint8(unsafe.Offsetof(NamespaceImport{}.ExportableBase)),
+	KindExportSpecifier:         uint8(unsafe.Offsetof(ExportSpecifier{}.ExportableBase)),
+	KindModuleDeclaration:       uint8(unsafe.Offsetof(ModuleDeclaration{}.ExportableBase)),
+	KindImportEqualsDeclaration: uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.ExportableBase)),
+	KindImportClause:            uint8(unsafe.Offsetof(ImportClause{}.ExportableBase)),
+	KindImportSpecifier:         uint8(unsafe.Offsetof(ImportSpecifier{}.ExportableBase)),
 }
 
 func (n *Node) ExportableData() *ExportableBase {
-	switch nodeExportableDataDispatch[n.Kind] {
-	case 1:
-		return (*VariableDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 2:
-		return (*BindingElement)(unsafe.Pointer(n)).ExportableData()
-	case 3:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 4:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 5:
-		return (*ClassExpression)(unsafe.Pointer(n)).ExportableData()
-	case 6:
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 7:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 8:
-		return (*EnumDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 9:
-		return (*NamespaceImport)(unsafe.Pointer(n)).ExportableData()
-	case 10:
-		return (*ExportSpecifier)(unsafe.Pointer(n)).ExportableData()
-	case 11:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 12:
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 13:
-		return (*ImportClause)(unsafe.Pointer(n)).ExportableData()
-	case 14:
-		return (*ImportSpecifier)(unsafe.Pointer(n)).ExportableData()
-	default:
-		return nil
+	if offset := nodeExportableDataDispatch[n.Kind]; offset != 0 {
+		return (*ExportableBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeLocalsContainerDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindForStatement:                1,
-	KindForInStatement:              2,
-	KindForOfStatement:              2,
-	KindCaseBlock:                   3,
-	KindCatchClause:                 4,
-	KindBlock:                       5,
-	KindFunctionDeclaration:         6,
-	KindClassDeclaration:            7,
-	KindClassExpression:             8,
-	KindTypeAliasDeclaration:        9,
-	KindJSTypeAliasDeclaration:      9,
-	KindCallSignature:               10,
-	KindConstructSignature:          11,
-	KindConstructor:                 12,
-	KindGetAccessor:                 13,
-	KindSetAccessor:                 14,
-	KindIndexSignature:              15,
-	KindMethodSignature:             16,
-	KindMethodDeclaration:           17,
-	KindClassStaticBlockDeclaration: 18,
-	KindArrowFunction:               19,
-	KindFunctionExpression:          20,
-	KindConditionalType:             21,
-	KindMappedType:                  22,
-	KindFunctionType:                23,
-	KindConstructorType:             24,
-	KindJSDocSignature:              25,
-	KindSourceFile:                  26,
-	KindModuleDeclaration:           27,
+	KindForStatement:                uint8(unsafe.Offsetof(ForStatement{}.LocalsContainerBase)),
+	KindForInStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.LocalsContainerBase)),
+	KindForOfStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.LocalsContainerBase)),
+	KindCaseBlock:                   uint8(unsafe.Offsetof(CaseBlock{}.LocalsContainerBase)),
+	KindCatchClause:                 uint8(unsafe.Offsetof(CatchClause{}.LocalsContainerBase)),
+	KindBlock:                       uint8(unsafe.Offsetof(Block{}.LocalsContainerBase)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.LocalsContainerBase)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.LocalsContainerBase)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.LocalsContainerBase)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.LocalsContainerBase)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.LocalsContainerBase)),
+	KindCallSignature:               uint8(unsafe.Offsetof(CallSignatureDeclaration{}.LocalsContainerBase)),
+	KindConstructSignature:          uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.LocalsContainerBase)),
+	KindConstructor:                 uint8(unsafe.Offsetof(ConstructorDeclaration{}.LocalsContainerBase)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.LocalsContainerBase)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.LocalsContainerBase)),
+	KindIndexSignature:              uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.LocalsContainerBase)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.LocalsContainerBase)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.LocalsContainerBase)),
+	KindClassStaticBlockDeclaration: uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.LocalsContainerBase)),
+	KindArrowFunction:               uint8(unsafe.Offsetof(ArrowFunction{}.LocalsContainerBase)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.LocalsContainerBase)),
+	KindConditionalType:             uint8(unsafe.Offsetof(ConditionalTypeNode{}.LocalsContainerBase)),
+	KindMappedType:                  uint8(unsafe.Offsetof(MappedTypeNode{}.LocalsContainerBase)),
+	KindFunctionType:                uint8(unsafe.Offsetof(FunctionTypeNode{}.LocalsContainerBase)),
+	KindConstructorType:             uint8(unsafe.Offsetof(ConstructorTypeNode{}.LocalsContainerBase)),
+	KindJSDocSignature:              uint8(unsafe.Offsetof(JSDocSignature{}.LocalsContainerBase)),
+	KindSourceFile:                  uint8(unsafe.Offsetof(SourceFile{}.LocalsContainerBase)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.LocalsContainerBase)),
 }
 
 func (n *Node) LocalsContainerData() *LocalsContainerBase {
-	switch nodeLocalsContainerDataDispatch[n.Kind] {
-	case 1:
-		return (*ForStatement)(unsafe.Pointer(n)).LocalsContainerData()
-	case 2:
-		return (*ForInOrOfStatement)(unsafe.Pointer(n)).LocalsContainerData()
-	case 3:
-		return (*CaseBlock)(unsafe.Pointer(n)).LocalsContainerData()
-	case 4:
-		return (*CatchClause)(unsafe.Pointer(n)).LocalsContainerData()
-	case 5:
-		return (*Block)(unsafe.Pointer(n)).LocalsContainerData()
-	case 6:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 7:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 8:
-		return (*ClassExpression)(unsafe.Pointer(n)).LocalsContainerData()
-	case 9:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 10:
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 11:
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 12:
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 13:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 14:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 15:
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 16:
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 17:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 18:
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 19:
-		return (*ArrowFunction)(unsafe.Pointer(n)).LocalsContainerData()
-	case 20:
-		return (*FunctionExpression)(unsafe.Pointer(n)).LocalsContainerData()
-	case 21:
-		return (*ConditionalTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 22:
-		return (*MappedTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 23:
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 24:
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 25:
-		return (*JSDocSignature)(unsafe.Pointer(n)).LocalsContainerData()
-	case 26:
-		return (*SourceFile)(unsafe.Pointer(n)).LocalsContainerData()
-	case 27:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	default:
-		return nil
+	if offset := nodeLocalsContainerDataDispatch[n.Kind]; offset != 0 {
+		return (*LocalsContainerBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeFunctionLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindFunctionDeclaration: 1,
-	KindCallSignature:       2,
-	KindConstructSignature:  3,
-	KindConstructor:         4,
-	KindGetAccessor:         5,
-	KindSetAccessor:         6,
-	KindIndexSignature:      7,
-	KindMethodSignature:     8,
-	KindMethodDeclaration:   9,
-	KindArrowFunction:       10,
-	KindFunctionExpression:  11,
-	KindFunctionType:        12,
-	KindConstructorType:     13,
-	KindJSDocSignature:      14,
+	KindFunctionDeclaration: uint8(unsafe.Offsetof(FunctionDeclaration{}.FunctionLikeBase)),
+	KindCallSignature:       uint8(unsafe.Offsetof(CallSignatureDeclaration{}.FunctionLikeBase)),
+	KindConstructSignature:  uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.FunctionLikeBase)),
+	KindConstructor:         uint8(unsafe.Offsetof(ConstructorDeclaration{}.FunctionLikeBase)),
+	KindGetAccessor:         uint8(unsafe.Offsetof(GetAccessorDeclaration{}.FunctionLikeBase)),
+	KindSetAccessor:         uint8(unsafe.Offsetof(SetAccessorDeclaration{}.FunctionLikeBase)),
+	KindIndexSignature:      uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.FunctionLikeBase)),
+	KindMethodSignature:     uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.FunctionLikeBase)),
+	KindMethodDeclaration:   uint8(unsafe.Offsetof(MethodDeclaration{}.FunctionLikeBase)),
+	KindArrowFunction:       uint8(unsafe.Offsetof(ArrowFunction{}.FunctionLikeBase)),
+	KindFunctionExpression:  uint8(unsafe.Offsetof(FunctionExpression{}.FunctionLikeBase)),
+	KindFunctionType:        uint8(unsafe.Offsetof(FunctionTypeNode{}.FunctionLikeBase)),
+	KindConstructorType:     uint8(unsafe.Offsetof(ConstructorTypeNode{}.FunctionLikeBase)),
+	KindJSDocSignature:      uint8(unsafe.Offsetof(JSDocSignature{}.FunctionLikeBase)),
 }
 
 func (n *Node) FunctionLikeData() *FunctionLikeBase {
-	switch nodeFunctionLikeDataDispatch[n.Kind] {
-	case 1:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 2:
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 3:
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 4:
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 5:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 6:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 7:
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 8:
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 9:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 10:
-		return (*ArrowFunction)(unsafe.Pointer(n)).FunctionLikeData()
-	case 11:
-		return (*FunctionExpression)(unsafe.Pointer(n)).FunctionLikeData()
-	case 12:
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).FunctionLikeData()
-	case 13:
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).FunctionLikeData()
-	case 14:
-		return (*JSDocSignature)(unsafe.Pointer(n)).FunctionLikeData()
-	default:
-		return nil
+	if offset := nodeFunctionLikeDataDispatch[n.Kind]; offset != 0 {
+		return (*FunctionLikeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
+}
+
+var nodeClassLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
+	KindClassDeclaration: uint8(unsafe.Offsetof(ClassDeclaration{}.ClassLikeBase)),
+	KindClassExpression:  uint8(unsafe.Offsetof(ClassExpression{}.ClassLikeBase)),
 }
 
 func (n *Node) ClassLikeData() *ClassLikeBase {
-	switch n.Kind {
-	case KindClassDeclaration:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).ClassLikeData()
-	case KindClassExpression:
-		return (*ClassExpression)(unsafe.Pointer(n)).ClassLikeData()
-	default:
-		return nil
+	if offset := nodeClassLikeDataDispatch[n.Kind]; offset != 0 {
+		return (*ClassLikeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeBodyDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindFunctionDeclaration: 1,
-	KindConstructor:         2,
-	KindGetAccessor:         3,
-	KindSetAccessor:         4,
-	KindMethodDeclaration:   5,
-	KindArrowFunction:       6,
-	KindFunctionExpression:  7,
-	KindModuleDeclaration:   8,
+	KindFunctionDeclaration: uint8(unsafe.Offsetof(FunctionDeclaration{}.BodyBase)),
+	KindConstructor:         uint8(unsafe.Offsetof(ConstructorDeclaration{}.BodyBase)),
+	KindGetAccessor:         uint8(unsafe.Offsetof(GetAccessorDeclaration{}.BodyBase)),
+	KindSetAccessor:         uint8(unsafe.Offsetof(SetAccessorDeclaration{}.BodyBase)),
+	KindMethodDeclaration:   uint8(unsafe.Offsetof(MethodDeclaration{}.BodyBase)),
+	KindArrowFunction:       uint8(unsafe.Offsetof(ArrowFunction{}.BodyBase)),
+	KindFunctionExpression:  uint8(unsafe.Offsetof(FunctionExpression{}.BodyBase)),
+	KindModuleDeclaration:   uint8(unsafe.Offsetof(ModuleDeclaration{}.BodyBase)),
 }
 
 func (n *Node) BodyData() *BodyBase {
-	switch nodeBodyDataDispatch[n.Kind] {
-	case 1:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 2:
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 3:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 4:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 5:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 6:
-		return (*ArrowFunction)(unsafe.Pointer(n)).BodyData()
-	case 7:
-		return (*FunctionExpression)(unsafe.Pointer(n)).BodyData()
-	case 8:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).BodyData()
-	default:
-		return nil
+	if offset := nodeBodyDataDispatch[n.Kind]; offset != 0 {
+		return (*BodyBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeLiteralLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindStringLiteral:                 1,
-	KindNumericLiteral:                2,
-	KindBigIntLiteral:                 3,
-	KindRegularExpressionLiteral:      4,
-	KindNoSubstitutionTemplateLiteral: 5,
-	KindTemplateHead:                  6,
-	KindTemplateMiddle:                7,
-	KindTemplateTail:                  8,
-	KindJsxText:                       9,
+	KindStringLiteral:                 uint8(unsafe.Offsetof(StringLiteral{}.LiteralLikeNodeBase)),
+	KindNumericLiteral:                uint8(unsafe.Offsetof(NumericLiteral{}.LiteralLikeNodeBase)),
+	KindBigIntLiteral:                 uint8(unsafe.Offsetof(BigIntLiteral{}.LiteralLikeNodeBase)),
+	KindRegularExpressionLiteral:      uint8(unsafe.Offsetof(RegularExpressionLiteral{}.LiteralLikeNodeBase)),
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.LiteralLikeNodeBase)),
+	KindTemplateHead:                  uint8(unsafe.Offsetof(TemplateHead{}.LiteralLikeNodeBase)),
+	KindTemplateMiddle:                uint8(unsafe.Offsetof(TemplateMiddle{}.LiteralLikeNodeBase)),
+	KindTemplateTail:                  uint8(unsafe.Offsetof(TemplateTail{}.LiteralLikeNodeBase)),
+	KindJsxText:                       uint8(unsafe.Offsetof(JsxText{}.LiteralLikeNodeBase)),
 }
 
 func (n *Node) LiteralLikeData() *LiteralLikeNodeBase {
-	switch nodeLiteralLikeDataDispatch[n.Kind] {
-	case 1:
-		return (*StringLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 2:
-		return (*NumericLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 3:
-		return (*BigIntLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 4:
-		return (*RegularExpressionLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 5:
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 6:
-		return (*TemplateHead)(unsafe.Pointer(n)).LiteralLikeData()
-	case 7:
-		return (*TemplateMiddle)(unsafe.Pointer(n)).LiteralLikeData()
-	case 8:
-		return (*TemplateTail)(unsafe.Pointer(n)).LiteralLikeData()
-	case 9:
-		return (*JsxText)(unsafe.Pointer(n)).LiteralLikeData()
-	default:
-		return nil
+	if offset := nodeLiteralLikeDataDispatch[n.Kind]; offset != 0 {
+		return (*LiteralLikeNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
+}
+
+var nodeTemplateLiteralLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateHead:                  uint8(unsafe.Offsetof(TemplateHead{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateMiddle:                uint8(unsafe.Offsetof(TemplateMiddle{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateTail:                  uint8(unsafe.Offsetof(TemplateTail{}.TemplateLiteralLikeNodeBase)),
 }
 
 func (n *Node) TemplateLiteralLikeData() *TemplateLiteralLikeNodeBase {
-	switch n.Kind {
-	case KindNoSubstitutionTemplateLiteral:
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateHead:
-		return (*TemplateHead)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateMiddle:
-		return (*TemplateMiddle)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateTail:
-		return (*TemplateTail)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	default:
-		return nil
+	if offset := nodeTemplateLiteralLikeDataDispatch[n.Kind]; offset != 0 {
+		return (*TemplateLiteralLikeNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -11688,309 +11344,104 @@ func (n *Node) TemplateLiteralLikeData() *TemplateLiteralLikeNodeBase {
 // ──────────────────────────────────────────────────────────────────────
 
 var nodeNameDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:         1,
-	KindParameter:                   2,
-	KindBindingElement:              3,
-	KindFunctionDeclaration:         4,
-	KindClassDeclaration:            5,
-	KindClassExpression:             6,
-	KindInterfaceDeclaration:        7,
-	KindTypeAliasDeclaration:        8,
-	KindJSTypeAliasDeclaration:      8,
-	KindEnumMember:                  9,
-	KindEnumDeclaration:             10,
-	KindNamespaceImport:             11,
-	KindNamespaceExportDeclaration:  12,
-	KindNamespaceExport:             13,
-	KindExportSpecifier:             14,
-	KindGetAccessor:                 15,
-	KindSetAccessor:                 16,
-	KindMethodSignature:             17,
-	KindMethodDeclaration:           18,
-	KindPropertySignature:           19,
-	KindPropertyDeclaration:         20,
-	KindFunctionExpression:          21,
-	KindPropertyAccessExpression:    22,
-	KindMetaProperty:                23,
-	KindPropertyAssignment:          24,
-	KindShorthandPropertyAssignment: 25,
-	KindImportAttribute:             26,
-	KindNamedTupleMember:            27,
-	KindJsxNamespacedName:           28,
-	KindJsxAttribute:                29,
-	KindJSDocCallbackTag:            30,
-	KindJSDocTypedefTag:             31,
-	KindJSDocNameReference:          32,
-	KindModuleDeclaration:           33,
-	KindImportEqualsDeclaration:     34,
-	KindImportClause:                35,
-	KindImportSpecifier:             36,
-	KindJSDocLink:                   37,
-	KindJSDocLinkPlain:              38,
-	KindJSDocLinkCode:               39,
-	KindTypeParameter:               40,
-	KindJSDocParameterTag:           41,
-	KindJSDocPropertyTag:            41,
+	KindVariableDeclaration:         uint8(unsafe.Offsetof(VariableDeclaration{}.name)),
+	KindParameter:                   uint8(unsafe.Offsetof(ParameterDeclaration{}.name)),
+	KindBindingElement:              uint8(unsafe.Offsetof(BindingElement{}.name)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.name)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.name)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.name)),
+	KindInterfaceDeclaration:        uint8(unsafe.Offsetof(InterfaceDeclaration{}.name)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.name)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.name)),
+	KindEnumMember:                  uint8(unsafe.Offsetof(EnumMember{}.name)),
+	KindEnumDeclaration:             uint8(unsafe.Offsetof(EnumDeclaration{}.name)),
+	KindNamespaceImport:             uint8(unsafe.Offsetof(NamespaceImport{}.name)),
+	KindNamespaceExportDeclaration:  uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.name)),
+	KindNamespaceExport:             uint8(unsafe.Offsetof(NamespaceExport{}.name)),
+	KindExportSpecifier:             uint8(unsafe.Offsetof(ExportSpecifier{}.name)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.name)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.name)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.name)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.name)),
+	KindPropertySignature:           uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.name)),
+	KindPropertyDeclaration:         uint8(unsafe.Offsetof(PropertyDeclaration{}.name)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.name)),
+	KindPropertyAccessExpression:    uint8(unsafe.Offsetof(PropertyAccessExpression{}.name)),
+	KindMetaProperty:                uint8(unsafe.Offsetof(MetaProperty{}.name)),
+	KindPropertyAssignment:          uint8(unsafe.Offsetof(PropertyAssignment{}.name)),
+	KindShorthandPropertyAssignment: uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.name)),
+	KindImportAttribute:             uint8(unsafe.Offsetof(ImportAttribute{}.name)),
+	KindNamedTupleMember:            uint8(unsafe.Offsetof(NamedTupleMember{}.name)),
+	KindJsxNamespacedName:           uint8(unsafe.Offsetof(JsxNamespacedName{}.name)),
+	KindJsxAttribute:                uint8(unsafe.Offsetof(JsxAttribute{}.name)),
+	KindJSDocCallbackTag:            uint8(unsafe.Offsetof(JSDocCallbackTag{}.name)),
+	KindJSDocTypedefTag:             uint8(unsafe.Offsetof(JSDocTypedefTag{}.name)),
+	KindJSDocNameReference:          uint8(unsafe.Offsetof(JSDocNameReference{}.name)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.name)),
+	KindImportEqualsDeclaration:     uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.name)),
+	KindImportClause:                uint8(unsafe.Offsetof(ImportClause{}.name)),
+	KindImportSpecifier:             uint8(unsafe.Offsetof(ImportSpecifier{}.name)),
+	KindJSDocLink:                   uint8(unsafe.Offsetof(JSDocLink{}.name)),
+	KindJSDocLinkPlain:              uint8(unsafe.Offsetof(JSDocLinkPlain{}.name)),
+	KindJSDocLinkCode:               uint8(unsafe.Offsetof(JSDocLinkCode{}.name)),
+	KindTypeParameter:               uint8(unsafe.Offsetof(TypeParameterDeclaration{}.name)),
+	KindJSDocParameterTag:           uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.name)),
+	KindJSDocPropertyTag:            uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.name)),
 }
 
 func (n *Node) Name() *DeclarationName {
-	switch nodeNameDispatch[n.Kind] {
-	case 1:
-		return (*VariableDeclaration)(unsafe.Pointer(n)).Name()
-	case 2:
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).Name()
-	case 3:
-		return (*BindingElement)(unsafe.Pointer(n)).Name()
-	case 4:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).Name()
-	case 5:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).Name()
-	case 6:
-		return (*ClassExpression)(unsafe.Pointer(n)).Name()
-	case 7:
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).Name()
-	case 8:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).Name()
-	case 9:
-		return (*EnumMember)(unsafe.Pointer(n)).Name()
-	case 10:
-		return (*EnumDeclaration)(unsafe.Pointer(n)).Name()
-	case 11:
-		return (*NamespaceImport)(unsafe.Pointer(n)).Name()
-	case 12:
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).Name()
-	case 13:
-		return (*NamespaceExport)(unsafe.Pointer(n)).Name()
-	case 14:
-		return (*ExportSpecifier)(unsafe.Pointer(n)).Name()
-	case 15:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).Name()
-	case 16:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).Name()
-	case 17:
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).Name()
-	case 18:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).Name()
-	case 19:
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).Name()
-	case 20:
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).Name()
-	case 21:
-		return (*FunctionExpression)(unsafe.Pointer(n)).Name()
-	case 22:
-		return (*PropertyAccessExpression)(unsafe.Pointer(n)).Name()
-	case 23:
-		return (*MetaProperty)(unsafe.Pointer(n)).Name()
-	case 24:
-		return (*PropertyAssignment)(unsafe.Pointer(n)).Name()
-	case 25:
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).Name()
-	case 26:
-		return (*ImportAttribute)(unsafe.Pointer(n)).Name()
-	case 27:
-		return (*NamedTupleMember)(unsafe.Pointer(n)).Name()
-	case 28:
-		return (*JsxNamespacedName)(unsafe.Pointer(n)).Name()
-	case 29:
-		return (*JsxAttribute)(unsafe.Pointer(n)).Name()
-	case 30:
-		return (*JSDocCallbackTag)(unsafe.Pointer(n)).Name()
-	case 31:
-		return (*JSDocTypedefTag)(unsafe.Pointer(n)).Name()
-	case 32:
-		return (*JSDocNameReference)(unsafe.Pointer(n)).Name()
-	case 33:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).Name()
-	case 34:
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).Name()
-	case 35:
-		return (*ImportClause)(unsafe.Pointer(n)).Name()
-	case 36:
-		return (*ImportSpecifier)(unsafe.Pointer(n)).Name()
-	case 37:
-		return (*JSDocLink)(unsafe.Pointer(n)).Name()
-	case 38:
-		return (*JSDocLinkPlain)(unsafe.Pointer(n)).Name()
-	case 39:
-		return (*JSDocLinkCode)(unsafe.Pointer(n)).Name()
-	case 40:
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).Name()
-	case 41:
-		return (*JSDocParameterOrPropertyTag)(unsafe.Pointer(n)).Name()
-	default:
-		return nil
+	if offset := nodeNameDispatch[n.Kind]; offset != 0 {
+		return *(**DeclarationName)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeModifiersDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableStatement:           1,
-	KindParameter:                   2,
-	KindMissingDeclaration:          3,
-	KindFunctionDeclaration:         4,
-	KindClassDeclaration:            5,
-	KindClassExpression:             6,
-	KindInterfaceDeclaration:        7,
-	KindTypeAliasDeclaration:        8,
-	KindJSTypeAliasDeclaration:      8,
-	KindEnumDeclaration:             9,
-	KindImportDeclaration:           10,
-	KindJSImportDeclaration:         10,
-	KindExportAssignment:            11,
-	KindNamespaceExportDeclaration:  12,
-	KindConstructor:                 13,
-	KindGetAccessor:                 14,
-	KindSetAccessor:                 15,
-	KindIndexSignature:              16,
-	KindMethodSignature:             17,
-	KindMethodDeclaration:           18,
-	KindPropertySignature:           19,
-	KindPropertyDeclaration:         20,
-	KindClassStaticBlockDeclaration: 21,
-	KindBinaryExpression:            22,
-	KindArrowFunction:               23,
-	KindFunctionExpression:          24,
-	KindPropertyAssignment:          25,
-	KindShorthandPropertyAssignment: 26,
-	KindConstructorType:             27,
-	KindModuleDeclaration:           28,
-	KindImportEqualsDeclaration:     29,
-	KindExportDeclaration:           30,
-	KindTypeParameter:               31,
+	KindVariableStatement:           uint8(unsafe.Offsetof(VariableStatement{}.modifiers)),
+	KindParameter:                   uint8(unsafe.Offsetof(ParameterDeclaration{}.modifiers)),
+	KindMissingDeclaration:          uint8(unsafe.Offsetof(MissingDeclaration{}.modifiers)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.modifiers)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.modifiers)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.modifiers)),
+	KindInterfaceDeclaration:        uint8(unsafe.Offsetof(InterfaceDeclaration{}.modifiers)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.modifiers)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.modifiers)),
+	KindEnumDeclaration:             uint8(unsafe.Offsetof(EnumDeclaration{}.modifiers)),
+	KindImportDeclaration:           uint8(unsafe.Offsetof(ImportDeclaration{}.modifiers)),
+	KindJSImportDeclaration:         uint8(unsafe.Offsetof(ImportDeclaration{}.modifiers)),
+	KindExportAssignment:            uint8(unsafe.Offsetof(ExportAssignment{}.modifiers)),
+	KindNamespaceExportDeclaration:  uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.modifiers)),
+	KindConstructor:                 uint8(unsafe.Offsetof(ConstructorDeclaration{}.modifiers)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.modifiers)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.modifiers)),
+	KindIndexSignature:              uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.modifiers)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.modifiers)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.modifiers)),
+	KindPropertySignature:           uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.modifiers)),
+	KindPropertyDeclaration:         uint8(unsafe.Offsetof(PropertyDeclaration{}.modifiers)),
+	KindClassStaticBlockDeclaration: uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.modifiers)),
+	KindBinaryExpression:            uint8(unsafe.Offsetof(BinaryExpression{}.modifiers)),
+	KindArrowFunction:               uint8(unsafe.Offsetof(ArrowFunction{}.modifiers)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.modifiers)),
+	KindPropertyAssignment:          uint8(unsafe.Offsetof(PropertyAssignment{}.modifiers)),
+	KindShorthandPropertyAssignment: uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.modifiers)),
+	KindConstructorType:             uint8(unsafe.Offsetof(ConstructorTypeNode{}.modifiers)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.modifiers)),
+	KindImportEqualsDeclaration:     uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.modifiers)),
+	KindExportDeclaration:           uint8(unsafe.Offsetof(ExportDeclaration{}.modifiers)),
+	KindTypeParameter:               uint8(unsafe.Offsetof(TypeParameterDeclaration{}.modifiers)),
 }
 
 func (n *Node) Modifiers() *ModifierList {
-	switch nodeModifiersDispatch[n.Kind] {
-	case 1:
-		return (*VariableStatement)(unsafe.Pointer(n)).Modifiers()
-	case 2:
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 3:
-		return (*MissingDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 4:
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 5:
-		return (*ClassDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 6:
-		return (*ClassExpression)(unsafe.Pointer(n)).Modifiers()
-	case 7:
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 8:
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 9:
-		return (*EnumDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 10:
-		return (*ImportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 11:
-		return (*ExportAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 12:
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 13:
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 14:
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 15:
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 16:
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 17:
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 18:
-		return (*MethodDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 19:
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 20:
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 21:
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 22:
-		return (*BinaryExpression)(unsafe.Pointer(n)).Modifiers()
-	case 23:
-		return (*ArrowFunction)(unsafe.Pointer(n)).Modifiers()
-	case 24:
-		return (*FunctionExpression)(unsafe.Pointer(n)).Modifiers()
-	case 25:
-		return (*PropertyAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 26:
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 27:
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).Modifiers()
-	case 28:
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 29:
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 30:
-		return (*ExportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 31:
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).Modifiers()
-	default:
-		return nil
+	if offset := nodeModifiersDispatch[n.Kind]; offset != 0 {
+		return *(**ModifierList)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 func (n *MutableNode) SetModifiers(modifiers *ModifierList) {
-	switch n.Kind {
-	case KindVariableStatement:
-		(*VariableStatement)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindParameter:
-		(*ParameterDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMissingDeclaration:
-		(*MissingDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindFunctionDeclaration:
-		(*FunctionDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassDeclaration:
-		(*ClassDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassExpression:
-		(*ClassExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindInterfaceDeclaration:
-		(*InterfaceDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
-		(*TypeAliasDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindEnumDeclaration:
-		(*EnumDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindImportDeclaration, KindJSImportDeclaration:
-		(*ImportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindExportAssignment:
-		(*ExportAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindNamespaceExportDeclaration:
-		(*NamespaceExportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindConstructor:
-		(*ConstructorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindGetAccessor:
-		(*GetAccessorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindSetAccessor:
-		(*SetAccessorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindIndexSignature:
-		(*IndexSignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMethodSignature:
-		(*MethodSignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMethodDeclaration:
-		(*MethodDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertySignature:
-		(*PropertySignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertyDeclaration:
-		(*PropertyDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassStaticBlockDeclaration:
-		(*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindBinaryExpression:
-		(*BinaryExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindArrowFunction:
-		(*ArrowFunction)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindFunctionExpression:
-		(*FunctionExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertyAssignment:
-		(*PropertyAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindShorthandPropertyAssignment:
-		(*ShorthandPropertyAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindConstructorType:
-		(*ConstructorTypeNode)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindModuleDeclaration:
-		(*ModuleDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindImportEqualsDeclaration:
-		(*ImportEqualsDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindExportDeclaration:
-		(*ExportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindTypeParameter:
-		(*TypeParameterDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
+	if offset := nodeModifiersDispatch[n.Kind]; offset != 0 {
+		*(**ModifierList)(unsafe.Add(unsafe.Pointer(n), offset)) = modifiers
 	}
 }
 

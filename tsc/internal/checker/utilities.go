@@ -374,6 +374,17 @@ func (c *Checker) getNodeFileAndIndex(n *ast.Node) (*ast.SourceFile, int) {
 	if c.nodeFileIndexCache == nil {
 		c.nodeFileIndexCache = new([4096]nodeFileIndexEntry)
 	}
+	if p := n.Parent; p != nil {
+		pslot := (uint32(p.Pos())*2654435761 ^ uint32(p.End()) ^ uint32(p.Kind)) & 4095
+		pentry := &c.nodeFileIndexCache[pslot]
+		if pentry.node == p {
+			return pentry.file, pentry.fileIndex
+		}
+		sf := ast.GetSourceFileOfNode(p)
+		idx := c.fileIndexMap[sf]
+		*pentry = nodeFileIndexEntry{node: p, file: sf, fileIndex: idx}
+		return sf, idx
+	}
 	slot := (uint32(n.Pos())*2654435761 ^ uint32(n.End()) ^ uint32(n.Kind)) & 4095
 	entry := &c.nodeFileIndexCache[slot]
 	if entry.node == n {
@@ -484,7 +495,7 @@ func (c *Checker) compareNodes(n1, n2 *ast.Node) int {
 	if n2 == nil {
 		return -1
 	}
-	if n1.Parent != nil && n1.Parent == n2.Parent {
+	if n1.Parent != nil && n2.Parent != nil && (n1.Parent == n2.Parent || (n1.Parent.Parent != nil && n1.Parent.Parent == n2.Parent.Parent)) {
 		return n1.Pos() - n2.Pos()
 	}
 	s1, f1 := c.getNodeFileAndIndex(n1)
@@ -546,8 +557,10 @@ func CompareTypes(t1, t2 *Type) int {
 			if c := t1.checker.compareNodes(t1.AsInstantiationExpressionType().node, t2.AsInstantiationExpressionType().node); c != 0 {
 				return c
 			}
-		} else if c := t1.checker.compareSymbols(t1.symbol, t2.symbol); c != 0 {
-			return c
+		} else if t1.symbol != t2.symbol {
+			if c := t1.checker.compareSymbols(t1.symbol, t2.symbol); c != 0 {
+				return c
+			}
 		}
 		// When object types have the same or no symbol, order by kind. We order type references before other kinds.
 		if t1.objectFlags&ObjectFlagsReference != 0 && t2.objectFlags&ObjectFlagsReference != 0 {
@@ -724,6 +737,9 @@ func compareTypeNames(t1, t2 *Type) int {
 	s1 := getTypeNameSymbol(t1)
 	s2 := getTypeNameSymbol(t2)
 	if s1 == s2 {
+		if t1.alias == t2.alias {
+			return 0
+		}
 		return compareTypeLists(t1.alias.TypeArguments(), t2.alias.TypeArguments())
 	}
 	if s1 == nil {
@@ -1008,11 +1024,14 @@ func (c *Checker) releaseTemporaryTypeSet(set *temporaryTypeSet) {
 	if cap(set.values) > len(set.inline) {
 		clear(set.inline[:])
 	}
-	clear(set.valuesByKey)
+	if len(set.valuesByKey) > 256 || cap(set.values) > 4096 {
+		set.valuesByKey = nil
+	} else if len(set.valuesByKey) != 0 {
+		clear(set.valuesByKey)
+	}
 	// Do not retain arbitrarily large temporary unions and their dedup maps.
 	if cap(set.values) > 4096 {
 		set.values = set.inline[:0]
-		set.valuesByKey = nil
 	} else {
 		set.values = set.values[:0]
 	}
@@ -1060,15 +1079,17 @@ func (c *Checker) getTemporaryNameSet() map[string]struct{} {
 
 func (c *Checker) releaseTemporaryNameSet(set map[string]struct{}) {
 	// Do not retain unusually large tables in the free list.
-	if len(set) > 4096 {
+	if len(set) > 256 {
 		return
 	}
-	clear(set)
+	if len(set) != 0 {
+		clear(set)
+	}
 	c.freeNameSets = append(c.freeNameSets, set)
 }
 
 func (s *orderedSet[T]) contains(value T) bool {
-	if s.valuesByKey == nil {
+	if len(s.values) <= orderedSetMapThreshold {
 		return slices.Contains(s.values, value)
 	}
 	_, ok := s.valuesByKey[value]
@@ -1079,11 +1100,13 @@ func (s *orderedSet[T]) add(value T) {
 	s.values = append(s.values, value)
 	// Small sets are served by a linear scan over values; only materialize the map once the set
 	// grows large enough for hashing to win.
-	if s.valuesByKey == nil {
-		if len(s.values) <= orderedSetMapThreshold {
-			return
+	if len(s.values) <= orderedSetMapThreshold {
+		return
+	}
+	if len(s.values) == orderedSetMapThreshold+1 {
+		if s.valuesByKey == nil {
+			s.valuesByKey = make(map[T]struct{}, len(s.values))
 		}
-		s.valuesByKey = make(map[T]struct{}, len(s.values))
 		for _, v := range s.values[:len(s.values)-1] {
 			s.valuesByKey[v] = struct{}{}
 		}

@@ -1,7 +1,6 @@
 package core
 
 import (
-	"math/bits"
 	"runtime"
 	"slices"
 	"unsafe"
@@ -98,36 +97,28 @@ func nextArenaSize[T any](size int) int {
 // indexes instead of Go pointers. Index zero is nil. Unlike Arena, it retains all
 // blocks so that an index alone keeps its value reachable through the arena.
 type IndexedArena[T any] struct {
-	blocks [][]T
+	blocks []*[1 << indexedArenaPageShift]T
 	size   uint32
 }
 
-const indexedArenaPageShift = 8
+const indexedArenaPageShift = 6
 
 func (a *IndexedArena[T]) New() (uint32, *T) {
 	if a.size == ^uint32(0) {
 		panic("IndexedArena exhausted")
 	}
-	if len(a.blocks) == 0 || len(a.blocks[len(a.blocks)-1]) == cap(a.blocks[len(a.blocks)-1]) {
-		size := 1 << min(len(a.blocks), indexedArenaPageShift)
-		a.blocks = append(a.blocks, make([]T, 0, size))
+	i := a.size
+	if int(i>>indexedArenaPageShift) >= len(a.blocks) {
+		a.blocks = append(a.blocks, new([1 << indexedArenaPageShift]T))
 	}
-	block := &a.blocks[len(a.blocks)-1]
-	*block = (*block)[:len(*block)+1]
-	a.size++
-	return a.size, &(*block)[len(*block)-1]
+	a.size = i + 1
+	return i + 1, &a.blocks[i>>indexedArenaPageShift][i&((1<<indexedArenaPageShift)-1)]
 }
 
 func (a *IndexedArena[T]) Get(index uint32) *T {
 	if index == 0 {
 		return nil
 	}
-	// The initial blocks have sizes 1, 2, 4, ..., 128. Subsequent
-	// blocks have 256 entries, avoiding geometric over-allocation.
-	if index < 1<<indexedArenaPageShift {
-		block := bits.Len32(index) - 1
-		return &a.blocks[block][index-(1<<block)]
-	}
-	index -= 1 << indexedArenaPageShift
-	return &a.blocks[indexedArenaPageShift+int(index>>indexedArenaPageShift)][index&((1<<indexedArenaPageShift)-1)]
+	i := index - 1
+	return &a.blocks[i>>indexedArenaPageShift][i&((1<<indexedArenaPageShift)-1)]
 }

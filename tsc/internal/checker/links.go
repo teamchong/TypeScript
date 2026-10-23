@@ -28,7 +28,10 @@ func (s *nodeLinkStore[V]) Get(node *ast.Node) *V {
 }
 
 func (s *nodeLinkStore[V]) Has(node *ast.Node) bool {
-	id := uint64(s.gen.GetNodeId(node))
+	id := uint64(ast.PeekNodeId(node))
+	if id == 0 {
+		return false
+	}
 	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
 		return s.pages.Has(id - ast.BlockIdOffset)
 	}
@@ -36,7 +39,10 @@ func (s *nodeLinkStore[V]) Has(node *ast.Node) bool {
 }
 
 func (s *nodeLinkStore[V]) TryGet(node *ast.Node) *V {
-	id := uint64(s.gen.GetNodeId(node))
+	id := uint64(ast.PeekNodeId(node))
+	if id == 0 {
+		return nil
+	}
 	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
 		return s.pages.TryGet(id - ast.BlockIdOffset)
 	}
@@ -58,7 +64,10 @@ func (s *symbolLinkStore[V]) Get(symbol *ast.Symbol) *V {
 }
 
 func (s *symbolLinkStore[V]) Has(symbol *ast.Symbol) bool {
-	id := uint64(s.gen.GetSymbolId(symbol))
+	id := uint64(ast.PeekSymbolId(symbol))
+	if id == 0 {
+		return false
+	}
 	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
 		return s.pages.Has(id - ast.BlockIdOffset)
 	}
@@ -66,7 +75,10 @@ func (s *symbolLinkStore[V]) Has(symbol *ast.Symbol) bool {
 }
 
 func (s *symbolLinkStore[V]) TryGet(symbol *ast.Symbol) *V {
-	id := uint64(s.gen.GetSymbolId(symbol))
+	id := uint64(ast.PeekSymbolId(symbol))
+	if id == 0 {
+		return nil
+	}
 	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
 		return s.pages.TryGet(id - ast.BlockIdOffset)
 	}

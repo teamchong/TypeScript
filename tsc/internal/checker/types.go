@@ -10,7 +10,6 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/collections"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/evaluator"
-	"github.com/zeebo/xxh3"
 )
 
 //go:generate npx hereby generate:checker
@@ -301,7 +300,7 @@ type ExportTypeLinks struct {
 type TypeAliasLinks struct {
 	declaredType                  *Type
 	typeParameters                []*Type                // Type parameters of type alias (undefined if non-generic)
-	instantiations                map[CacheHashKey]*Type // Instantiations of generic type alias (undefined if non-generic)
+	instantiations                  typeCacheTable // Instantiations of generic type alias (undefined if non-generic)
 	isConstructorDeclaredProperty bool
 }
 
@@ -786,12 +785,21 @@ const (
 	typeKindUnion
 	typeKindIntersection
 )
+type typeCacheFlags uint8
+
+const (
+	typeCacheIsWeakComputed typeCacheFlags = 1 << iota
+	typeCacheIsWeak
+	typeCacheShouldNormalizeComputed
+	typeCacheShouldNormalize
+)
 
 type Type struct {
 	flags       TypeFlags
 	objectFlags ObjectFlags
 	id          TypeId
 	kind        typeKind
+	cacheFlags  typeCacheFlags
 	symbol      *ast.Symbol
 	alias       *TypeAlias
 	checker     *Checker
@@ -944,30 +952,43 @@ func (t *Type) Distributed() []*Type {
 
 // Common accessors
 
+var typeTargetOffset = [typeKindIntersection + 1]uint8{
+	typeKindObject:                  uint8(unsafe.Offsetof(ObjectType{}.target)),
+	typeKindTypeReference:           uint8(unsafe.Offsetof(TypeReference{}.target)),
+	typeKindInterface:               uint8(unsafe.Offsetof(InterfaceType{}.target)),
+	typeKindTuple:                   uint8(unsafe.Offsetof(TupleType{}.target)),
+	typeKindInstantiationExpression: uint8(unsafe.Offsetof(InstantiationExpressionType{}.target)),
+	typeKindMapped:                  uint8(unsafe.Offsetof(MappedType{}.target)),
+	typeKindReverseMapped:           uint8(unsafe.Offsetof(ReverseMappedType{}.target)),
+	typeKindEvolvingArray:           uint8(unsafe.Offsetof(EvolvingArrayType{}.target)),
+	typeKindTypeParameter:           uint8(unsafe.Offsetof(TypeParameter{}.target)),
+	typeKindIndex:                   uint8(unsafe.Offsetof(IndexType{}.target)),
+	typeKindStringMapping:           uint8(unsafe.Offsetof(StringMappingType{}.target)),
+}
+
 func (t *Type) Target() *Type {
-	switch {
-	case t.flags&TypeFlagsObject != 0:
-		return t.AsObjectType().target
-	case t.flags&TypeFlagsTypeParameter != 0:
-		return t.AsTypeParameter().target
-	case t.flags&TypeFlagsIndex != 0:
-		return t.AsIndexType().target
-	case t.flags&TypeFlagsStringMapping != 0:
-		return t.AsStringMappingType().target
-	case t.flags&TypeFlagsObject != 0 && t.objectFlags&ObjectFlagsMapped != 0:
-		return t.AsMappedType().target
+	if off := typeTargetOffset[t.kind]; off != 0 {
+		return *(**Type)(unsafe.Add(unsafe.Pointer(t), off))
 	}
 	panic("Unhandled case in Type.Target")
 }
 
+var typeMapperOffset = [typeKindIntersection + 1]uint8{
+	typeKindObject:                  uint8(unsafe.Offsetof(ObjectType{}.mapper)),
+	typeKindTypeReference:           uint8(unsafe.Offsetof(TypeReference{}.mapper)),
+	typeKindInterface:               uint8(unsafe.Offsetof(InterfaceType{}.mapper)),
+	typeKindTuple:                   uint8(unsafe.Offsetof(TupleType{}.mapper)),
+	typeKindInstantiationExpression: uint8(unsafe.Offsetof(InstantiationExpressionType{}.mapper)),
+	typeKindMapped:                  uint8(unsafe.Offsetof(MappedType{}.mapper)),
+	typeKindReverseMapped:           uint8(unsafe.Offsetof(ReverseMappedType{}.mapper)),
+	typeKindEvolvingArray:           uint8(unsafe.Offsetof(EvolvingArrayType{}.mapper)),
+	typeKindTypeParameter:           uint8(unsafe.Offsetof(TypeParameter{}.mapper)),
+	typeKindConditional:             uint8(unsafe.Offsetof(ConditionalType{}.mapper)),
+}
+
 func (t *Type) Mapper() *TypeMapper {
-	switch {
-	case t.flags&TypeFlagsObject != 0:
-		return t.AsObjectType().mapper
-	case t.flags&TypeFlagsTypeParameter != 0:
-		return t.AsTypeParameter().mapper
-	case t.flags&TypeFlagsConditional != 0:
-		return t.AsConditionalType().mapper
+	if off := typeMapperOffset[t.kind]; off != 0 {
+		return *(**TypeMapper)(unsafe.Add(unsafe.Pointer(t), off))
 	}
 	panic("Unhandled case in Type.Mapper")
 }
@@ -1118,17 +1139,17 @@ func (t *ConstrainedType) AsConstrainedType() *ConstrainedType { return t }
 
 type StructuredType struct {
 	ConstrainedType
-	members    *memberIndex
-	properties []*ast.Symbol
-	extra      *structuredTypeExtra
+	extra *structuredTypeExtra
 }
 
 type structuredTypeExtra struct {
-	signatures         []*Signature // Signatures (call + construct)
-	callSignatureCount int          // Count of call signatures
-	indexInfos         []*IndexInfo
-
+	members                                      *memberIndex
+	properties                                   []*ast.Symbol
+	signatures                                   []*Signature // Signatures (call + construct)
+	callSignatureCount                           int          // Count of call signatures
+	indexInfos                                   []*IndexInfo
 	objectTypeWithoutAbstractConstructSignatures *Type
+	regularType                                  *Type
 }
 
 func (t *StructuredType) AsStructuredType() *StructuredType { return t }
@@ -1169,10 +1190,33 @@ func (t *StructuredType) ensureExtra() *structuredTypeExtra {
 }
 
 func (t *StructuredType) Properties() []*ast.Symbol {
-	if t.flags&TypeFlagsObject != 0 {
-		return t.properties
+	if t.flags&TypeFlagsObject != 0 && t.extra != nil {
+		return t.extra.properties
 	}
 	return nil
+}
+
+func (t *StructuredType) getPropertiesSlice() []*ast.Symbol {
+	if t.extra == nil {
+		return nil
+	}
+	return t.extra.properties
+}
+
+func (t *StructuredType) getMembersIndex() *memberIndex {
+	if t.extra == nil {
+		return nil
+	}
+	return t.extra.members
+}
+
+func (t *StructuredType) setMembersAndProperties(members *memberIndex, properties []*ast.Symbol) {
+	if members == nil && len(properties) == 0 && t.extra == nil {
+		return
+	}
+	ex := t.ensureExtra()
+	ex.members = members
+	ex.properties = properties
 }
 
 type memberIndex struct {
@@ -1208,8 +1252,25 @@ func symbolTableKeysMatchNames(members ast.SymbolTable) bool {
 	return true
 }
 
+func hashMemberName(s string) uint64 {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	p := unsafe.StringData(s)
+	var h uint64
+	if n >= 8 {
+		h = *(*uint64)(unsafe.Pointer(p)) ^ (*(*uint64)(unsafe.Add(unsafe.Pointer(p), n-8)) * 0x9e3779b97f4a7c15)
+	} else if n >= 4 {
+		h = uint64(*(*uint32)(unsafe.Pointer(p))) | (uint64(*(*uint32)(unsafe.Add(unsafe.Pointer(p), n-4))) << 32)
+	} else {
+		h = uint64(*p) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n-1))) << 16)
+	}
+	return (h ^ uint64(n)) * 0xbf58476d1ce4e5b9
+}
+
 func (c *Checker) newPropertyIndex(properties []*ast.Symbol, index *memberIndex) *memberIndex {
-	if len(properties) <= 8 {
+	if len(properties) <= 3 {
 		if index != nil {
 			c.memberIndexArena.Pop(index)
 		}
@@ -1224,40 +1285,74 @@ func (c *Checker) newPropertyIndex(properties []*ast.Symbol, index *memberIndex)
 	size := 1 << bits.Len(uint(len(properties))*2-1)
 	index.slots = c.memberIndexSlotsArena.NewSlice(size)
 	mask := uint64(size - 1)
-	for i, symbol := range properties {
-		slot := xxh3.HashString(symbol.Name()) & mask
-		for index.slots[slot] != 0 {
-			slot = (slot + 1) & mask
+	if len(properties) < 0xffff {
+		for i, symbol := range properties {
+			h := hashMemberName(symbol.Name())
+			tag := uint32(h>>16) & 0xffff0000
+			slot := h & mask
+			for index.slots[slot] != 0 {
+				slot = (slot + 1) & mask
+			}
+			index.slots[slot] = uint32(i+1) | tag
 		}
-		index.slots[slot] = uint32(i + 1)
+	} else {
+		for i, symbol := range properties {
+			slot := hashMemberName(symbol.Name()) & mask
+			for index.slots[slot] != 0 {
+				slot = (slot + 1) & mask
+			}
+			index.slots[slot] = uint32(i + 1)
+		}
 	}
 	return index
 }
 
 func (t *StructuredType) getMember(name string) *ast.Symbol {
-	if t.members == nil {
-		for _, symbol := range t.properties {
+	if t.extra == nil {
+		return nil
+	}
+	properties := t.extra.properties
+	members := t.extra.members
+	if members == nil {
+		for _, symbol := range properties {
 			if symbol.Name() == name {
 				return symbol
 			}
 		}
 		return nil
 	}
-	if t.members.fallback != nil {
-		return t.members.fallback[name]
+	if members.fallback != nil {
+		return members.fallback[name]
 	}
-	slots := t.members.slots
+	slots := members.slots
 	if len(slots) == 0 {
 		return nil
 	}
 	mask := uint64(len(slots) - 1)
-	slot := xxh3.HashString(name) & mask
+	h := hashMemberName(name)
+	slot := h & mask
+	if len(properties) < 0xffff {
+		tag := uint32(h>>16) & 0xffff0000
+		for {
+			entry := slots[slot]
+			if entry == 0 {
+				return nil
+			}
+			if (entry & 0xffff0000) == tag {
+				symbol := properties[(entry&0xffff)-1]
+				if symbol.Name() == name {
+					return symbol
+				}
+			}
+			slot = (slot + 1) & mask
+		}
+	}
 	for {
 		index := slots[slot]
 		if index == 0 {
 			return nil
 		}
-		symbol := t.properties[index-1]
+		symbol := properties[index-1]
 		if symbol.Name() == name {
 			return symbol
 		}
@@ -1266,14 +1361,18 @@ func (t *StructuredType) getMember(name string) *ast.Symbol {
 }
 
 func (t *StructuredType) getMembers() ast.SymbolTable {
-	if t.members != nil && t.members.fallback != nil {
-		return t.members.fallback
-	}
-	if len(t.properties) == 0 {
+	if t.extra == nil {
 		return nil
 	}
-	members := make(ast.SymbolTable, len(t.properties))
-	for _, symbol := range t.properties {
+	if t.extra.members != nil && t.extra.members.fallback != nil {
+		return t.extra.members.fallback
+	}
+	properties := t.extra.properties
+	if len(properties) == 0 {
+		return nil
+	}
+	members := make(ast.SymbolTable, len(properties))
+	for _, symbol := range properties {
 		members[symbol.Name()] = symbol
 	}
 	return members
@@ -1314,9 +1413,9 @@ func (t *StructuredType) getMembers() ast.SymbolTable {
 
 type ObjectType struct {
 	StructuredType
-	target         *Type                  // Target of instantiated type
-	mapper         *TypeMapper            // Type mapper for instantiated type
-	instantiations map[CacheHashKey]*Type // Map of type instantiations
+	target         *Type           // Target of instantiated type
+	mapper         *TypeMapper     // Type mapper for instantiated type
+	instantiations *typeCacheTable // Map of type instantiations
 }
 
 func (t *ObjectType) AsObjectType() *ObjectType { return t }
@@ -1512,7 +1611,6 @@ func (t *UnionOrIntersectionType) Types() []*Type {
 type UnionType struct {
 	UnionOrIntersectionType
 	resolvedReducedType *Type
-	regularType         *Type
 	origin              *Type // Denormalized union, intersection, or index type in which union originates
 }
 
@@ -1604,22 +1702,33 @@ type ConditionalRoot struct {
 	isDistributive      bool
 	inferTypeParameters []*Type
 	outerTypeParameters []*Type
-	instantiations      map[CacheHashKey]*Type
+	instantiations      typeCacheTable
 	alias               *TypeAlias
 }
 
-type ConditionalType struct {
-	ConstrainedType
-	root                             *ConditionalRoot
-	checkType                        *Type
-	extendsType                      *Type
+type conditionalTypeExtra struct {
 	resolvedTrueType                 *Type
 	resolvedFalseType                *Type
 	resolvedInferredTrueType         *Type // The `trueType` instantiated with the `combinedMapper`, if present
 	resolvedDefaultConstraint        *Type
 	resolvedConstraintOfDistributive *Type
-	mapper                           *TypeMapper
 	combinedMapper                   *TypeMapper
+}
+
+type ConditionalType struct {
+	ConstrainedType
+	root        *ConditionalRoot
+	checkType   *Type
+	extendsType *Type
+	mapper      *TypeMapper
+	extra       *conditionalTypeExtra
+}
+
+func (t *ConditionalType) ensureExtra(c *Checker) *conditionalTypeExtra {
+	if t.extra == nil {
+		t.extra = c.conditionalTypeExtraArena.New()
+	}
+	return t.extra
 }
 
 func (t *ConditionalType) CheckType() *Type   { return t.checkType }

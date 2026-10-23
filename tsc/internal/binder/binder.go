@@ -565,14 +565,14 @@ func (b *Binder) addAntecedent(label *ast.FlowLabel, antecedent *ast.FlowNode) {
 	}
 	// If antecedent isn't already on the Antecedents list, add it to the end of the list
 	var last *ast.FlowList
-	for list := label.Antecedents; list != nil; list = list.Next {
+	for list := label.Antecedents(); list != nil; list = list.Next {
 		if list.Flow == antecedent {
 			return
 		}
 		last = list
 	}
 	if last == nil {
-		label.Antecedents = b.newFlowList(antecedent, nil)
+		label.SetAntecedents(b.newFlowList(antecedent, nil))
 	} else {
 		last.Next = b.newFlowList(antecedent, nil)
 	}
@@ -580,11 +580,12 @@ func (b *Binder) addAntecedent(label *ast.FlowLabel, antecedent *ast.FlowNode) {
 }
 
 func (b *Binder) finishFlowLabel(label *ast.FlowLabel) *ast.FlowNode {
-	if label.Antecedents == nil {
+	antecedents := label.Antecedents()
+	if antecedents == nil {
 		return b.unreachableFlow
 	}
-	if label.Antecedents.Next == nil {
-		return label.Antecedents.Flow
+	if antecedents.Next == nil {
+		return antecedents.Flow
 	}
 	return label
 }
@@ -2137,7 +2138,7 @@ func (b *Binder) bindTryStatement(node *ast.Node) {
 		// set of antecedents for the pre-finally label. As control flow analysis passes by a ReduceLabel
 		// node, the pre-finally label is temporarily switched to the reduced antecedent set.
 		finallyLabel := b.createBranchLabel()
-		finallyLabel.Antecedents = b.combineFlowLists(normalExitLabel.Antecedents, b.combineFlowLists(exceptionLabel.Antecedents, returnLabel.Antecedents))
+		finallyLabel.SetAntecedents(b.combineFlowLists(normalExitLabel.Antecedents(), b.combineFlowLists(exceptionLabel.Antecedents(), returnLabel.Antecedents())))
 		b.currentFlow = finallyLabel
 		b.bind(stmt.FinallyBlock)
 		if b.currentFlow.Flags&ast.FlowFlagsUnreachable != 0 {
@@ -2146,19 +2147,19 @@ func (b *Binder) bindTryStatement(node *ast.Node) {
 		} else {
 			// If we have an IIFE return target and return statements in the try or catch blocks, add a control
 			// flow that goes back through the finally block and back through only the return statements.
-			if b.currentReturnTarget != nil && returnLabel.Antecedents != nil {
-				b.addAntecedent(b.currentReturnTarget, b.createReduceLabel(finallyLabel, returnLabel.Antecedents, b.currentFlow))
+			if b.currentReturnTarget != nil && returnLabel.Antecedents() != nil {
+				b.addAntecedent(b.currentReturnTarget, b.createReduceLabel(finallyLabel, returnLabel.Antecedents(), b.currentFlow))
 			}
 			// If we have an outer exception target (i.e. a containing try-finally or try-catch-finally), add a
 			// control flow that goes back through the finally block and back through each possible exception source.
-			if b.currentExceptionTarget != nil && exceptionLabel.Antecedents != nil {
-				b.addAntecedent(b.currentExceptionTarget, b.createReduceLabel(finallyLabel, exceptionLabel.Antecedents, b.currentFlow))
+			if b.currentExceptionTarget != nil && exceptionLabel.Antecedents() != nil {
+				b.addAntecedent(b.currentExceptionTarget, b.createReduceLabel(finallyLabel, exceptionLabel.Antecedents(), b.currentFlow))
 			}
 			// If the end of the finally block is reachable, but the end of the try and catch blocks are not,
 			// convert the current flow to unreachable. For example, 'try { return 1; } finally { ... }' should
 			// result in an unreachable current control flow.
-			if normalExitLabel.Antecedents != nil {
-				b.currentFlow = b.createReduceLabel(finallyLabel, normalExitLabel.Antecedents, b.currentFlow)
+			if normalExitLabel.Antecedents() != nil {
+				b.currentFlow = b.createReduceLabel(finallyLabel, normalExitLabel.Antecedents(), b.currentFlow)
 			} else {
 				b.currentFlow = b.unreachableFlow
 			}

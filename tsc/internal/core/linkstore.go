@@ -90,7 +90,9 @@ func (s *PagedLinkStore[V]) TryGet(key uint64) *V {
 	pageIndex := key >> LinkPageShift
 	if int(pageIndex) < len(s.pages) {
 		if page := s.pages[pageIndex]; page != nil {
-			return s.arena.Get(page[key&LinkPageMask])
+			if idx := page[key&LinkPageMask]; idx != 0 {
+				return s.arena.Get(idx)
+			}
 		}
 	}
 	return nil

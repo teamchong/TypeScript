@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
+	"unsafe"
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
 	"github.com/microsoft/TypeScript/tsc/internal/collections"
@@ -93,13 +93,11 @@ type ErrorOutputContainer struct {
 
 type ErrorReporter func(message *diagnostics.Message, args ...any)
 
-type RecursionId struct {
-	value any
-}
+type RecursionId uintptr
 
 // This function exists to constrain the types of values that can be used as recursion IDs.
-func asRecursionId(value any) RecursionId {
-	return RecursionId{value: value}
+func asRecursionId[T *Type | *ast.Symbol | *ast.Node](value T) RecursionId {
+	return RecursionId(uintptr(unsafe.Pointer(value)))
 }
 
 type Relation struct {
@@ -120,36 +118,44 @@ type simpleRelationMap struct {
 }
 
 func (m *simpleRelationMap) get(key uint64) uint32 {
-	if len(m.slots) == 0 {
+	slots := m.slots
+	if len(slots) == 0 {
 		return 0
 	}
 	lo, hi := uint32(key), uint32(key>>32)
-	mask := uint32(len(m.slots) - 1)
-	i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
+	mask := uint32(len(slots) - 1)
+	i := uint32((uint64(lo)*0x9e3779b97f4a7c15 ^ uint64(hi)*0xbf58476d1ce4e5b9) >> m.shift)
 	for {
-		s := m.slots[i]
+		s := slots[i&mask]
 		if s.packed == 0 {
 			return 0
 		}
 		if s.lo == lo && s.hi == hi {
 			return s.packed
 		}
-		i = (i + 1) & mask
+		i++
 	}
 }
 
-func (m *simpleRelationMap) slot(key uint64) *simpleRelationSlot {
+func (m *simpleRelationMap) slot(p *packedRelationCache, key uint64) *simpleRelationSlot {
 	if len(m.slots) == 0 {
-		m.slots = make([]simpleRelationSlot, 64)
+		if p != nil && len(p.freeSimpleSlots[6]) > 0 {
+			n := len(p.freeSimpleSlots[6]) - 1
+			m.slots = p.freeSimpleSlots[6][n]
+			p.freeSimpleSlots[6] = p.freeSimpleSlots[6][:n]
+		} else {
+			m.slots = make([]simpleRelationSlot, 64)
+		}
 		m.shift = 64 - 6
-	} else if int(m.count+1)*8 > len(m.slots)*7 {
-		m.grow()
+	} else if int(m.count+1)*4 >= len(m.slots)*3 {
+		m.grow(p)
 	}
+	slots := m.slots
 	lo, hi := uint32(key), uint32(key>>32)
-	mask := uint32(len(m.slots) - 1)
-	i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
+	mask := uint32(len(slots) - 1)
+	i := uint32((uint64(lo)*0x9e3779b97f4a7c15 ^ uint64(hi)*0xbf58476d1ce4e5b9) >> m.shift)
 	for {
-		s := &m.slots[i]
+		s := &slots[i&mask]
 		if s.packed == 0 {
 			s.lo = lo
 			s.hi = hi
@@ -159,30 +165,45 @@ func (m *simpleRelationMap) slot(key uint64) *simpleRelationSlot {
 		if s.lo == lo && s.hi == hi {
 			return s
 		}
-		i = (i + 1) & mask
+		i++
 	}
 }
 
-func (m *simpleRelationMap) grow() {
+func (m *simpleRelationMap) grow(p *packedRelationCache) {
 	old := m.slots
+	oldShift := bits.TrailingZeros32(uint32(len(old)))
 	newCap := len(old) * 2
 	m.shift--
 	if len(old) <= 16384 {
 		newCap = len(old) * 4
 		m.shift--
 	}
-	m.slots = make([]simpleRelationSlot, newCap)
+	newShift := bits.TrailingZeros32(uint32(newCap))
+	var slots []simpleRelationSlot
+	if p != nil && newShift < len(p.freeSimpleSlots) && len(p.freeSimpleSlots[newShift]) > 0 {
+		n := len(p.freeSimpleSlots[newShift]) - 1
+		slots = p.freeSimpleSlots[newShift][n]
+		p.freeSimpleSlots[newShift] = p.freeSimpleSlots[newShift][:n]
+	} else {
+		slots = make([]simpleRelationSlot, newCap)
+	}
+	m.slots = slots
 	mask := uint32(newCap - 1)
-	for _, s := range old {
+	shift := m.shift
+	for idx := range old {
+		s := old[idx]
 		if s.packed == 0 {
 			continue
 		}
-		key := uint64(s.hi)<<32 | uint64(s.lo)
-		i := uint32((key * 0x9e3779b97f4a7c15) >> m.shift)
-		for m.slots[i].packed != 0 {
-			i = (i + 1) & mask
+		old[idx].packed = 0
+		i := uint32((uint64(s.lo)*0x9e3779b97f4a7c15 ^ uint64(s.hi)*0xbf58476d1ce4e5b9) >> shift)
+		for slots[i&mask].packed != 0 {
+			i++
 		}
-		m.slots[i] = s
+		slots[i&mask] = s
+	}
+	if p != nil && oldShift < len(p.freeSimpleSlots) {
+		p.freeSimpleSlots[oldShift] = append(p.freeSimpleSlots[oldShift], old)
 	}
 }
 
@@ -268,9 +289,10 @@ func (m *genericRelationMap) grow() {
 }
 
 type packedRelationCache struct {
-	genericResults genericRelationMap
-	simpleResults  [4]simpleRelationMap
-	counts         [packedRelationCount]int
+	genericResults  genericRelationMap
+	simpleResults   [4]simpleRelationMap
+	freeSimpleSlots [24][][]simpleRelationSlot
+	counts          [packedRelationCount]int
 }
 
 type relationKey struct {
@@ -367,7 +389,7 @@ func (r *Relation) set(key relationKey, result RelationComparisonResult) Relatio
 		}
 		slot.packed = slot.packed&^mask | shiftedResult
 	} else {
-		slot := r.packedResults.simpleResults[key.value.Hi].slot(key.value.Lo)
+		slot := r.packedResults.simpleResults[key.value.Hi].slot(r.packedResults, key.value.Lo)
 		if slot.packed&mask == 0 {
 			r.packedResults.counts[r.packedShift/packedRelationResultBits]++
 		}
@@ -965,29 +987,38 @@ func (c *Checker) elaborateArrowFunction(node *ast.Node, source *Type, target *T
 // A type is 'weak' if it is an object type with at least one optional property
 // and no required properties, call/construct signatures or index signatures
 func (c *Checker) isWeakType(t *Type) bool {
+	if t.cacheFlags&typeCacheIsWeakComputed != 0 {
+		return t.cacheFlags&typeCacheIsWeak != 0
+	}
 	if t.flags&TypeFlagsObject != 0 {
 		if len(c.getSignaturesOfStructuredType(t, SignatureKindCall)) != 0 ||
 			len(c.getSignaturesOfStructuredType(t, SignatureKindConstruct)) != 0 ||
 			len(c.getIndexInfosOfStructuredType(t)) != 0 {
+			t.cacheFlags |= typeCacheIsWeakComputed
 			return false
 		}
 		hasProperty := false
-		return c.everyPropertyOfStructuredType(t, func(p *ast.Symbol) bool {
+		res := c.everyPropertyOfStructuredType(t, func(p *ast.Symbol) bool {
 			hasProperty = true
 			return p.Flags()&ast.SymbolFlagsOptional != 0
 		}) && hasProperty
+		t.cacheFlags |= typeCacheIsWeakComputed | core.IfElse(res, typeCacheIsWeak, 0)
+		return res
 	}
 	if t.flags&TypeFlagsSubstitution != 0 {
 		return c.isWeakType(t.AsSubstitutionType().baseType)
 	}
 	if t.flags&TypeFlagsIntersection != 0 {
-		return core.Every(t.Types(), c.isWeakType)
+		res := core.Every(t.Types(), c.isWeakType)
+		t.cacheFlags |= typeCacheIsWeakComputed | core.IfElse(res, typeCacheIsWeak, 0)
+		return res
 	}
 	return false
 }
 
 func (c *Checker) hasCommonProperties(source *Type, target *Type, isComparingJsxAttributes bool) bool {
-	for _, prop := range c.getPropertiesOfType(source) {
+	props, _ := c.getPropertiesOfTypeLazily(source)
+	for _, prop := range props {
 		if c.isKnownProperty(target, prop.Name(), isComparingJsxAttributes) {
 			return true
 		}
@@ -1095,7 +1126,13 @@ func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxD
 			count := 0
 			lastTypeId := TypeId(0)
 			for i := range stack {
+				if count+(len(stack)-i) < maxDepth {
+					return false
+				}
 				e := &stack[i]
+				if e.t.id < lastTypeId {
+					continue
+				}
 				if e.target == nil {
 					e.target = getRecursionIdentityTarget(e.t)
 					if e.target.flags&TypeFlagsIntersection == 0 {
@@ -1109,11 +1146,9 @@ func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxD
 					matches = e.identity == identity
 				}
 				if matches {
-					if e.t.id >= lastTypeId {
-						count++
-						if count >= maxDepth {
-							return true
-						}
+					count++
+					if count >= maxDepth {
+						return true
 					}
 					lastTypeId = e.t.id
 				}
@@ -1136,15 +1171,19 @@ func (c *Checker) isDeeplyNestedType(t *Type, stack []*Type, maxDepth int) bool 
 			identity := getRecursionIdentityFromTarget(target)
 			count := 0
 			lastTypeId := TypeId(0)
-			for _, t := range stack {
+			for i, t := range stack {
+				if count+(len(stack)-i) < maxDepth {
+					return false
+				}
+				// We only count occurrences with a higher type id than the previous occurrence, since higher
+				// type ids are an indicator of newer instantiations caused by recursion.
+				if t.id < lastTypeId {
+					continue
+				}
 				if hasMatchingRecursionIdentity(t, identity) {
-					// We only count occurrences with a higher type id than the previous occurrence, since higher
-					// type ids are an indicator of newer instantiations caused by recursion.
-					if t.id >= lastTypeId {
-						count++
-						if count >= maxDepth {
-							return true
-						}
+					count++
+					if count >= maxDepth {
+						return true
 					}
 					lastTypeId = t.id
 				}
@@ -4207,9 +4246,10 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 			sourceParams := source.AsConditionalType().root.inferTypeParameters
 			sourceExtends := source.AsConditionalType().extendsType
 			var mapper *TypeMapper
+			var ctx *InferenceContext
 			if len(sourceParams) != 0 {
 				// If the source has infer type parameters, we instantiate them in the context of the target
-				ctx := r.c.newInferenceContext(sourceParams, nil /*signature*/, InferenceFlagsNone, r.isRelatedToWorker)
+				ctx = r.c.newInferenceContext(sourceParams, nil /*signature*/, InferenceFlagsNone, r.isRelatedToWorker)
 				r.c.inferTypes(ctx.inferences, target.AsConditionalType().extendsType, sourceExtends, InferencePriorityNoConstraints|InferencePriorityAlwaysStrict, false)
 				sourceExtends = r.c.instantiateType(sourceExtends, ctx.mapper)
 				mapper = ctx.mapper
@@ -4220,8 +4260,14 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 					result &= r.isRelatedTo(r.c.getFalseTypeFromConditionalType(source), r.c.getFalseTypeFromConditionalType(target), RecursionFlagsBoth, reportErrors)
 				}
 				if result != TernaryFalse {
+					if ctx != nil && !ctx.escaped {
+						r.c.releaseConditionalInferenceContext(ctx, nil, nil)
+					}
 					return result
 				}
+			}
+			if ctx != nil && !ctx.escaped {
+				r.c.releaseConditionalInferenceContext(ctx, nil, nil)
 			}
 		}
 		// conditionals can be related to one another via normal constraint, as, eg, `A extends B ? O : never` should be assignable to `O`

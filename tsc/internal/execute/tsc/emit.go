@@ -52,14 +52,14 @@ func EmitAndReportStatistics(input EmitInput) (CompileAndEmitResult, *Statistics
 		return result, nil
 	}
 	result.times.totalTime = input.Sys.SinceStart()
+	if input.ResumeGC != nil && *input.ResumeGC != nil {
+		(*input.ResumeGC)()
+		*input.ResumeGC = nil
+	}
 
 	if input.Config.CompilerOptions().Diagnostics.IsTrue() || input.Config.CompilerOptions().ExtendedDiagnostics.IsTrue() {
 		var memStats runtime.MemStats
-		// GC must be called twice to allow things to settle.
-		runtime.GC()
-		runtime.GC()
 		runtime.ReadMemStats(&memStats)
-
 		statistics = statisticsFromProgram(input, &memStats)
 		statistics.Report(input.Writer, input.Testing)
 	}
@@ -91,10 +91,6 @@ func EmitFilesAndReportErrors(input EmitInput) (result CompileAndEmitResult) {
 			bindStart := input.Sys.Now()
 			diags := input.ProgramLike.GetBindDiagnostics(ctx, file)
 			result.times.bindTime = input.Sys.Now().Sub(bindStart)
-			if input.ResumeGC != nil && *input.ResumeGC != nil {
-				(*input.ResumeGC)()
-				*input.ResumeGC = nil
-			}
 			return diags
 		},
 		func(ctx context.Context, file *ast.SourceFile) []*ast.Diagnostic {

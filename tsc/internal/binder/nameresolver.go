@@ -99,7 +99,7 @@ loop:
 				result = nil
 			}
 		}
-		withinDeferredContext = withinDeferredContext || getIsDeferredContext(location, lastLocation)
+		withinDeferredContext = withinDeferredContext || (nameNotFoundMessage != nil && getIsDeferredContext(location, lastLocation))
 		switch location.Kind {
 		case ast.KindSourceFile:
 			if !ast.IsExternalOrCommonJSModule(location.AsSourceFile()) {

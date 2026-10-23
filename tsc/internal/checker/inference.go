@@ -20,6 +20,12 @@ type inferMemoEntry struct {
 	cleared bool
 }
 
+type inferenceVisitedSlot struct {
+	key    uint64
+	status InferencePriority
+	epoch  uint32
+}
+
 type InferenceState struct {
 	inferences        []*InferenceInfo
 	originalSource    *Type
@@ -31,7 +37,10 @@ type InferenceState struct {
 	clearedInferences bool
 	expandingFlags    ExpandingFlags
 	propagationType   *Type
-	visited           map[uint64]InferencePriority
+	visited           []inferenceVisitedSlot
+	visitedCount      uint32
+	visitedEpoch      uint32
+	visitedInline     [16]inferenceVisitedSlot
 	sourceStack       []relaterStackEntry
 	targetStack       []relaterStackEntry
 	next              *InferenceState
@@ -40,26 +49,107 @@ type InferenceState struct {
 func (c *Checker) getInferenceState() *InferenceState {
 	n := c.freeinferenceState
 	if n == nil {
-		n = &InferenceState{}
+		n = &InferenceState{visitedEpoch: 1}
+		n.visited = n.visitedInline[:]
+		return n
 	}
 	c.freeinferenceState = n.next
+	n.next = nil
 	return n
 }
 
 func (c *Checker) putInferenceState(n *InferenceState) {
-	if len(n.visited) > 64 {
-		n.visited = nil
-	} else if len(n.visited) != 0 {
-		clear(n.visited)
+	epoch := n.visitedEpoch
+	if n.visitedCount != 0 {
+		epoch++
+		if epoch == 0 {
+			clear(n.visited)
+			epoch = 1
+		}
 	}
-	*n = InferenceState{
-		inferences:  n.inferences[:0],
-		visited:     n.visited,
-		sourceStack: n.sourceStack[:0],
-		targetStack: n.targetStack[:0],
-		next:        c.freeinferenceState,
-	}
+	n.inferences = n.inferences[:0]
+	n.originalSource = nil
+	n.originalTarget = nil
+	n.priority = 0
+	n.inferencePriority = 0
+	n.contravariant = false
+	n.bivariant = false
+	n.clearedInferences = false
+	n.expandingFlags = 0
+	n.propagationType = nil
+	n.visitedCount = 0
+	n.visitedEpoch = epoch
+	n.sourceStack = n.sourceStack[:0]
+	n.targetStack = n.targetStack[:0]
+	n.next = c.freeinferenceState
 	c.freeinferenceState = n
+}
+
+func (n *InferenceState) lookupOrInsertVisited(key uint64) (InferencePriority, bool) {
+	slots := n.visited
+	epoch := n.visitedEpoch
+	mask := uint32(len(slots) - 1)
+	idx := uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+	for {
+		s := &slots[idx]
+		if s.epoch != epoch {
+			if (n.visitedCount+1)*4 >= uint32(len(slots))*3 {
+				n.growVisited()
+				slots = n.visited
+				epoch = n.visitedEpoch
+				mask = uint32(len(slots) - 1)
+				idx = uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+				for slots[idx].epoch == epoch {
+					idx = (idx + 1) & mask
+				}
+				s = &slots[idx]
+			}
+			s.key = key
+			s.status = InferencePriorityCircularity
+			s.epoch = epoch
+			n.visitedCount++
+			return 0, false
+		}
+		if s.key == key {
+			return s.status, true
+		}
+		idx = (idx + 1) & mask
+	}
+}
+
+func (n *InferenceState) updateVisited(key uint64, status InferencePriority) {
+	slots := n.visited
+	epoch := n.visitedEpoch
+	mask := uint32(len(slots) - 1)
+	idx := uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+	for {
+		s := &slots[idx]
+		if s.epoch == epoch && s.key == key {
+			s.status = status
+			return
+		}
+		idx = (idx + 1) & mask
+	}
+}
+
+func (n *InferenceState) growVisited() {
+	oldSlots := n.visited
+	oldEpoch := n.visitedEpoch
+	newCap := len(oldSlots) * 2
+	newSlots := make([]inferenceVisitedSlot, newCap)
+	mask := uint32(newCap - 1)
+	for i := range oldSlots {
+		s := &oldSlots[i]
+		if s.epoch == oldEpoch {
+			idx := uint32((s.key*0x9e3779b97f4a7c15)>>32) & mask
+			for newSlots[idx].epoch != 0 {
+				idx = (idx + 1) & mask
+			}
+			newSlots[idx] = inferenceVisitedSlot{key: s.key, status: s.status, epoch: 1}
+		}
+	}
+	n.visited = newSlots
+	n.visitedEpoch = 1
 }
 
 const (
@@ -476,14 +566,10 @@ func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, acti
 	}
 	flags |= uint64(n.priority) & 0x7ff
 	key := uint64(source.id) | (uint64(target.id) << 25) | (flags << 50)
-	if status, ok := n.visited[key]; ok {
+	if status, ok := n.lookupOrInsertVisited(key); ok {
 		n.inferencePriority = min(n.inferencePriority, status)
 		return
 	}
-	if n.visited == nil {
-		n.visited = make(map[uint64]InferencePriority)
-	}
-	n.visited[key] = InferencePriorityCircularity
 	saveInferencePriority := n.inferencePriority
 	n.inferencePriority = InferencePriorityMaxValue
 	// We stop inferring and report a circularity if we encounter duplicate recursion identities on both
@@ -505,7 +591,7 @@ func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, acti
 	n.targetStack = n.targetStack[:len(n.targetStack)-1]
 	n.sourceStack = n.sourceStack[:len(n.sourceStack)-1]
 	n.expandingFlags = saveExpandingFlags
-	n.visited[key] = n.inferencePriority
+	n.updateVisited(key, n.inferencePriority)
 	n.inferencePriority = min(n.inferencePriority, saveInferencePriority)
 }
 
@@ -1396,27 +1482,24 @@ func (c *Checker) createEmptyObjectTypeFromStringLiteral(t *Type) *Type {
 }
 
 func (c *Checker) newInferenceContext(typeParameters []*Type, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
-	if compareTypes == nil {
-		compareTypes = c.compareTypesAssignable
-	}
-	infos := make([]InferenceInfo, len(typeParameters))
-	inferences := make([]*InferenceInfo, len(typeParameters))
-	for i, tp := range typeParameters {
-		infos[i] = InferenceInfo{typeParameter: tp, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
-		infos[i].candidates = infos[i].candidateStorage[:0]
-		inferences[i] = &infos[i]
-	}
-	return c.newInferenceContextWorker(inferences, signature, flags, compareTypes)
+	return c.acquireInferenceContext(typeParameters, signature, flags, compareTypes)
 }
 
 func (c *Checker) acquireConditionalInferenceContext(typeParameters []*Type) *InferenceContext {
+	return c.acquireInferenceContext(typeParameters, nil, InferenceFlagsNone, c.compareTypesAssignable)
+}
+
+func (c *Checker) acquireInferenceContext(typeParameters []*Type, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
+	if compareTypes == nil {
+		compareTypes = c.compareTypesAssignable
+	}
 	var n *InferenceContext
 	if l := len(c.freeInferenceContexts); l > 0 {
 		n = c.freeInferenceContexts[l-1]
 		c.freeInferenceContexts = c.freeInferenceContexts[:l-1]
-		n.signature = nil
-		n.flags = InferenceFlagsNone
-		n.compareTypes = c.compareTypesAssignable
+		n.signature = signature
+		n.flags = flags
+		n.compareTypes = compareTypes
 		n.returnMapper = nil
 		n.outerReturnMapper = nil
 		n.inferredTypeParameters = nil
@@ -1425,7 +1508,7 @@ func (c *Checker) acquireConditionalInferenceContext(typeParameters []*Type) *In
 		n.mapper = c.initInferenceTypeMapper(&n.mapperStorage[0], n, true /*fixing*/)
 		n.nonFixingMapper = c.initInferenceTypeMapper(&n.mapperStorage[1], n, false /*fixing*/)
 	} else {
-		n = c.newInferenceContextWorker(nil, nil, InferenceFlagsNone, c.compareTypesAssignable)
+		n = c.newInferenceContextWorker(nil, signature, flags, compareTypes)
 	}
 	inferences := n.inferences[:0]
 	for _, tp := range typeParameters {
@@ -1466,6 +1549,11 @@ func (c *Checker) releaseConditionalInferenceContext(n *InferenceContext, fixing
 		n.inferences[i] = nil
 	}
 	n.inferences = n.inferences[:0]
+	n.signature = nil
+	n.returnMapper = nil
+	n.outerReturnMapper = nil
+	n.inferredTypeParameters = nil
+	n.intraExpressionInferenceSites = nil
 	c.freeInferenceContexts = append(c.freeInferenceContexts, n)
 }
 

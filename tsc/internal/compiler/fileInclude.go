@@ -30,7 +30,7 @@ type FileIncludeReason struct {
 	kind                   fileIncludeKind
 	index                  int
 	isDefaultLib           bool
-	referencedFile         *referencedFileData
+	referencedFile         referencedFileData
 	automaticTypeDirective *automaticTypeDirectiveFileData
 	canonicalSourceFile    tspath.PathKey
 }
@@ -85,9 +85,8 @@ func (r *FileIncludeReason) asLibFileIndex() (int, bool) {
 func (r *FileIncludeReason) isReferencedFile() bool {
 	return r != nil && r.kind <= fileIncludeKindLibReferenceDirective
 }
-
 func (r *FileIncludeReason) asReferencedFileData() *referencedFileData {
-	return r.referencedFile
+	return &r.referencedFile
 }
 
 func (r *FileIncludeReason) asAutomaticTypeDirectiveFileData() *automaticTypeDirectiveFileData {

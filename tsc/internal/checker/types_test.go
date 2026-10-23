@@ -262,9 +262,7 @@ func BenchmarkTypeListKey(b *testing.B) {
 func newCompositeTestChecker() (*Checker, []*Type) {
 	c := &Checker{
 		strictNullChecks:      true,
-		unionTypes:            make(map[CacheHashKey]*Type),
-		unionOfUnionTypes:     make(map[UnionOfUnionKey]*Type),
-		intersectionTypes:     make(map[CacheHashKey]*Type),
+		unionOfUnionTypes: make(map[UnionOfUnionKey]*Type),
 		subtypeReductionCache: make(map[CacheHashKey][]*Type),
 	}
 	c.compareSymbols = c.compareSymbolsWorker
@@ -622,7 +620,7 @@ func TestStructuredMembersLookup(t *testing.T) {
 		}
 		typ := c.newAnonymousType(nil, members, nil, nil, nil)
 		resolved := typ.AsStructuredType()
-		assert.Equal(t, len(resolved.properties), count)
+		assert.Equal(t, len(resolved.Properties()), count)
 		for name, symbol := range members {
 			assert.Equal(t, resolved.getMember(name), symbol)
 		}
@@ -637,7 +635,7 @@ func TestStructuredMembersLookup(t *testing.T) {
 		withReserved := c.newAnonymousType(nil, members, nil, nil, nil).AsStructuredType()
 		assert.Equal(t, withReserved.getMember(ast.InternalSymbolNameCall), members[ast.InternalSymbolNameCall])
 		for range 300 {
-			c.newMemberIndex(members, withReserved.properties, nil)
+		c.newMemberIndex(members, withReserved.Properties(), nil)
 		}
 		runtime.GC()
 		for name, symbol := range members {
@@ -740,7 +738,7 @@ func TestUnionIntersectionPropertyCacheModes(t *testing.T) {
 
 func TestCompactStructuredTypeLayout(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, unsafe.Sizeof(StructuredType{}), unsafe.Sizeof(ConstrainedType{})+5*unsafe.Sizeof(uintptr(0)))
+	assert.Equal(t, unsafe.Sizeof(StructuredType{}), unsafe.Sizeof(ConstrainedType{})+1*unsafe.Sizeof(uintptr(0)))
 }
 
 func TestStructuredTypeExtra(t *testing.T) {
