@@ -1575,7 +1575,7 @@ func (c *Checker) createNameResolver() *binder.NameResolver {
 		Globals:                          c.globals,
 		ArgumentsSymbol:                  c.argumentsSymbol,
 		RequireSymbol:                    c.requireSymbol,
-		Lookup:                           c.getSymbol,
+		LookupSymbol:                     c.resolveSymbolLookup,
 		SymbolReferenced:                 c.symbolReferenced,
 		SetRequiresScopeChangeCache:      c.setRequiresScopeChangeCache,
 		GetRequiresScopeChangeCache:      c.getRequiresScopeChangeCache,
@@ -2310,17 +2310,24 @@ func (c *Checker) addTypeOnlyDeclarationRelatedInfo(diagnostic *ast.Diagnostic, 
 
 func (c *Checker) getSymbol(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol {
 	if meaning&ast.SymbolFlagsAll != 0 {
-		symbol := c.getMergedSymbol(symbols[name])
-		if symbol != nil {
-			if symbol.Flags()&meaning != 0 {
+		if s := symbols[name]; s != nil {
+			return c.resolveSymbolLookup(s, meaning)
+		}
+	}
+	return nil
+}
+
+func (c *Checker) resolveSymbolLookup(s *ast.Symbol, meaning ast.SymbolFlags) *ast.Symbol {
+	symbol := c.getMergedSymbol(s)
+	if symbol != nil {
+		if symbol.Flags()&meaning != 0 {
+			return symbol
+		}
+		if symbol.Flags()&ast.SymbolFlagsAlias != 0 {
+			targetFlags := c.getSymbolFlags(symbol)
+			// `targetFlags` will be `SymbolFlags.All` if an error occurred in alias resolution; this avoids cascading errors
+			if targetFlags&meaning != 0 {
 				return symbol
-			}
-			if symbol.Flags()&ast.SymbolFlagsAlias != 0 {
-				targetFlags := c.getSymbolFlags(symbol)
-				// `targetFlags` will be `SymbolFlags.All` if an error occurred in alias resolution; this avoids cascading errors
-				if targetFlags&meaning != 0 {
-					return symbol
-				}
 			}
 		}
 	}
@@ -16818,10 +16825,10 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 			return nil
 		}
 		visitedSymbols = append(visitedSymbols, symbol)
-		symbols := maps.Clone(symbol.Exports())
-		// All export * declarations are collected in an __export symbol by the binder
 		exportStars := symbol.Exports()[ast.InternalSymbolNameExportStar]
+		var symbols ast.SymbolTable
 		if exportStars != nil {
+			symbols = maps.Clone(symbol.Exports())
 			decls := exportStars.Declarations()
 			if len(decls) == 1 {
 				node := decls[0]
@@ -16829,7 +16836,7 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 				exportedSymbols := visit(resolvedModule, node, isTypeOnly || node.IsTypeOnly())
 				c.extendExportSymbols(symbols, exportedSymbols, nil, nil)
 			} else if len(decls) > 1 {
-				nestedSymbols := make(ast.SymbolTable)
+				nestedSymbols := c.acquireSymbolTable()
 				var lookupTable ExportCollisionTable
 				exportedByStar := make([]ast.SymbolTable, len(decls))
 				for i, node := range decls {
@@ -16873,7 +16880,10 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 					}
 				}
 				c.extendExportSymbols(symbols, nestedSymbols, nil, nil)
+				c.releaseSymbolTable(nestedSymbols)
 			}
+		} else {
+			symbols = symbol.Exports()
 		}
 		if exportStar != nil && exportStar.IsTypeOnly() {
 			if typeOnlyExportStarMap == nil {
@@ -16899,14 +16909,17 @@ func (c *Checker) getExportsOfModuleWorker(moduleSymbol *ast.Symbol) (exports as
 	}
 	// A CommonJS module defined by an 'export=' might also export typedefs, stored on the original module
 	if originalModule != nil && len(originalModule.Exports()) > 1 {
+		var cloned bool
 		for _, symbol := range originalModule.Exports() {
 			if symbol.Name() == ast.InternalSymbolNameExportEquals || symbol.Name() == ast.InternalSymbolNameExportStar {
 				continue
 			}
 			flags := c.getSymbolFlags(symbol)
-			if flags&(ast.SymbolFlagsType|ast.SymbolFlagsNamespace) != 0 &&
-				flags&ast.SymbolFlagsValue == 0 &&
-				exports[symbol.Name()] == nil {
+			if flags&(ast.SymbolFlagsType|ast.SymbolFlagsNamespace) != 0 && !(flags&ast.SymbolFlagsValue != 0 && exports[symbol.Name()] != nil) {
+				if !cloned && moduleSymbol != nil && moduleSymbol.Exports() != nil && moduleSymbol.Exports()[ast.InternalSymbolNameExportStar] == nil {
+					exports = maps.Clone(exports)
+					cloned = true
+				}
 				exports[symbol.Name()] = symbol
 			}
 		}
@@ -20713,11 +20726,18 @@ func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters
 			members = c.instantiateSymbolTable(resolved.declaredMembers, mapper)
 		}
 	}
+	ownsMembers := instantiated && members != nil
 	if len(baseTypes) != 0 {
 		if !instantiated {
-			members = maps.Clone(members)
-		} else if members == nil {
-			members = make(ast.SymbolTable, len(properties))
+			if len(members) != 0 {
+				cloned := c.acquireSymbolTable()
+				maps.Copy(cloned, members)
+				members = cloned
+				ownsMembers = true
+			}
+		} else if members == nil && len(properties) != 0 {
+			members = c.acquireSymbolTable()
+			ownsMembers = true
 			for _, symbol := range properties {
 				members[symbol.Name()] = symbol
 			}
@@ -20729,6 +20749,15 @@ func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters
 				instantiatedBaseType = c.getTypeWithThisArgument(c.instantiateType(baseType, mapper), thisArgument, false /*needsApparentType*/)
 			}
 			members = c.addInheritedMembers(members, c.getPropertiesOfType(instantiatedBaseType))
+			if members != nil {
+				ownsMembers = true
+			}
+		}
+		for _, baseType := range baseTypes {
+			instantiatedBaseType := baseType
+			if thisArgument != nil {
+				instantiatedBaseType = c.getTypeWithThisArgument(c.instantiateType(baseType, mapper), thisArgument, false /*needsApparentType*/)
+			}
 			callSignatures = core.Concatenate(callSignatures, c.getSignaturesOfType(instantiatedBaseType, SignatureKindCall))
 			constructSignatures = core.Concatenate(constructSignatures, c.getSignaturesOfType(instantiatedBaseType, SignatureKindConstruct))
 			var inheritedIndexInfos []*IndexInfo
@@ -20743,6 +20772,9 @@ func (c *Checker) resolveObjectTypeMembers(t *Type, source *Type, typeParameters
 		}
 	}
 	c.setStructuredTypeMembers(t, members, callSignatures, constructSignatures, indexInfos)
+	if ownsMembers {
+		c.releaseSymbolTableIfUnused(t, members)
+	}
 	if instantiated && len(baseTypes) == 0 && members == nil {
 		data := t.AsStructuredType()
 		data.setMembersAndProperties(c.newPropertyIndex(properties, nil), properties)
@@ -22298,6 +22330,7 @@ func (c *Checker) resolveAnonymousTypeMembers(t *Type) {
 		constructSignatures := c.instantiateSignatures(c.getSignaturesOfType(d.target, SignatureKindConstruct), d.mapper)
 		indexInfos := c.instantiateIndexInfos(c.getIndexInfosOfType(d.target), d.mapper)
 		c.setStructuredTypeMembers(t, members, callSignatures, constructSignatures, indexInfos)
+		c.releaseSymbolTableIfUnused(t, members)
 		return
 	}
 	symbol := c.getMergedSymbol(t.symbol)
@@ -22324,13 +22357,19 @@ func (c *Checker) resolveAnonymousTypeMembers(t *Type) {
 	}
 	var baseConstructorIndexInfo *IndexInfo
 	c.setStructuredTypeMembers(t, members, nil, nil, nil)
+	ownsMembers := false
 	if symbol.Flags()&ast.SymbolFlagsClass != 0 {
 		classType := c.getDeclaredTypeOfClassOrInterface(symbol)
 		baseConstructorType := c.getBaseConstructorTypeOfClass(classType)
 		if baseConstructorType.flags&(TypeFlagsObject|TypeFlagsIntersection|TypeFlagsTypeVariable) != 0 {
-			members = maps.Clone(members)
-			c.addInheritedMembers(members, c.getPropertiesOfType(baseConstructorType))
-			c.setStructuredTypeMembers(t, members, nil, nil, nil)
+			baseProps := c.getPropertiesOfType(baseConstructorType)
+			if len(baseProps) != 0 {
+				cloned := c.acquireSymbolTable()
+				maps.Copy(cloned, members)
+				members = c.addInheritedMembers(cloned, baseProps)
+				ownsMembers = true
+				c.setStructuredTypeMembers(t, members, nil, nil, nil)
+			}
 		} else if baseConstructorType == c.anyType {
 			baseConstructorIndexInfo = c.anyBaseTypeIndexInfo
 		}
@@ -22348,10 +22387,12 @@ func (c *Checker) resolveAnonymousTypeMembers(t *Type) {
 			indexInfos = append(indexInfos, c.enumNumberIndexInfo)
 		}
 	}
+	if ownsMembers {
+		c.releaseSymbolTableIfUnused(t, members)
+	}
 	if indexInfos != nil || d.extra != nil {
 		d.ensureExtra().indexInfos = indexInfos
 	}
-	// We resolve the members before computing the signatures because a signature may use
 	// typeof with a qualified name expression that circularly references the type we are
 	// in the process of resolving (see issue #6072). The temporarily empty signature list
 	// will never be observed because a qualified name can't reference signatures.
@@ -22381,7 +22422,7 @@ func (c *Checker) createInstantiatedSymbolTable(symbols []*ast.Symbol, m *TypeMa
 	if len(symbols) == 0 {
 		return nil
 	}
-	result := make(ast.SymbolTable, len(symbols))
+	result := c.acquireSymbolTable()
 	for _, symbol := range symbols {
 		result[symbol.Name()] = c.instantiateSymbol(symbol, m)
 	}
@@ -22392,7 +22433,7 @@ func (c *Checker) instantiateSymbolTable(symbols ast.SymbolTable, m *TypeMapper)
 	if len(symbols) == 0 {
 		return nil
 	}
-	result := make(ast.SymbolTable, len(symbols))
+	result := c.acquireSymbolTable()
 	for id, symbol := range symbols {
 		if c.isNamedMember(symbol, id) {
 			result[id] = c.instantiateSymbol(symbol, m)
@@ -22581,7 +22622,7 @@ func (c *Checker) getLazyMappedTypeMember(t *Type, lazy *lazyMappedTable, name s
 			return existing, true
 		}
 	} else {
-		lazy.members = make(map[string]*ast.Symbol)
+		lazy.members = c.acquireSymbolTable()
 	}
 	// Recursive lookups see nil, as they would while resolveMappedTypeMembers runs.
 	lazy.members[name] = nil
@@ -22672,7 +22713,7 @@ func (c *Checker) appendMappedTypeIndexInfo(indexInfos []*IndexInfo, t *Type, mo
 func (c *Checker) resolveMappedTypeMembers(t *Type) {
 	lazy := t.AsMappedType().lazy
 	t.AsMappedType().lazy = nil
-	members := make(ast.SymbolTable)
+	members := c.acquireSymbolTable()
 	var indexInfos []*IndexInfo
 	// Resolve upfront such that recursive references see an empty object type.
 	c.setStructuredTypeMembers(t, nil, nil, nil, nil)
@@ -22728,6 +22769,11 @@ func (c *Checker) resolveMappedTypeMembers(t *Type) {
 		indexInfos = lazy.indexInfos
 	}
 	c.setStructuredTypeMembers(t, members, nil, nil, indexInfos)
+	c.releaseSymbolTableIfUnused(t, members)
+	if lazy != nil && lazy.members != nil {
+		c.releaseSymbolTable(lazy.members)
+		lazy.members = nil
+	}
 }
 
 func (c *Checker) getTypeOfMappedSymbol(symbol *ast.Symbol) *Type {

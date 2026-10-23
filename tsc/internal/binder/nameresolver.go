@@ -14,6 +14,7 @@ type NameResolver struct {
 	ArgumentsSymbol                  *ast.Symbol
 	RequireSymbol                    *ast.Symbol
 	Lookup                           func(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol
+	LookupSymbol                     func(symbol *ast.Symbol, meaning ast.SymbolFlags) *ast.Symbol
 	SymbolReferenced                 func(symbol *ast.Symbol, meaning ast.SymbolFlags)
 	SetRequiresScopeChangeCache      func(node *ast.Node, value core.Tristate)
 	GetRequiresScopeChangeCache      func(node *ast.Node) core.Tristate
@@ -176,23 +177,25 @@ loop:
 				}
 			}
 		case ast.KindClassDeclaration, ast.KindClassExpression, ast.KindInterfaceDeclaration:
-			result = r.lookup(r.getSymbolOfDeclaration(location).Members(), name, meaning&ast.SymbolFlagsType)
-			if result != nil {
-				if !isTypeParameterSymbolDeclaredInContainer(result, location) {
-					// ignore type parameters not declared in this container
-					result = nil
-					break
-				}
-				if lastLocation != nil && ast.IsStatic(lastLocation) {
-					// TypeScript 1.0 spec (April 2014): 3.4.1
-					// The scope of a type parameter extends over the entire declaration with which the type
-					// parameter list is associated, with the exception of static member declarations in classes.
-					if nameNotFoundMessage != nil {
-						r.error(originalLocation, diagnostics.Static_members_cannot_reference_class_type_parameters)
+			if meaning&ast.SymbolFlagsTypeParameter != 0 && (len(location.TypeParameters()) != 0 || ast.IsInJSFile(location)) {
+				result = r.lookup(r.getSymbolOfDeclaration(location).Members(), name, meaning&ast.SymbolFlagsType)
+				if result != nil {
+					if !isTypeParameterSymbolDeclaredInContainer(result, location) {
+						// ignore type parameters not declared in this container
+						result = nil
+						break
 					}
-					return nil
+					if lastLocation != nil && ast.IsStatic(lastLocation) {
+						// TypeScript 1.0 spec (April 2014): 3.4.1
+						// The scope of a type parameter extends over the entire declaration with which the type
+						// parameter list is associated, with the exception of static member declarations in classes.
+						if nameNotFoundMessage != nil {
+							r.error(originalLocation, diagnostics.Static_members_cannot_reference_class_type_parameters)
+						}
+						return nil
+					}
+					break loop
 				}
-				break loop
 			}
 			if ast.IsClassExpression(location) && meaning&ast.SymbolFlagsClass != 0 {
 				className := location.Name()
@@ -204,7 +207,7 @@ loop:
 		case ast.KindExpressionWithTypeArguments:
 			if lastLocation == location.Expression() && ast.IsHeritageClause(location.Parent) && location.Parent.AsHeritageClause().Token == ast.KindExtendsKeyword {
 				container := location.Parent.Parent
-				if ast.IsClassLike(container) {
+				if ast.IsClassLike(container) && meaning&ast.SymbolFlagsTypeParameter != 0 && (len(container.TypeParameters()) != 0 || ast.IsInJSFile(container)) {
 					result = r.lookup(r.getSymbolOfDeclaration(container).Members(), name, meaning&ast.SymbolFlagsType)
 					if result != nil {
 						if nameNotFoundMessage != nil {
@@ -223,8 +226,7 @@ loop:
 		//   }
 		case ast.KindComputedPropertyName:
 			grandparent = location.Parent.Parent
-			if ast.IsClassLike(grandparent) || ast.IsInterfaceDeclaration(grandparent) {
-				// A reference to this grandparent's type parameters would be an error
+			if (ast.IsClassLike(grandparent) || ast.IsInterfaceDeclaration(grandparent)) && meaning&ast.SymbolFlagsTypeParameter != 0 && (len(grandparent.TypeParameters()) != 0 || ast.IsInJSFile(grandparent)) {
 				result = r.lookup(r.getSymbolOfDeclaration(grandparent).Members(), name, meaning&ast.SymbolFlagsType)
 				if result != nil {
 					if nameNotFoundMessage != nil {
@@ -424,17 +426,21 @@ func (r *NameResolver) getSymbolOfDeclaration(node *ast.Node) *ast.Symbol {
 }
 
 func (r *NameResolver) lookup(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol {
+	if meaning == 0 || len(symbols) == 0 {
+		return nil
+	}
+	if r.LookupSymbol != nil {
+		if symbol := symbols[name]; symbol != nil {
+			return r.LookupSymbol(symbol, meaning)
+		}
+		return nil
+	}
 	if r.Lookup != nil {
 		return r.Lookup(symbols, name, meaning)
 	}
 	// Default implementation does not support following aliases or merged symbols
-	if meaning != 0 {
-		symbol := symbols[name]
-		if symbol != nil {
-			if symbol.Flags()&meaning != 0 {
-				return symbol
-			}
-		}
+	if symbol := symbols[name]; symbol != nil && symbol.Flags()&meaning != 0 {
+		return symbol
 	}
 	return nil
 }
