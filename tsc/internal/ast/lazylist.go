@@ -140,7 +140,7 @@ func (lazy *LazyNodeList) Force() []*Node {
 		return nil
 	}
 	if lazy.Owner != nil {
-		if sym := lazy.Owner.Symbol(); sym != nil && atomic.LoadUint32(&sym.data.lazyState) != 0 {
+		if sym := lazy.Owner.Symbol(); sym != nil && atomic.LoadUint32(&sym.owner().declHeader)&lazyStateMask != 0 {
 			sym.forceLazyMembers()
 			if lazy.state.Load() == LazyListDone {
 				return lazy.forcedNodes
@@ -171,34 +171,43 @@ func (lazy *LazyNodeList) Force() []*Node {
 }
 
 func (s *Symbol) SetHasLazyMembers() {
-	atomic.StoreUint32(&s.data.lazyState, 1)
+	owner := s.owner()
+	for {
+		old := atomic.LoadUint32(&owner.declHeader)
+		next := (old &^ lazyStateMask) | lazyStatePending
+		if atomic.CompareAndSwapUint32(&owner.declHeader, old, next) {
+			break
+		}
+	}
 }
 
 func (s *Symbol) HasLazyMembers() bool {
-	return s != nil && atomic.LoadUint32(&s.data.lazyState) == 1
+	return s != nil && atomic.LoadUint32(&s.owner().declHeader)&lazyStateMask == lazyStatePending
 }
 
 //go:noinline
 func (s *Symbol) membersSlow() SymbolTable {
 	s.forceLazyMembers()
-	if s.data.extra == nil {
+	d := s.data()
+	if d.extra == nil {
 		return nil
 	}
-	return s.data.extra.members
+	return d.extra.members
 }
 
 //go:noinline
 func (s *Symbol) exportsSlow() SymbolTable {
 	s.forceLazyMembers()
-	if s.data.extra == nil {
+	d := s.data()
+	if d.extra == nil {
 		return nil
 	}
-	return s.data.extra.exports
+	return d.extra.exports
 }
 
 //go:noinline
 func (s *Symbol) getMembersSlow(arena *SymbolExtraArena) SymbolTable {
-	if atomic.LoadUint32(&s.data.lazyState) == 1 {
+	if atomic.LoadUint32(&s.owner().declHeader)&lazyStateMask == lazyStatePending {
 		s.forceLazyMembers()
 	}
 	return GetSymbolTable(&s.ensureExtra(arena).members)
@@ -206,23 +215,32 @@ func (s *Symbol) getMembersSlow(arena *SymbolExtraArena) SymbolTable {
 
 //go:noinline
 func (s *Symbol) getExportsSlow(arena *SymbolExtraArena) SymbolTable {
-	if atomic.LoadUint32(&s.data.lazyState) == 1 {
+	if atomic.LoadUint32(&s.owner().declHeader)&lazyStateMask == lazyStatePending {
 		s.forceLazyMembers()
 	}
 	return GetSymbolTable(&s.ensureExtra(arena).exports)
 }
 
 func (s *Symbol) forceLazyMembers() {
-	if s == nil || atomic.LoadUint32(&s.data.lazyState) == 0 {
+	if s == nil {
 		return
 	}
-	mu := &lazySymbolLocks[(uintptr(unsafe.Pointer(s.data))>>6)&255]
+	owner := s.owner()
+	if atomic.LoadUint32(&owner.declHeader)&lazyStateMask == 0 {
+		return
+	}
+	mu := &lazySymbolLocks[(uintptr(unsafe.Pointer(owner))>>6)&255]
 	mu.Lock()
 	defer mu.Unlock()
-	if atomic.LoadUint32(&s.data.lazyState) != 1 {
+	if atomic.LoadUint32(&owner.declHeader)&lazyStateMask != lazyStatePending {
 		return
 	}
-	atomic.StoreUint32(&s.data.lazyState, 2)
+	for {
+		old := atomic.LoadUint32(&owner.declHeader)
+		if atomic.CompareAndSwapUint32(&owner.declHeader, old, (old&^lazyStateMask)|lazyStateActive) {
+			break
+		}
+	}
 	for _, decl := range s.Declarations() {
 		if decl == nil {
 			continue
@@ -246,5 +264,10 @@ func (s *Symbol) forceLazyMembers() {
 			}
 		}
 	}
-	atomic.StoreUint32(&s.data.lazyState, 0)
+	for {
+		old := atomic.LoadUint32(&owner.declHeader)
+		if atomic.CompareAndSwapUint32(&owner.declHeader, old, old&^lazyStateMask) {
+			break
+		}
+	}
 }

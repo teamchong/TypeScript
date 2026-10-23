@@ -108,15 +108,19 @@ func GetSymbolTable(data *SymbolTable) SymbolTable {
 }
 
 func GetMembers(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	if symbol.data.lazyState == 0 && symbol.data.extra != nil && symbol.data.extra.members != nil {
-		return symbol.data.extra.members
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.members != nil {
+		return d.extra.members
 	}
 	return symbol.getMembersSlow(arena)
 }
 
 func GetExports(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	if symbol.data.lazyState == 0 && symbol.data.extra != nil && symbol.data.extra.exports != nil {
-		return symbol.data.extra.exports
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.exports != nil {
+		return d.extra.exports
 	}
 	return symbol.getExportsSlow(arena)
 }

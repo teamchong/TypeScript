@@ -118,7 +118,7 @@ func TestSymbolTableInitialization(t *testing.T) {
 
 func TestSymbolHotRecordLayout(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, unsafe.Sizeof(ast.SymbolWithData{}), unsafe.Sizeof(ast.Symbol{})+7*unsafe.Sizeof((*ast.Node)(nil)))
+	assert.Equal(t, unsafe.Sizeof(ast.SymbolWithData{}), unsafe.Sizeof(ast.Symbol{})+5*unsafe.Sizeof((*ast.Node)(nil)))
 }
 
 func TestSymbolNilExtraFieldsDoNotAllocate(t *testing.T) { //nolint:paralleltest
@@ -130,9 +130,8 @@ func TestSymbolNilExtraFieldsDoNotAllocate(t *testing.T) { //nolint:paralleltest
 		symbol.SetExportSymbol(nil, &arena)
 	})
 	assert.Equal(t, allocs, float64(0))
-	assert.Assert(t, reflect.ValueOf(symbol).Elem().FieldByName("data").Elem().FieldByName("extra").IsNil())
+	assert.Assert(t, symbol.Members() == nil && symbol.Exports() == nil && symbol.ExportSymbol() == nil)
 }
-
 func TestSymbolSharedExtraData(t *testing.T) {
 	t.Parallel()
 	var arena ast.SymbolExtraArena
