@@ -85,11 +85,11 @@ func nextArenaSize[T any](size int) int {
 		size = min(size*2, 1024, maxSize)
 		return size
 	}
-	// Target 8 KiB (one Go page) before allocator size-class rounding, with at
+	// Target 32 KiB (four Go pages) before allocator size-class rounding, with at
 	// least one value. Small arenas start at 8 elements and double up to maxSize.
-	maxSize := max(8192/max(int(unsafe.Sizeof(*new(T))), 1), 1)
+	maxSize := max(32768/max(int(unsafe.Sizeof(*new(T))), 1), 1)
 	size = max(size, 4)
-	size = min(size*2, 256, maxSize)
+	size = min(size*2, 1024, maxSize)
 	return size
 }
 
