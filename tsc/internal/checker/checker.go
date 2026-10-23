@@ -34545,7 +34545,7 @@ func (c *Checker) getNarrowableTypeForReference(t *Type, reference *ast.Node, ch
 	// control flow analysis an opportunity to narrow it further. For example, for a reference of a type
 	// parameter type 'T extends string | undefined' with a contextual type 'string', we substitute
 	// 'string | undefined' to give control flow analysis the opportunity to narrow to type 'string'.
-	substituteConstraints := checkMode&CheckModeInferential == 0 && someType(t, c.isGenericTypeWithUnionConstraint) && (c.isConstraintPosition(t, reference) || c.hasContextualTypeWithNoGenericTypes(reference, checkMode))
+	substituteConstraints := checkMode&CheckModeInferential == 0 && c.someGenericTypeWithUnionConstraint(t) && (c.isConstraintPosition(t, reference) || c.hasContextualTypeWithNoGenericTypes(reference, checkMode))
 	if substituteConstraints {
 		c.flowMemo.taint(0)
 		return c.mapType(t, c.getBaseConstraintOrType)
@@ -34561,6 +34561,16 @@ func (c *Checker) isConstraintPosition(t *Type, node *ast.Node) bool {
 	return ast.IsPropertyAccessExpression(parent) || ast.IsQualifiedName(parent) ||
 		(ast.IsCallExpression(parent) || ast.IsNewExpression(parent)) && parent.Expression() == node ||
 		ast.IsElementAccessExpression(parent) && parent.Expression() == node && !(someType(t, c.isGenericTypeWithoutNullableConstraint) && c.isGenericIndexType(c.getTypeOfExpression(parent.AsElementAccessExpression().ArgumentExpression)))
+}
+
+func (c *Checker) someGenericTypeWithUnionConstraint(t *Type) bool {
+	if t.flags&TypeFlagsUnion != 0 {
+		if t.objectFlags&(ObjectFlagsCouldContainTypeVariablesComputed|ObjectFlagsCouldContainTypeVariables) == ObjectFlagsCouldContainTypeVariablesComputed {
+			return false
+		}
+		return core.Some(t.AsUnionType().types, c.isGenericTypeWithUnionConstraint)
+	}
+	return c.isGenericTypeWithUnionConstraint(t)
 }
 
 func (c *Checker) isGenericTypeWithUnionConstraint(t *Type) bool {

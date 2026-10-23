@@ -550,6 +550,10 @@ func (p *checkerPool) forEachCheckerGroupDo(ctx context.Context, files []*ast.So
 	p.createCheckers()
 	checkerCount := len(p.checkers)
 	if checkerCount == 1 {
+		if prev := runtime.GOMAXPROCS(0); prev > 1 {
+			runtime.GOMAXPROCS(1)
+			defer runtime.GOMAXPROCS(prev)
+		}
 		p.locks[0].Lock()
 		defer p.locks[0].Unlock()
 		current := p.checkers[0]
@@ -578,6 +582,10 @@ func (p *checkerPool) forEachCheckerGroupDo(ctx context.Context, files []*ast.So
 		return
 	}
 	if !singleThreaded && p.maxMemoryBytes == 0 {
+		if prev := runtime.GOMAXPROCS(0); prev > checkerCount {
+			runtime.GOMAXPROCS(checkerCount)
+			defer runtime.GOMAXPROCS(prev)
+		}
 		queues := make([]checkerWorkQueue, checkerCount)
 		counts := make([]int, checkerCount)
 		fileCheckers := make([]int, len(files))

@@ -118,15 +118,27 @@ type simpleRelationMap struct {
 }
 
 func (m *simpleRelationMap) get(key uint64) uint32 {
-	slots := m.slots
-	if len(slots) == 0 {
+	if len(m.slots) == 0 {
 		return 0
 	}
 	lo, hi := uint32(key), uint32(key>>32)
-	mask := uint32(len(slots) - 1)
 	i := uint32((uint64(lo)*0x9e3779b97f4a7c15 ^ uint64(hi)*0xbf58476d1ce4e5b9) >> m.shift)
+	s := &m.slots[i]
+	if s.packed == 0 {
+		return 0
+	}
+	if s.lo == lo && s.hi == hi {
+		return s.packed
+	}
+	return m.getSlow(lo, hi, i+1)
+}
+
+//go:noinline
+func (m *simpleRelationMap) getSlow(lo uint32, hi uint32, i uint32) uint32 {
+	slots := m.slots
+	mask := uint32(len(slots) - 1)
 	for {
-		s := slots[i&mask]
+		s := &slots[i&mask]
 		if s.packed == 0 {
 			return 0
 		}
@@ -513,6 +525,21 @@ func (c *Checker) isTypeRelatedTo(source *Type, target *Type, relation *Relation
 }
 
 func (c *Checker) isSimpleTypeRelatedTo(source *Type, target *Type, relation *Relation, errorReporter ErrorReporter) bool {
+	const numberMember = TypeFlagsNumberLiteral | TypeFlagsEnumLiteral
+	const stringMember = TypeFlagsStringLiteral | TypeFlagsEnumLiteral
+	s := source.flags
+	t := target.flags
+	if s == t && (s == numberMember || s == stringMember) {
+		return source.AsLiteralType().value == target.AsLiteralType().value && c.isEnumTypeRelatedTo(source.symbol, target.symbol, errorReporter)
+	}
+	if (s|t)&^TypeFlagsStructuredOrInstantiable == 0 {
+		return t&TypeFlagsUnion != 0 && (relation == c.assignableRelation || relation == c.comparableRelation) && c.isUnknownLikeUnionType(target)
+	}
+	return c.isSimpleTypeRelatedToSlow(source, target, relation, errorReporter)
+}
+
+//go:noinline
+func (c *Checker) isSimpleTypeRelatedToSlow(source *Type, target *Type, relation *Relation, errorReporter ErrorReporter) bool {
 	s := source.flags
 	t := target.flags
 	if t&TypeFlagsAny != 0 || s&TypeFlagsNever != 0 || source == c.wildcardType {
@@ -1092,6 +1119,25 @@ type relaterStackEntry struct {
 	t        *Type
 	target   *Type
 	identity RecursionId
+	bloom    uint64
+}
+
+func recursionIdBloomMask(id RecursionId) uint64 {
+	h := uint64(id) * 0x9e3779b97f4a7c15
+	return (uint64(1) << (h >> 58)) | (uint64(1) << ((h >> 52) & 63))
+}
+
+func getIntersectionRecursionBloom(t *Type) uint64 {
+	var bloom uint64
+	for _, elem := range t.Types() {
+		target := getRecursionIdentityTarget(elem)
+		if target.flags&TypeFlagsIntersection != 0 {
+			bloom |= getIntersectionRecursionBloom(target)
+		} else {
+			bloom |= recursionIdBloomMask(getRecursionIdentityFromTarget(target))
+		}
+	}
+	return bloom
 }
 
 func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxDepth int) bool {
@@ -1123,6 +1169,7 @@ func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxD
 			} else {
 				identity = getRecursionIdentityFromTarget(target)
 			}
+			idMask := recursionIdBloomMask(identity)
 			count := 0
 			lastTypeId := TypeId(0)
 			for i := range stack {
@@ -1141,7 +1188,10 @@ func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxD
 				}
 				var matches bool
 				if e.target.flags&TypeFlagsIntersection != 0 {
-					matches = hasMatchingRecursionIdentity(e.target, identity)
+					if e.bloom == 0 {
+						e.bloom = getIntersectionRecursionBloom(e.target)
+					}
+					matches = e.bloom&idMask == idMask && hasMatchingRecursionIdentity(e.target, identity)
 				} else {
 					matches = e.identity == identity
 				}
