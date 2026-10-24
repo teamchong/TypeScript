@@ -859,7 +859,7 @@ function transitiveBaseKeys(node: NodeType): Set<string> {
     return seen;
 }
 
-function generateNodeAccessorDispatch(w: CodeWriter, method: string, ret: string, hasAccessor: (node: NodeType) => boolean) {
+function generateNodeAccessorDispatch(w: CodeWriter, method: string, ret: string, field: string, deref: boolean, hasAccessor: (node: NodeType) => boolean) {
     const cases: { node: NodeType; kinds: string[]; }[] = [];
     for (const node of api.nodes()) {
         if (!hasAccessor(node)) continue;
@@ -867,45 +867,31 @@ function generateNodeAccessorDispatch(w: CodeWriter, method: string, ret: string
         if (kinds.length !== 0) cases.push({ node, kinds });
     }
 
-    // Large sparse Kind switches become comparison trees. Dense indices let Go
-    // emit jump tables; zero is reserved for kinds without the accessor.
-    const useDispatchTable = cases.length >= 8;
     const table = `node${method}Dispatch`;
-    if (useDispatchTable) {
-        if (cases.length > 255) {
-            throw new Error(`${method} dispatch exceeds the uint8 index range`);
+    w.write(`var ${table} = [kindFlowReduceLabelData + 1]uint8{`);
+    w.push();
+    for (const { node, kinds } of cases) {
+        for (const kind of kinds) {
+            w.write(`${kind}: uint8(unsafe.Offsetof(${node.name}{}.${field})),`);
         }
-        w.write(`var ${table} = [kindFlowReduceLabelData + 1]uint8{`);
-        w.push();
-        for (const [index, { kinds }] of cases.entries()) {
-            for (const kind of kinds) {
-                w.write(`${kind}: ${index + 1},`);
-            }
-        }
-        w.pop();
-        w.write("}");
-        w.write("");
     }
+    w.pop();
+    w.write("}");
+    w.write("");
 
     w.write(`func (n *Node) ${method}() ${ret} {`);
     w.push();
-    if (useDispatchTable) {
-        w.write(`switch ${table}[n.Kind] {`);
+    w.write(`if offset := ${table}[n.Kind]; offset != 0 {`);
+    w.push();
+    if (deref) {
+        w.write(`return *(*${ret})(unsafe.Add(unsafe.Pointer(n), offset))`);
     }
     else {
-        w.write("switch n.Kind {");
+        w.write(`return (${ret})(unsafe.Add(unsafe.Pointer(n), offset))`);
     }
-    for (const [index, { node, kinds }] of cases.entries()) {
-        w.write(`case ${useDispatchTable ? index + 1 : kinds.join(", ")}:`);
-        w.push();
-        w.write(`return (*${node.name})(unsafe.Pointer(n)).${method}()`);
-        w.pop();
-    }
-    w.write("default:");
-    w.push();
-    w.write("return nil");
     w.pop();
     w.write("}");
+    w.write("return nil");
     w.pop();
     w.write("}");
     w.write("");
@@ -913,7 +899,7 @@ function generateNodeAccessorDispatch(w: CodeWriter, method: string, ret: string
 
 function generateNodeAccessors(w: CodeWriter) {
     for (const { method, ret, base } of NODE_ACCESSORS) {
-        generateNodeAccessorDispatch(w, method, ret, node => transitiveBaseKeys(node).has(base));
+        generateNodeAccessorDispatch(w, method, ret, base, false, node => transitiveBaseKeys(node).has(base));
     }
 }
 
@@ -921,27 +907,13 @@ function hasMember(node: NodeType, name: string): boolean {
     return schemaMembers(node).some(member => member.name === name);
 }
 
-function generateNameDispatch(w: CodeWriter) {
-    generateNodeAccessorDispatch(w, "Name", "*DeclarationName", node => hasMember(node, "name"));
-}
-
-function generateModifiersDispatch(w: CodeWriter) {
-    generateNodeAccessorDispatch(w, "Modifiers", "*ModifierList", node => hasMember(node, "modifiers"));
-}
-
 function generateSetModifiersDispatch(w: CodeWriter) {
     w.write("func (n *MutableNode) SetModifiers(modifiers *ModifierList) {");
     w.push();
-    w.write("switch n.Kind {");
-    for (const node of api.nodes()) {
-        if (!hasMember(node, "modifiers")) continue;
-        const kinds = node.allKinds().map(kind => kind.formatGoConstant());
-        if (kinds.length === 0) continue;
-        w.write(`case ${kinds.join(", ")}:`);
-        w.push();
-        w.write(`(*${node.name})(unsafe.Pointer(n)).setModifiers(modifiers)`);
-        w.pop();
-    }
+    w.write("if offset := nodeModifiersDispatch[n.Kind]; offset != 0 {");
+    w.push();
+    w.write("*(**ModifierList)(unsafe.Add(unsafe.Pointer(n), offset)) = modifiers");
+    w.pop();
     w.write("}");
     w.pop();
     w.write("}");
@@ -1331,8 +1303,8 @@ function generate(): string {
     w.write("// Common node accessor dispatch");
     w.write("// ──────────────────────────────────────────────────────────────────────");
     w.write("");
-    generateNameDispatch(w);
-    generateModifiersDispatch(w);
+    generateNodeAccessorDispatch(w, "Name", "*DeclarationName", "name", true, node => hasMember(node, "name"));
+    generateNodeAccessorDispatch(w, "Modifiers", "*ModifierList", "modifiers", true, node => hasMember(node, "modifiers"));
     generateSetModifiersDispatch(w);
 
     // As*() casts

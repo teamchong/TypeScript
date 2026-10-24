@@ -3,31 +3,31 @@ package ast
 import (
 	"strings"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
 )
 
-// Symbol stores flags, checkFlags, and id uniquely for every symbol instance, but may share
-// symbolData with other symbols. This is done so that instantiated symbols in the checker can
-// all share the same underlying symbolData. Every Symbol needs its data field initialized either
-// through SymbolWithData.Initialize or by explicitly setting it with Symbol.SetSymbolData.
+// Symbol stores flags, checkFlags, id, and declaration header uniquely for every symbol instance.
+// Ordinary symbols are embedded at offset 0 of SymbolWithData and store their parent in parentOrData;
+// transient symbols created with SetSymbolData set checkFlagsSharedData and store their owner Symbol
+// in parentOrData.
 type Symbol struct {
-	flags      SymbolFlags
-	checkFlags CheckFlags // Non-zero only in transient symbols created by Checker
-	id         atomic.Uint64
-	data       *symbolData
+	flags        SymbolFlags
+	checkFlags   CheckFlags // Non-zero only in transient symbols created by Checker
+	id           atomic.Uint32
+	declHeader   uint32 // bits 0..14: declLen, bits 15..29: declCap, bits 30..31: lazyState
+	parentOrData *Symbol
 }
 
 // Every symbol references a symbolData structure that may be shared with other symbols.
 type symbolData struct {
 	name             string
-	declarations     []*Node
+	declPtr          *Node
 	valueDeclaration *Node
-	parent           *Symbol
 	extra            *symbolExtra
 }
-
 type symbolExtra struct {
 	members      SymbolTable
 	exports      SymbolTable
@@ -40,62 +40,186 @@ type SymbolExtraArena struct {
 	arena core.Arena[symbolExtra]
 }
 
-func (s *Symbol) Flags() SymbolFlags      { return s.flags }
-func (s *Symbol) CheckFlags() CheckFlags  { return s.checkFlags }
-func (s *Symbol) Name() string            { return s.data.name }
-func (s *Symbol) Declarations() []*Node   { return s.data.declarations }
-func (s *Symbol) ValueDeclaration() *Node { return s.data.valueDeclaration }
-func (s *Symbol) Parent() *Symbol         { return s.data.parent }
+const (
+	checkFlagsReferencedAny           CheckFlags = 1 << 28
+	checkFlagsReferencedVariable      CheckFlags = 1 << 29
+	checkFlagsReferencedTypeParameter CheckFlags = 1 << 30
+	checkFlagsSharedData              CheckFlags = 1 << 31
+	checkFlagsReferencedMask          CheckFlags = checkFlagsReferencedAny | checkFlagsReferencedVariable | checkFlagsReferencedTypeParameter
+	checkFlagsInternalMask            CheckFlags = checkFlagsReferencedMask | checkFlagsSharedData
 
-func (s *Symbol) Members() SymbolTable {
-	if s.data.extra == nil {
+	declLenCapMask   uint32 = 0x7fff
+	declCapShift     uint32 = 15
+	lazyStateShift   uint32 = 30
+	lazyStateMask    uint32 = 3 << lazyStateShift
+	lazyStatePending uint32 = 1 << lazyStateShift
+	lazyStateActive  uint32 = 2 << lazyStateShift
+)
+
+func (s *Symbol) owner() *Symbol {
+	if s.checkFlags&checkFlagsSharedData != 0 {
+		return s.parentOrData
+	}
+	return s
+}
+
+func (s *Symbol) data() *symbolData {
+	if s.checkFlags&checkFlagsSharedData != 0 {
+		return &((*SymbolWithData)(unsafe.Pointer(s.parentOrData)).d)
+	}
+	return &((*SymbolWithData)(unsafe.Pointer(s)).d)
+}
+
+func (s *Symbol) Flags() SymbolFlags { return s.flags }
+func (s *Symbol) CheckFlags() CheckFlags {
+	return CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags))) &^ checkFlagsInternalMask
+}
+
+func (s *Symbol) AddReference(meaning SymbolFlags) {
+	if s == nil {
+		return
+	}
+	flags := uint32(checkFlagsReferencedAny)
+	if meaning&SymbolFlagsVariable != 0 {
+		flags |= uint32(checkFlagsReferencedVariable)
+	}
+	if meaning&SymbolFlagsTypeParameter != 0 {
+		flags |= uint32(checkFlagsReferencedTypeParameter)
+	}
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		if old&flags == flags || atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, old|flags) {
+			break
+		}
+	}
+}
+
+func (s *Symbol) ReferenceKinds() SymbolFlags {
+	if s == nil {
+		return 0
+	}
+	cf := CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags)))
+	if cf&checkFlagsReferencedMask == 0 {
+		return 0
+	}
+	res := SymbolFlagsAll &^ (SymbolFlagsVariable | SymbolFlagsTypeParameter)
+	if cf&checkFlagsReferencedVariable != 0 {
+		res |= SymbolFlagsVariable
+	}
+	if cf&checkFlagsReferencedTypeParameter != 0 {
+		res |= SymbolFlagsTypeParameter
+	}
+	return res
+}
+func (s *Symbol) Name() string { return s.data().name }
+func (s *Symbol) Declarations() []*Node {
+	owner := s.owner()
+	hdr := owner.declHeader
+	declLen := hdr & declLenCapMask
+	if declLen == 0 {
 		return nil
 	}
-	return s.data.extra.members
+	d := &((*SymbolWithData)(unsafe.Pointer(owner)).d)
+	declCap := (hdr >> declCapShift) & declLenCapMask
+	if declCap == 0 {
+		return unsafe.Slice(&d.declPtr, 1)
+	}
+	return unsafe.Slice((**Node)(unsafe.Pointer(d.declPtr)), declCap)[:declLen]
+}
+func (s *Symbol) ValueDeclaration() *Node { return s.data().valueDeclaration }
+func (s *Symbol) Parent() *Symbol         { return s.owner().parentOrData }
+
+func (s *Symbol) Members() SymbolTable {
+	owner := s.owner()
+	if owner.declHeader&lazyStateMask != 0 {
+		return s.membersSlow()
+	}
+	d := &((*SymbolWithData)(unsafe.Pointer(owner)).d)
+	if d.extra == nil {
+		return nil
+	}
+	return d.extra.members
 }
 
 func (s *Symbol) Exports() SymbolTable {
-	if s.data.extra == nil {
+	owner := s.owner()
+	if owner.declHeader&lazyStateMask != 0 {
+		return s.exportsSlow()
+	}
+	d := &((*SymbolWithData)(unsafe.Pointer(owner)).d)
+	if d.extra == nil {
 		return nil
 	}
-	return s.data.extra.exports
+	return d.extra.exports
 }
-
 func (s *Symbol) ExportSymbol() *Symbol {
-	if s.data.extra == nil {
+	d := s.data()
+	if d.extra == nil {
 		return nil
 	}
-	return s.data.extra.exportSymbol
+	return d.extra.exportSymbol
 }
 
-func (s *Symbol) SetFlags(value SymbolFlags)      { s.flags = value }
-func (s *Symbol) SetCheckFlags(value CheckFlags)  { s.checkFlags = value }
-func (s *Symbol) SetName(value string)            { s.data.name = value }
-func (s *Symbol) SetDeclarations(value []*Node)   { s.data.declarations = value }
-func (s *Symbol) SetValueDeclaration(value *Node) { s.data.valueDeclaration = value }
-func (s *Symbol) SetParent(value *Symbol)         { s.data.parent = value }
+func (s *Symbol) SetFlags(value SymbolFlags) { s.flags = value }
+func (s *Symbol) SetCheckFlags(value CheckFlags) {
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		next := (old & uint32(checkFlagsInternalMask)) | (uint32(value) &^ uint32(checkFlagsInternalMask))
+		if atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, next) {
+			break
+		}
+	}
+}
+func (s *Symbol) SetName(value string) { s.data().name = value }
+func (s *Symbol) SetSingleDeclaration(node *Node) {
+	owner := s.owner()
+	d := &((*SymbolWithData)(unsafe.Pointer(owner)).d)
+	d.declPtr = node
+	owner.declHeader = (owner.declHeader & lazyStateMask) | 1
+}
+
+func (s *Symbol) SetDeclarations(value []*Node) {
+	owner := s.owner()
+	d := &((*SymbolWithData)(unsafe.Pointer(owner)).d)
+	lazy := owner.declHeader & lazyStateMask
+	if len(value) == 0 {
+		d.declPtr = nil
+		owner.declHeader = lazy
+		return
+	}
+	d.declPtr = (*Node)(unsafe.Pointer(unsafe.SliceData(value)))
+	declLen := uint32(len(value)) & declLenCapMask
+	declCap := uint32(max(cap(value), len(value))) & declLenCapMask
+	owner.declHeader = lazy | declLen | (declCap << declCapShift)
+}
+func (s *Symbol) SetValueDeclaration(value *Node) { s.data().valueDeclaration = value }
+func (s *Symbol) SetParent(value *Symbol)         { s.owner().parentOrData = value }
 
 func (s *Symbol) ensureExtra(arena *SymbolExtraArena) *symbolExtra {
-	if s.data.extra == nil {
-		s.data.extra = arena.arena.New()
+	d := s.data()
+	if d.extra == nil {
+		d.extra = arena.arena.New()
 	}
-	return s.data.extra
+	return d.extra
 }
 
 func (s *Symbol) SetMembers(value SymbolTable, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).members = value
 	}
 }
 
 func (s *Symbol) SetExports(value SymbolTable, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).exports = value
 	}
 }
 
 func (s *Symbol) SetExportSymbol(value *Symbol, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).exportSymbol = value
 	}
 }
@@ -108,7 +232,6 @@ type SymbolWithData struct {
 
 // Initializes a SymbolWithData instance and returns the embedded Symbol.
 func (sd *SymbolWithData) Initialize() *Symbol {
-	sd.s.data = &sd.d
 	return &sd.s
 }
 
@@ -117,11 +240,10 @@ func NewSymbol() *Symbol {
 }
 
 // Initializes a Symbol's data field with the data from another Symbol. This allows multiple
-// symbols to share the same underlying symbolData.
 func (s *Symbol) SetSymbolData(other *Symbol) {
-	s.data = other.data
+	s.parentOrData = other.owner()
+	s.checkFlags |= checkFlagsSharedData
 }
-
 // GetSourceFileOfSymbol returns the owning file of a published binder symbol, or
 // nil for a non-file-owned symbol, even if it borrows declarations from a file.
 // Ownership recovery walks only the first declaration's AST parents.

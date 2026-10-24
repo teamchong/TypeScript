@@ -1,6 +1,7 @@
 package core
 
 import (
+	"runtime"
 	"slices"
 	"unsafe"
 )
@@ -16,12 +17,24 @@ type Arena[T any] struct {
 func (a *Arena[T]) New() *T {
 	if len(a.data) == cap(a.data) {
 		nextSize := nextArenaSize[T](len(a.data))
-		// Use the same trick as slices.Concat; Grow rounds up to the next size class.
-		a.data = slices.Grow[[]T](nil, nextSize)
+		if runtime.GOARCH == "wasm" {
+			a.data = make([]T, 0, nextSize)
+		} else {
+			// Use the same trick as slices.Concat; Grow rounds up to the next size class.
+			a.data = slices.Grow[[]T](nil, nextSize)
+		}
 	}
 	index := len(a.data)
 	a.data = a.data[:index+1]
 	return &a.data[index]
+}
+
+func (a *Arena[T]) Pop(p *T) {
+	if n := len(a.data); n > 0 && &a.data[n-1] == p {
+		var zero T
+		a.data[n-1] = zero
+		a.data = a.data[:n-1]
+	}
 }
 
 // Allocate a slice of the given size in the arena. If the requested size is beyond the capacity of the arena
@@ -34,11 +47,15 @@ func (a *Arena[T]) NewSlice(size int) []T {
 	}
 	if len(a.data)+size > cap(a.data) {
 		nextSize := nextArenaSize[T](len(a.data))
-		if size > nextSize {
+		if size > nextSize || (cap(a.data)-len(a.data) >= 8 && size >= 16) {
 			return make([]T, size)
 		}
-		// Use the same trick as slices.Concat; Grow rounds up to the next size class.
-		a.data = slices.Grow[[]T](nil, nextSize)
+		if runtime.GOARCH == "wasm" {
+			a.data = make([]T, 0, nextSize)
+		} else {
+			// Use the same trick as slices.Concat; Grow rounds up to the next size class.
+			a.data = slices.Grow[[]T](nil, nextSize)
+		}
 	}
 	newLen := len(a.data) + size
 	slice := a.data[len(a.data):newLen:newLen]
@@ -62,10 +79,46 @@ func (a *Arena[T]) Clone(t []T) []T {
 }
 
 func nextArenaSize[T any](size int) int {
-	// Target 512 bytes before allocator size-class rounding, with at least one
-	// value. A surviving interior pointer retains and scans the whole chunk.
-	maxSize := max(512/max(int(unsafe.Sizeof(*new(T))), 1), 1)
-	size = max(size, 1)
-	size = min(size*2, 256, maxSize)
+	if runtime.GOARCH == "wasm" {
+		maxSize := max(4096/max(int(unsafe.Sizeof(*new(T))), 1), 1)
+		size = max(size, 8)
+		size = min(size*2, 1024, maxSize)
+		return size
+	}
+	// Target 32 KiB (four Go pages) before allocator size-class rounding, with at
+	// least one value. Small arenas start at 8 elements and double up to maxSize.
+	maxSize := max(32768/max(int(unsafe.Sizeof(*new(T))), 1), 1)
+	size = max(size, 4)
+	size = min(size*2, 1024, maxSize)
 	return size
+}
+
+// IndexedArena keeps values at stable addresses and references them with uint32
+// indexes instead of Go pointers. Index zero is nil. Unlike Arena, it retains all
+// blocks so that an index alone keeps its value reachable through the arena.
+type IndexedArena[T any] struct {
+	blocks []*[1 << indexedArenaPageShift]T
+	size   uint32
+}
+
+const indexedArenaPageShift = 6
+
+func (a *IndexedArena[T]) New() (uint32, *T) {
+	if a.size == ^uint32(0) {
+		panic("IndexedArena exhausted")
+	}
+	i := a.size
+	if int(i>>indexedArenaPageShift) >= len(a.blocks) {
+		a.blocks = append(a.blocks, new([1 << indexedArenaPageShift]T))
+	}
+	a.size = i + 1
+	return i + 1, &a.blocks[i>>indexedArenaPageShift][i&((1<<indexedArenaPageShift)-1)]
+}
+
+func (a *IndexedArena[T]) Get(index uint32) *T {
+	if index == 0 {
+		return nil
+	}
+	i := index - 1
+	return &a.blocks[i>>indexedArenaPageShift][i&((1<<indexedArenaPageShift)-1)]
 }

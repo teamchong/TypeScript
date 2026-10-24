@@ -31,6 +31,7 @@ export var NodeFlags;
     NodeFlags[NodeFlags["PossiblyContainsDeprecatedTag"] = 67108864] = "PossiblyContainsDeprecatedTag";
     NodeFlags[NodeFlags["Unreachable"] = 134217728] = "Unreachable";
     NodeFlags[NodeFlags["ReparserTransformedLiteral"] = 268435456] = "ReparserTransformedLiteral";
+    NodeFlags[NodeFlags["CondFlowClean"] = 536870912] = "CondFlowClean";
     NodeFlags[NodeFlags["BlockScoped"] = 7] = "BlockScoped";
     NodeFlags[NodeFlags["Constant"] = 6] = "Constant";
     NodeFlags[NodeFlags["AwaitUsing"] = 6] = "AwaitUsing";

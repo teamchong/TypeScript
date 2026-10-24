@@ -1,10 +1,11 @@
 package checker
 
 import (
+	"math/bits"
 	"slices"
 	"strconv"
 	"strings"
-
+	"unsafe"
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/binder"
 	"github.com/microsoft/TypeScript/tsc/internal/collections"
@@ -64,12 +65,18 @@ const (
 type RelationComparisonResult uint32
 
 const (
+	relationComparisonResultSucceededBitShift           = 0
+	relationComparisonResultFailedBitShift              = 1
+	relationComparisonResultReportsUnmeasurableBitShift = 3
+	relationComparisonResultReportsUnreliableBitShift   = 4
+	relationComparisonResultOverflowBitShift            = 5
+
 	RelationComparisonResultNone                RelationComparisonResult = 0
-	RelationComparisonResultSucceeded           RelationComparisonResult = 1 << 0
-	RelationComparisonResultFailed              RelationComparisonResult = 1 << 1
-	RelationComparisonResultReportsUnmeasurable RelationComparisonResult = 1 << 3
-	RelationComparisonResultReportsUnreliable   RelationComparisonResult = 1 << 4
-	RelationComparisonResultComplexityOverflow  RelationComparisonResult = 1 << 5
+	RelationComparisonResultSucceeded           RelationComparisonResult = 1 << relationComparisonResultSucceededBitShift
+	RelationComparisonResultFailed              RelationComparisonResult = 1 << relationComparisonResultFailedBitShift
+	RelationComparisonResultReportsUnmeasurable RelationComparisonResult = 1 << relationComparisonResultReportsUnmeasurableBitShift
+	RelationComparisonResultReportsUnreliable   RelationComparisonResult = 1 << relationComparisonResultReportsUnreliableBitShift
+	RelationComparisonResultComplexityOverflow  RelationComparisonResult = 1 << relationComparisonResultOverflowBitShift
 	RelationComparisonResultReportsMask                                  = RelationComparisonResultReportsUnmeasurable | RelationComparisonResultReportsUnreliable
 	RelationComparisonResultOverflow                                     = RelationComparisonResultComplexityOverflow
 )
@@ -86,32 +93,347 @@ type ErrorOutputContainer struct {
 
 type ErrorReporter func(message *diagnostics.Message, args ...any)
 
-type RecursionId struct {
-	value any
-}
+type RecursionId uintptr
 
 // This function exists to constrain the types of values that can be used as recursion IDs.
-func asRecursionId[T *ast.Node | *ast.Symbol | *Type](value T) RecursionId {
-	return RecursionId{value: value}
+func asRecursionId[T *Type | *ast.Symbol | *ast.Node](value T) RecursionId {
+	return RecursionId(uintptr(unsafe.Pointer(value)))
 }
 
 type Relation struct {
-	results map[CacheHashKey]RelationComparisonResult
+	packedResults *packedRelationCache
+	packedShift   uint8
 }
 
-func (r *Relation) get(key CacheHashKey) RelationComparisonResult {
-	return r.results[key]
+type simpleRelationSlot struct {
+	lo     uint32
+	hi     uint32
+	packed uint32
 }
 
-func (r *Relation) set(key CacheHashKey, result RelationComparisonResult) {
-	if r.results == nil {
-		r.results = make(map[CacheHashKey]RelationComparisonResult)
+type simpleRelationMap struct {
+	slots []simpleRelationSlot
+	count uint32
+	shift uint8
+}
+
+func (m *simpleRelationMap) get(key uint64) uint32 {
+	if len(m.slots) == 0 {
+		return 0
 	}
-	r.results[key] = result
+	lo, hi := uint32(key), uint32(key>>32)
+	i := uint32((uint64(lo)*0x9e3779b97f4a7c15 ^ uint64(hi)*0xbf58476d1ce4e5b9) >> m.shift)
+	s := &m.slots[i]
+	if s.packed == 0 {
+		return 0
+	}
+	if s.lo == lo && s.hi == hi {
+		return s.packed
+	}
+	return m.getSlow(lo, hi, i+1)
+}
+
+//go:noinline
+func (m *simpleRelationMap) getSlow(lo uint32, hi uint32, i uint32) uint32 {
+	slots := m.slots
+	mask := uint32(len(slots) - 1)
+	for {
+		s := &slots[i&mask]
+		if s.packed == 0 {
+			return 0
+		}
+		if s.lo == lo && s.hi == hi {
+			return s.packed
+		}
+		i++
+	}
+}
+
+func (m *simpleRelationMap) slot(p *packedRelationCache, key uint64) *simpleRelationSlot {
+	if len(m.slots) == 0 {
+		if p != nil && len(p.freeSimpleSlots[6]) > 0 {
+			n := len(p.freeSimpleSlots[6]) - 1
+			m.slots = p.freeSimpleSlots[6][n]
+			p.freeSimpleSlots[6] = p.freeSimpleSlots[6][:n]
+		} else {
+			m.slots = make([]simpleRelationSlot, 64)
+		}
+		m.shift = 64 - 6
+	} else if int(m.count+1)*4 >= len(m.slots)*3 {
+		m.grow(p)
+	}
+	slots := m.slots
+	lo, hi := uint32(key), uint32(key>>32)
+	mask := uint32(len(slots) - 1)
+	i := uint32((uint64(lo)*0x9e3779b97f4a7c15 ^ uint64(hi)*0xbf58476d1ce4e5b9) >> m.shift)
+	for {
+		s := &slots[i&mask]
+		if s.packed == 0 {
+			s.lo = lo
+			s.hi = hi
+			m.count++
+			return s
+		}
+		if s.lo == lo && s.hi == hi {
+			return s
+		}
+		i++
+	}
+}
+
+func (m *simpleRelationMap) grow(p *packedRelationCache) {
+	old := m.slots
+	oldShift := bits.TrailingZeros32(uint32(len(old)))
+	newCap := len(old) * 2
+	m.shift--
+	if len(old) <= 16384 {
+		newCap = len(old) * 4
+		m.shift--
+	}
+	newShift := bits.TrailingZeros32(uint32(newCap))
+	var slots []simpleRelationSlot
+	if p != nil && newShift < len(p.freeSimpleSlots) && len(p.freeSimpleSlots[newShift]) > 0 {
+		n := len(p.freeSimpleSlots[newShift]) - 1
+		slots = p.freeSimpleSlots[newShift][n]
+		p.freeSimpleSlots[newShift] = p.freeSimpleSlots[newShift][:n]
+	} else {
+		slots = make([]simpleRelationSlot, newCap)
+	}
+	m.slots = slots
+	mask := uint32(newCap - 1)
+	shift := m.shift
+	for idx := range old {
+		s := old[idx]
+		if s.packed == 0 {
+			continue
+		}
+		old[idx].packed = 0
+		i := uint32((uint64(s.lo)*0x9e3779b97f4a7c15 ^ uint64(s.hi)*0xbf58476d1ce4e5b9) >> shift)
+		for slots[i&mask].packed != 0 {
+			i++
+		}
+		slots[i&mask] = s
+	}
+	if p != nil && oldShift < len(p.freeSimpleSlots) {
+		p.freeSimpleSlots[oldShift] = append(p.freeSimpleSlots[oldShift], old)
+	}
+}
+
+type genericRelationSlot struct {
+	lo0    uint32
+	lo1    uint32
+	hi0    uint32
+	hi1    uint32
+	packed uint32
+}
+
+type genericRelationMap struct {
+	slots []genericRelationSlot
+	count uint32
+	shift uint8
+}
+
+func (m *genericRelationMap) get(key CacheHashKey) uint32 {
+	if len(m.slots) == 0 {
+		return 0
+	}
+	lo0, lo1 := uint32(key.Lo), uint32(key.Lo>>32)
+	hi0, hi1 := uint32(key.Hi), uint32(key.Hi>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32(key.Lo >> m.shift)
+	for {
+		s := m.slots[i]
+		if s.packed == 0 {
+			return 0
+		}
+		if s.lo0 == lo0 && s.lo1 == lo1 && s.hi0 == hi0 && s.hi1 == hi1 {
+			return s.packed
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *genericRelationMap) slot(key CacheHashKey) *genericRelationSlot {
+	if len(m.slots) == 0 {
+		m.slots = make([]genericRelationSlot, 32)
+		m.shift = 64 - 5
+	} else if int(m.count+1)*4 > len(m.slots)*3 {
+		m.grow()
+	}
+	lo0, lo1 := uint32(key.Lo), uint32(key.Lo>>32)
+	hi0, hi1 := uint32(key.Hi), uint32(key.Hi>>32)
+	mask := uint32(len(m.slots) - 1)
+	i := uint32(key.Lo >> m.shift)
+	for {
+		s := &m.slots[i]
+		if s.packed == 0 {
+			s.lo0 = lo0
+			s.lo1 = lo1
+			s.hi0 = hi0
+			s.hi1 = hi1
+			m.count++
+			return s
+		}
+		if s.lo0 == lo0 && s.lo1 == lo1 && s.hi0 == hi0 && s.hi1 == hi1 {
+			return s
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (m *genericRelationMap) grow() {
+	old := m.slots
+	newCap := len(old) * 2
+	m.slots = make([]genericRelationSlot, newCap)
+	m.shift--
+	mask := uint32(newCap - 1)
+	for _, s := range old {
+		if s.packed == 0 {
+			continue
+		}
+		lo := uint64(s.lo1)<<32 | uint64(s.lo0)
+		i := uint32(lo >> m.shift)
+		for m.slots[i].packed != 0 {
+			i = (i + 1) & mask
+		}
+		m.slots[i] = s
+	}
+}
+
+type packedRelationCache struct {
+	genericResults  genericRelationMap
+	simpleResults   [4]simpleRelationMap
+	freeSimpleSlots [24][][]simpleRelationSlot
+	counts          [packedRelationCount]int
+}
+
+type relationKey struct {
+	value   CacheHashKey
+	generic bool
+}
+
+func newRelations() (subtype *Relation, strictSubtype *Relation, assignable *Relation, comparableRelation *Relation, identity *Relation) {
+	packedResults := &packedRelationCache{}
+	identity = newRelation(packedResults, 0)
+	strictSubtype = newRelation(packedResults, 6)
+	subtype = newRelation(packedResults, 12)
+	assignable = newRelation(packedResults, 18)
+	comparableRelation = newRelation(packedResults, 24)
+	return subtype, strictSubtype, assignable, comparableRelation, identity
+}
+
+func newRelation(packedResults *packedRelationCache, packedShift uint8) *Relation {
+	return &Relation{packedResults: packedResults, packedShift: packedShift}
+}
+
+func (r *Relation) getPacked(key relationKey) uint32 {
+	if r.packedResults == nil {
+		return 0
+	}
+	if key.generic {
+		return r.packedResults.genericResults.get(key.value)
+	}
+	return r.packedResults.simpleResults[key.value.Hi].get(key.value.Lo)
+}
+
+func (r *Relation) get(key relationKey) RelationComparisonResult {
+	if r.packedResults == nil {
+		return RelationComparisonResultNone
+	}
+	if key.generic {
+		s := r.packedResults.genericResults.get(key.value)
+		if s == 0 {
+			return RelationComparisonResultNone
+		}
+		result := RelationComparisonResult(s>>r.packedShift) & relationComparisonResultMask
+		if result != RelationComparisonResultNone {
+			return result
+		}
+		return r.deriveAndSetPacked(key, s)
+	}
+	s := r.packedResults.simpleResults[key.value.Hi].get(key.value.Lo)
+	if s == 0 {
+		return RelationComparisonResultNone
+	}
+	result := RelationComparisonResult(s>>r.packedShift) & relationComparisonResultMask
+	if result != RelationComparisonResultNone {
+		return result
+	}
+	return r.deriveAndSetPacked(key, s)
+}
+
+func (r *Relation) deriveAndSetPacked(key relationKey, packed uint32) RelationComparisonResult {
+	// A failure in a laxer relation implies failure in this relation. Align each
+	// slot's failure and overflow bits with its respective slot marker, then keep
+	// failures that did not result from an overflow. The mask excludes this and
+	// all stricter relations.
+	laxerSlots := packedRelationSlotMask &^ (uint32(1)<<(r.packedShift+packedRelationResultBits) - 1)
+	if failedSlots := ((packed >> relationComparisonResultFailedBitShift) &^ (packed >> relationComparisonResultOverflowBitShift)) & laxerSlots; failedSlots != 0 {
+		// The lowest set marker is the nearest laxer relation with a usable failure.
+		shift := bits.TrailingZeros32(failedSlots)
+		result := RelationComparisonResult(packed>>shift) & relationComparisonResultMask
+		return r.setPacked(key, packed, result)
+	}
+	// A success in a stricter relation implies success in this relation. Align
+	// each slot's success bit with its respective slot marker, then exclude this
+	// and all laxer relations.
+	stricterSlots := packedRelationSlotMask & (uint32(1)<<r.packedShift - 1)
+	if succeededSlots := (packed >> relationComparisonResultSucceededBitShift) & stricterSlots; succeededSlots != 0 {
+		// Prefer the strictest available success, matching the previous scan order.
+		shift := bits.TrailingZeros32(succeededSlots)
+		result := RelationComparisonResult(packed>>shift) & relationComparisonResultMask
+		return r.setPacked(key, packed, result)
+	}
+	return RelationComparisonResultNone
+}
+
+func (r *Relation) set(key relationKey, result RelationComparisonResult) RelationComparisonResult {
+	if r.packedResults == nil {
+		r.packedResults = &packedRelationCache{}
+	}
+	result &= relationComparisonResultMask
+	shiftedResult := uint32(result) << r.packedShift
+	mask := uint32(relationComparisonResultMask) << r.packedShift
+	if key.generic {
+		slot := r.packedResults.genericResults.slot(key.value)
+		if slot.packed&mask == 0 {
+			r.packedResults.counts[r.packedShift/packedRelationResultBits]++
+		}
+		slot.packed = slot.packed&^mask | shiftedResult
+	} else {
+		slot := r.packedResults.simpleResults[key.value.Hi].slot(r.packedResults, key.value.Lo)
+		if slot.packed&mask == 0 {
+			r.packedResults.counts[r.packedShift/packedRelationResultBits]++
+		}
+		slot.packed = slot.packed&^mask | shiftedResult
+	}
+	return result
+}
+
+const relationComparisonResultMask = RelationComparisonResultSucceeded |
+	RelationComparisonResultFailed |
+	RelationComparisonResultReportsUnmeasurable |
+	RelationComparisonResultReportsUnreliable |
+	RelationComparisonResultComplexityOverflow
+
+// Each map value contains one six-bit result slot per relation, ordered from
+// strictest to laxest: identity, strict subtype, subtype, assignable, comparable.
+const (
+	packedRelationResultBits = 6
+	packedRelationCount      = 5
+	// Marks the low bit of every slot, which is also its success bit.
+	packedRelationSlotMask = 1 | 1<<6 | 1<<12 | 1<<18 | 1<<24
+)
+
+func (r *Relation) setPacked(key relationKey, packed uint32, result RelationComparisonResult) RelationComparisonResult {
+	return r.set(key, result)
 }
 
 func (r *Relation) size() int {
-	return len(r.results)
+	if r.packedResults == nil {
+		return 0
+	}
+	return r.packedResults.counts[r.packedShift/packedRelationResultBits]
 }
 
 func (c *Checker) isTypeIdenticalTo(source *Type, target *Type) bool {
@@ -203,6 +525,21 @@ func (c *Checker) isTypeRelatedTo(source *Type, target *Type, relation *Relation
 }
 
 func (c *Checker) isSimpleTypeRelatedTo(source *Type, target *Type, relation *Relation, errorReporter ErrorReporter) bool {
+	const numberMember = TypeFlagsNumberLiteral | TypeFlagsEnumLiteral
+	const stringMember = TypeFlagsStringLiteral | TypeFlagsEnumLiteral
+	s := source.flags
+	t := target.flags
+	if s == t && (s == numberMember || s == stringMember) {
+		return source.AsLiteralType().value == target.AsLiteralType().value && c.isEnumTypeRelatedTo(source.symbol, target.symbol, errorReporter)
+	}
+	if (s|t)&^TypeFlagsStructuredOrInstantiable == 0 {
+		return t&TypeFlagsUnion != 0 && (relation == c.assignableRelation || relation == c.comparableRelation) && c.isUnknownLikeUnionType(target)
+	}
+	return c.isSimpleTypeRelatedToSlow(source, target, relation, errorReporter)
+}
+
+//go:noinline
+func (c *Checker) isSimpleTypeRelatedToSlow(source *Type, target *Type, relation *Relation, errorReporter ErrorReporter) bool {
 	s := source.flags
 	t := target.flags
 	if t&TypeFlagsAny != 0 || s&TypeFlagsNever != 0 || source == c.wildcardType {
@@ -677,23 +1014,38 @@ func (c *Checker) elaborateArrowFunction(node *ast.Node, source *Type, target *T
 // A type is 'weak' if it is an object type with at least one optional property
 // and no required properties, call/construct signatures or index signatures
 func (c *Checker) isWeakType(t *Type) bool {
+	if t.cacheFlags&typeCacheIsWeakComputed != 0 {
+		return t.cacheFlags&typeCacheIsWeak != 0
+	}
 	if t.flags&TypeFlagsObject != 0 {
-		resolved := c.resolveStructuredTypeMembers(t)
-		return len(resolved.getSignatures()) == 0 && len(resolved.getIndexInfos()) == 0 && len(resolved.properties) > 0 && core.Every(resolved.properties, func(p *ast.Symbol) bool {
+		if len(c.getSignaturesOfStructuredType(t, SignatureKindCall)) != 0 ||
+			len(c.getSignaturesOfStructuredType(t, SignatureKindConstruct)) != 0 ||
+			len(c.getIndexInfosOfStructuredType(t)) != 0 {
+			t.cacheFlags |= typeCacheIsWeakComputed
+			return false
+		}
+		hasProperty := false
+		res := c.everyPropertyOfStructuredType(t, func(p *ast.Symbol) bool {
+			hasProperty = true
 			return p.Flags()&ast.SymbolFlagsOptional != 0
-		})
+		}) && hasProperty
+		t.cacheFlags |= typeCacheIsWeakComputed | core.IfElse(res, typeCacheIsWeak, 0)
+		return res
 	}
 	if t.flags&TypeFlagsSubstitution != 0 {
 		return c.isWeakType(t.AsSubstitutionType().baseType)
 	}
 	if t.flags&TypeFlagsIntersection != 0 {
-		return core.Every(t.Types(), c.isWeakType)
+		res := core.Every(t.Types(), c.isWeakType)
+		t.cacheFlags |= typeCacheIsWeakComputed | core.IfElse(res, typeCacheIsWeak, 0)
+		return res
 	}
 	return false
 }
 
 func (c *Checker) hasCommonProperties(source *Type, target *Type, isComparingJsxAttributes bool) bool {
-	for _, prop := range c.getPropertiesOfType(source) {
+	props, _ := c.getPropertiesOfTypeLazily(source)
+	for _, prop := range props {
 		if c.isKnownProperty(target, prop.Name(), isComparingJsxAttributes) {
 			return true
 		}
@@ -763,6 +1115,99 @@ func isExcessPropertyCheckTarget(t *Type) bool {
 // It is possible, though highly unlikely, for the deeply nested check to be true in a situation where a chain of
 // instantiations is not infinitely expanding. Effectively, we will generate a false positive when two types are
 // structurally equal to at least maxDepth levels, but unequal at some level beyond that.
+type relaterStackEntry struct {
+	t        *Type
+	target   *Type
+	identity RecursionId
+	bloom    uint64
+}
+
+func recursionIdBloomMask(id RecursionId) uint64 {
+	h := uint64(id) * 0x9e3779b97f4a7c15
+	return (uint64(1) << (h >> 58)) | (uint64(1) << ((h >> 52) & 63))
+}
+
+func getIntersectionRecursionBloom(t *Type) uint64 {
+	var bloom uint64
+	for _, elem := range t.Types() {
+		target := getRecursionIdentityTarget(elem)
+		if target.flags&TypeFlagsIntersection != 0 {
+			bloom |= getIntersectionRecursionBloom(target)
+		} else {
+			bloom |= recursionIdBloomMask(getRecursionIdentityFromTarget(target))
+		}
+	}
+	return bloom
+}
+
+func (c *Checker) isDeeplyNestedOnStack(t *Type, stack []relaterStackEntry, maxDepth int) bool {
+	if len(stack) >= maxDepth {
+		var target *Type
+		topIdx := len(stack) - 1
+		if stack[topIdx].t == t {
+			target = stack[topIdx].target
+			if target == nil {
+				target = getRecursionIdentityTarget(t)
+				stack[topIdx].target = target
+				if target.flags&TypeFlagsIntersection == 0 {
+					stack[topIdx].identity = getRecursionIdentityFromTarget(target)
+				}
+			}
+		} else {
+			target = getRecursionIdentityTarget(t)
+		}
+		if target.flags&TypeFlagsIntersection != 0 {
+			for _, t := range target.Types() {
+				if c.isDeeplyNestedOnStack(t, stack, maxDepth) {
+					return true
+				}
+			}
+		} else {
+			var identity RecursionId
+			if stack[topIdx].t == t {
+				identity = stack[topIdx].identity
+			} else {
+				identity = getRecursionIdentityFromTarget(target)
+			}
+			idMask := recursionIdBloomMask(identity)
+			count := 0
+			lastTypeId := TypeId(0)
+			for i := range stack {
+				if count+(len(stack)-i) < maxDepth {
+					return false
+				}
+				e := &stack[i]
+				if e.t.id < lastTypeId {
+					continue
+				}
+				if e.target == nil {
+					e.target = getRecursionIdentityTarget(e.t)
+					if e.target.flags&TypeFlagsIntersection == 0 {
+						e.identity = getRecursionIdentityFromTarget(e.target)
+					}
+				}
+				var matches bool
+				if e.target.flags&TypeFlagsIntersection != 0 {
+					if e.bloom == 0 {
+						e.bloom = getIntersectionRecursionBloom(e.target)
+					}
+					matches = e.bloom&idMask == idMask && hasMatchingRecursionIdentity(e.target, identity)
+				} else {
+					matches = e.identity == identity
+				}
+				if matches {
+					count++
+					if count >= maxDepth {
+						return true
+					}
+					lastTypeId = e.t.id
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (c *Checker) isDeeplyNestedType(t *Type, stack []*Type, maxDepth int) bool {
 	if len(stack) >= maxDepth {
 		target := getRecursionIdentityTarget(t)
@@ -776,15 +1221,19 @@ func (c *Checker) isDeeplyNestedType(t *Type, stack []*Type, maxDepth int) bool 
 			identity := getRecursionIdentityFromTarget(target)
 			count := 0
 			lastTypeId := TypeId(0)
-			for _, t := range stack {
+			for i, t := range stack {
+				if count+(len(stack)-i) < maxDepth {
+					return false
+				}
+				// We only count occurrences with a higher type id than the previous occurrence, since higher
+				// type ids are an indicator of newer instantiations caused by recursion.
+				if t.id < lastTypeId {
+					continue
+				}
 				if hasMatchingRecursionIdentity(t, identity) {
-					// We only count occurrences with a higher type id than the previous occurrence, since higher
-					// type ids are an indicator of newer instantiations caused by recursion.
-					if t.id >= lastTypeId {
-						count++
-						if count >= maxDepth {
-							return true
-						}
+					count++
+					if count >= maxDepth {
+						return true
 					}
 					lastTypeId = t.id
 				}
@@ -975,20 +1424,47 @@ func (c *Checker) getUnmatchedProperties(source *Type, target *Type, requireOpti
 }
 
 func (c *Checker) getUnmatchedPropertiesWorker(source *Type, target *Type, requireOptionalProperties bool, matchDiscriminantProperties bool, propsOut *[]*ast.Symbol) *ast.Symbol {
-	properties := c.getPropertiesOfType(target)
+	properties, lazyType := c.getPropertiesOfTypeLazily(target)
+	resolvedSource := c.isResolvedPlainObjectType(source)
 	for _, targetProp := range properties {
 		// TODO: remove this when we support static private identifier fields and find other solutions to get privateNamesAndStaticFields test to pass
-		if isStaticPrivateIdentifierProperty(targetProp) {
-			continue
-		}
-		if requireOptionalProperties || targetProp.Flags()&ast.SymbolFlagsOptional == 0 && targetProp.CheckFlags()&ast.CheckFlagsPartial == 0 {
-			sourceProp := c.getPropertyOfType(source, targetProp.Name())
+		if (requireOptionalProperties || targetProp.Flags()&ast.SymbolFlagsOptional == 0 && targetProp.CheckFlags()&ast.CheckFlagsPartial == 0) && !isStaticPrivateIdentifierProperty(targetProp) {
+			if !matchDiscriminantProperties {
+				var hasProp bool
+				if resolvedSource {
+					hasProp = c.getResolvedPropertyOfPlainObjectType(source, targetProp.Name()) != nil
+				} else {
+					hasProp = c.hasPropertyOfType(source, targetProp.Name())
+				}
+				if !hasProp {
+					if lazyType != nil {
+						targetProp = c.getPropertyOfType(lazyType, targetProp.Name())
+					}
+					if propsOut == nil {
+						return targetProp
+					}
+					*propsOut = append(*propsOut, targetProp)
+				}
+				continue
+			}
+			var sourceProp *ast.Symbol
+			if resolvedSource {
+				sourceProp = c.getResolvedPropertyOfPlainObjectType(source, targetProp.Name())
+			} else {
+				sourceProp = c.getPropertyOfType(source, targetProp.Name())
+			}
 			if sourceProp == nil {
+				if lazyType != nil {
+					targetProp = c.getPropertyOfType(lazyType, targetProp.Name())
+				}
 				if propsOut == nil {
 					return targetProp
 				}
 				*propsOut = append(*propsOut, targetProp)
-			} else if matchDiscriminantProperties {
+			} else {
+				if lazyType != nil {
+					targetProp = c.getPropertyOfType(lazyType, targetProp.Name())
+				}
 				targetType := c.getTypeOfSymbol(targetProp)
 				if targetType.flags&TypeFlagsUnit != 0 {
 					sourceType := c.getTypeOfSymbol(sourceProp)
@@ -1105,24 +1581,38 @@ func (c *Checker) getMatchingUnionConstituentForType(unionType *Type, t *Type) *
 	return c.getConstituentTypeForKeyType(unionType, propType)
 }
 
+type unionDiscriminant struct {
+	keyPropertyName string
+	constituentMap  map[*Type]*Type
+}
+
 // Return the name of a discriminant property for which it was possible and feasible to construct a map of
 // constituent types keyed by the literal types of the property by that name in each constituent type. Return
 // an empty string if no such discriminant property exists.
 func (c *Checker) getKeyPropertyName(t *Type) string {
-	u := t.AsUnionType()
-	if u.keyPropertyName == "" {
-		u.keyPropertyName, u.constituentMap = c.computeKeyPropertyNameAndMap(t)
-	}
-	if u.keyPropertyName == ast.InternalSymbolNameMissing {
+	types := t.Types()
+	if len(types) < 10 || t.objectFlags&ObjectFlagsPrimitiveUnion != 0 {
 		return ""
 	}
-	return u.keyPropertyName
+	u := t.AsUnionType()
+	disc, ok := c.unionDiscriminants[u]
+	if !ok {
+		disc.keyPropertyName, disc.constituentMap = c.computeKeyPropertyNameAndMap(t)
+		if c.unionDiscriminants == nil {
+			c.unionDiscriminants = make(map[*UnionType]unionDiscriminant)
+		}
+		c.unionDiscriminants[u] = disc
+	}
+	if disc.keyPropertyName == ast.InternalSymbolNameMissing {
+		return ""
+	}
+	return disc.keyPropertyName
 }
 
 // Given a union type for which getKeyPropertyName returned a non-empty string, return the constituent
 // that corresponds to the given key type for that property name.
 func (c *Checker) getConstituentTypeForKeyType(t *Type, keyType *Type) *Type {
-	result := t.AsUnionType().constituentMap[c.getRegularTypeOfLiteralType(keyType)]
+	result := c.unionDiscriminants[t.AsUnionType()].constituentMap[c.getRegularTypeOfLiteralType(keyType)]
 	if result != c.unknownType {
 		return result
 	}
@@ -2366,6 +2856,7 @@ func (c *Checker) templateLiteralTypesDefinitelyUnrelated(source *TemplateLitera
 func (c *Checker) isTypeMatchedByTemplateLiteralType(source *Type, target *TemplateLiteralType, compareTypes TypeComparer) bool {
 	inferences := c.inferTypesFromTemplateLiteralType(source, target, compareTypes)
 	if inferences != nil {
+		defer c.releaseTemporaryTypeArguments(inferences)
 		for i, inference := range inferences {
 			if !c.isValidTypeForTemplateLiteralPlaceholder(inference, target.types[i], compareTypes) {
 				return false
@@ -2379,15 +2870,21 @@ func (c *Checker) isTypeMatchedByTemplateLiteralType(source *Type, target *Templ
 func (c *Checker) inferTypesFromTemplateLiteralType(source *Type, target *TemplateLiteralType, compareTypes TypeComparer) []*Type {
 	switch {
 	case source.flags&TypeFlagsStringLiteral != 0:
-		return c.inferFromLiteralPartsToTemplateLiteral([]string{getStringLiteralValue(source)}, nil, target)
+		var sourceTexts [1]string
+		sourceTexts[0] = getStringLiteralValue(source)
+		return c.inferFromLiteralPartsToTemplateLiteral(sourceTexts[:], nil, target)
 	case source.flags&TypeFlagsTemplateLiteral != 0:
 		if slices.Equal(source.AsTemplateLiteralType().texts, target.texts) {
-			return core.MapIndex(source.AsTemplateLiteralType().types, func(s *Type, i int) *Type {
+			sourceTypes := source.AsTemplateLiteralType().types
+			matches := c.getTemporaryTypeArguments(len(sourceTypes))
+			for i, s := range sourceTypes {
 				if compareTypes(c.getBaseConstraintOrType(s), c.getBaseConstraintOrType(target.types[i]), false /*partialMatch*/) != TernaryFalse {
-					return s
+					matches[i] = s
+				} else {
+					matches[i] = c.getStringLikeTypeForType(s)
 				}
-				return c.getStringLikeTypeForType(s)
-			})
+			}
+			return matches
 		}
 		return c.inferFromLiteralPartsToTemplateLiteral(source.AsTemplateLiteralType().texts, source.AsTemplateLiteralType().types, target)
 	default:
@@ -2430,7 +2927,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 	remainingEndText := sourceEndText[:len(sourceEndText)-len(targetEndText)]
 	seg := 0
 	pos := len(targetStartText)
-	var matches []*Type
+	matches := c.getTemporaryTypeArguments(lastTargetIndex)[:0]
 	getSourceText := func(index int) string {
 		if index < lastSourceIndex {
 			return sourceTexts[index]
@@ -2442,7 +2939,13 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 		if s == seg {
 			matchType = c.getStringLiteralType(stringutil.CombineSurrogatePairs(getSourceText(s)[pos:p]))
 		} else {
-			matchTexts := make([]string, s-seg+1)
+			var matchTextsBuf [8]string
+			var matchTexts []string
+			if s-seg+1 <= len(matchTextsBuf) {
+				matchTexts = matchTextsBuf[:s-seg+1]
+			} else {
+				matchTexts = make([]string, s-seg+1)
+			}
 			matchTexts[0] = sourceTexts[seg][pos:]
 			copy(matchTexts[1:], sourceTexts[seg+1:s])
 			matchTexts[s-seg] = getSourceText(s)[:p]
@@ -2465,6 +2968,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 				}
 				s++
 				if s == len(sourceTexts) {
+					c.releaseTemporaryTypeArguments(matches)
 					return nil
 				}
 				p = 0
@@ -2493,6 +2997,7 @@ func (c *Checker) inferFromLiteralPartsToTemplateLiteral(sourceTexts []string, s
 		} else if seg < lastSourceIndex {
 			addMatch(seg+1, 0)
 		} else {
+			c.releaseTemporaryTypeArguments(matches)
 			return nil
 		}
 	}
@@ -2584,10 +3089,10 @@ type Relater struct {
 	errorNode      *ast.Node
 	errorChain     *ErrorChain
 	relatedInfo    []*ast.Diagnostic
-	maybeKeys      []CacheHashKey
-	maybeKeysSet   collections.Set[CacheHashKey]
-	sourceStack    []*Type
-	targetStack    []*Type
+	maybeKeys      []relationKey
+	maybeKeysSet   collections.Set[relationKey]
+	sourceStack    []relaterStackEntry
+	targetStack    []relaterStackEntry
 	maybeCount     int
 	sourceDepth    int
 	targetDepth    int
@@ -2606,8 +3111,31 @@ func (c *Checker) getRelater() *Relater {
 	return r
 }
 
+const maybeKeysSetThreshold = 32
+
+func (r *Relater) hasMaybeKey(key relationKey) bool {
+	if len(r.maybeKeys) > maybeKeysSetThreshold {
+		return r.maybeKeysSet.Has(key)
+	}
+	return slices.Contains(r.maybeKeys, key)
+}
+
+func (r *Relater) pushMaybeKey(key relationKey) {
+	r.maybeKeys = append(r.maybeKeys, key)
+	if len(r.maybeKeys) > maybeKeysSetThreshold {
+		if len(r.maybeKeys) == maybeKeysSetThreshold+1 {
+			for _, k := range r.maybeKeys[:maybeKeysSetThreshold] {
+				r.maybeKeysSet.Add(k)
+			}
+		}
+		r.maybeKeysSet.Add(key)
+	}
+}
+
 func (c *Checker) putRelater(r *Relater) {
-	r.maybeKeysSet.Clear()
+	if len(r.maybeKeys) > maybeKeysSetThreshold {
+		r.maybeKeysSet.Clear()
+	}
 	*r = Relater{
 		c:            c,
 		maybeKeys:    r.maybeKeys[:0],
@@ -3119,7 +3647,7 @@ func (r *Relater) recursiveTypeRelatedTo(source *Type, target *Type, reportError
 		return TernaryFalse
 	}
 	// If source and target are already being compared, consider them related with assumptions
-	if r.maybeKeysSet.Has(id) {
+	if r.hasMaybeKey(id) {
 		return TernaryMaybe
 	}
 	// A constrained key indicates that we have type references that reference constrained
@@ -3127,7 +3655,7 @@ func (r *Relater) recursiveTypeRelatedTo(source *Type, target *Type, reportError
 	// were unconstrained.
 	if constrained {
 		broadestEquivalentId, _ := getRelationKey(source, target, intersectionState, r.relation == r.c.identityRelation, true /*ignoreConstraints*/)
-		if r.maybeKeysSet.Has(broadestEquivalentId) {
+		if r.hasMaybeKey(broadestEquivalentId) {
 			return TernaryMaybe
 		}
 	}
@@ -3138,18 +3666,17 @@ func (r *Relater) recursiveTypeRelatedTo(source *Type, target *Type, reportError
 		return TernaryMaybe
 	}
 	maybeStart := len(r.maybeKeys)
-	r.maybeKeys = append(r.maybeKeys, id)
-	r.maybeKeysSet.Add(id)
+	r.pushMaybeKey(id)
 	saveExpandingFlags := r.expandingFlags
 	if recursionFlags&RecursionFlagsSource != 0 {
-		r.sourceStack = append(r.sourceStack, source)
-		if r.expandingFlags&ExpandingFlagsSource == 0 && r.c.isDeeplyNestedType(source, r.sourceStack, 3) {
+		r.sourceStack = append(r.sourceStack, relaterStackEntry{t: source})
+		if r.expandingFlags&ExpandingFlagsSource == 0 && r.c.isDeeplyNestedOnStack(source, r.sourceStack, 3) {
 			r.expandingFlags |= ExpandingFlagsSource
 		}
 	}
 	if recursionFlags&RecursionFlagsTarget != 0 {
-		r.targetStack = append(r.targetStack, target)
-		if r.expandingFlags&ExpandingFlagsTarget == 0 && r.c.isDeeplyNestedType(target, r.targetStack, 3) {
+		r.targetStack = append(r.targetStack, relaterStackEntry{t: target})
+		if r.expandingFlags&ExpandingFlagsTarget == 0 && r.c.isDeeplyNestedOnStack(target, r.targetStack, 3) {
 			r.expandingFlags |= ExpandingFlagsTarget
 		}
 	}
@@ -3200,9 +3727,17 @@ func (r *Relater) recursiveTypeRelatedTo(source *Type, target *Type, reportError
 }
 
 func (r *Relater) resetMaybeStack(maybeStart int, propagatingVarianceFlags RelationComparisonResult, markAllAsSucceeded bool) {
-	for i := maybeStart; i < len(r.maybeKeys); i++ {
-		r.maybeKeysSet.Delete(r.maybeKeys[i])
-		if markAllAsSucceeded {
+	if len(r.maybeKeys) > maybeKeysSetThreshold {
+		if maybeStart <= maybeKeysSetThreshold {
+			r.maybeKeysSet.Clear()
+		} else {
+			for i := maybeStart; i < len(r.maybeKeys); i++ {
+				r.maybeKeysSet.Delete(r.maybeKeys[i])
+			}
+		}
+	}
+	if markAllAsSucceeded {
+		for i := maybeStart; i < len(r.maybeKeys); i++ {
 			r.relation.set(r.maybeKeys[i], RelationComparisonResultSucceeded|propagatingVarianceFlags)
 			r.relationCount--
 		}
@@ -3247,7 +3782,7 @@ func (r *Relater) structuredTypeRelatedTo(source *Type, target *Type, reportErro
 				sourceTypes = []*Type{source}
 			}
 			constraint := r.c.getEffectiveConstraintOfIntersection(sourceTypes, target.flags&TypeFlagsUnion != 0)
-			if constraint != nil && everyType(constraint, func(c *Type) bool { return c != source }) {
+			if constraint != nil && everyTypeNotEqual(constraint, source) {
 				// TODO: Stack errors so we get a pyramid for the "normal" comparison above, _and_ a second for this
 				result = r.isRelatedToEx(constraint, target, RecursionFlagsSource, false /*reportErrors*/, nil /*headMessage*/, intersectionState)
 			}
@@ -3284,11 +3819,62 @@ func (r *Relater) structuredTypeRelatedTo(source *Type, target *Type, reportErro
 	return result
 }
 
+func everyTypeNotEqual(t *Type, other *Type) bool {
+	if t.flags&TypeFlagsUnion != 0 {
+		for _, c := range t.Types() {
+			if c == other {
+				return false
+			}
+		}
+		return true
+	}
+	return t != other
+}
+
 func (r *Relater) isSourceIntersectionNeedingExtraCheck(source *Type, target *Type) bool {
-	return source.flags&TypeFlagsIntersection != 0 && r.c.getApparentType(source).flags&TypeFlagsStructuredType != 0 &&
-		!core.Some(source.Types(), func(t *Type) bool {
-			return t == target || t.objectFlags&ObjectFlagsNonInferrableType != 0
-		})
+	if source.flags&TypeFlagsIntersection == 0 || r.c.getApparentType(source).flags&TypeFlagsStructuredType == 0 {
+		return false
+	}
+	for _, t := range source.Types() {
+		if t == target || t.objectFlags&ObjectFlagsNonInferrableType != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Relater) relateVariances(sourceTypeArguments []*Type, targetTypeArguments []*Type, variances []VarianceFlags, reportErrors bool, intersectionState IntersectionState, saveErrorState errorState, varianceCheckFailed *bool, originalErrorChain **ErrorChain) (Ternary, bool) {
+	if result := r.typeArgumentsRelatedTo(sourceTypeArguments, targetTypeArguments, variances, reportErrors, intersectionState); result != TernaryFalse {
+		return result, true
+	}
+	for _, v := range variances {
+		if v&VarianceFlagsAllowsStructuralFallback != 0 {
+			*originalErrorChain = nil
+			r.restoreErrorState(saveErrorState)
+			return TernaryFalse, false
+		}
+	}
+	allowStructuralFallback := r.c.hasCovariantVoidArgument(targetTypeArguments, variances)
+	*varianceCheckFailed = !allowStructuralFallback
+	if len(variances) != 0 && !allowStructuralFallback {
+		if *varianceCheckFailed {
+			hasInvariant := false
+			if reportErrors {
+				for _, v := range variances {
+					if (v & VarianceFlagsVarianceMask) == VarianceFlagsInvariant {
+						hasInvariant = true
+						break
+					}
+				}
+			}
+			if !hasInvariant {
+				return TernaryFalse, true
+			}
+		}
+		*originalErrorChain = r.errorChain
+		r.restoreErrorState(saveErrorState)
+	}
+	return TernaryFalse, false
 }
 
 func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, reportErrors bool, intersectionState IntersectionState) Ternary {
@@ -3296,48 +3882,6 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 	var varianceCheckFailed bool
 	var originalErrorChain *ErrorChain
 	saveErrorState := r.getErrorState()
-	relateVariances := func(sourceTypeArguments []*Type, targetTypeArguments []*Type, variances []VarianceFlags, intersectionState IntersectionState) (Ternary, bool) {
-		if result = r.typeArgumentsRelatedTo(sourceTypeArguments, targetTypeArguments, variances, reportErrors, intersectionState); result != TernaryFalse {
-			return result, true
-		}
-		if core.Some(variances, func(v VarianceFlags) bool { return v&VarianceFlagsAllowsStructuralFallback != 0 }) {
-			// If some type parameter was `Unmeasurable` or `Unreliable`, and we couldn't pass by assuming it was identical, then we
-			// have to allow a structural fallback check
-			// We elide the variance-based error elaborations, since those might not be too helpful, since we'll potentially
-			// be assuming identity of the type parameter.
-			originalErrorChain = nil
-			r.restoreErrorState(saveErrorState)
-			return TernaryFalse, false
-		}
-		allowStructuralFallback := r.c.hasCovariantVoidArgument(targetTypeArguments, variances)
-		varianceCheckFailed = !allowStructuralFallback
-		// The type arguments did not relate appropriately, but it may be because we have no variance
-		// information (in which case typeArgumentsRelatedTo defaulted to covariance for all type
-		// arguments). It might also be the case that the target type has a 'void' type argument for
-		// a covariant type parameter that is only used in return positions within the generic type
-		// (in which case any type argument is permitted on the source side). In those cases we proceed
-		// with a structural comparison. Otherwise, we know for certain the instantiations aren't
-		// related and we can return here.
-		if len(variances) != 0 && !allowStructuralFallback {
-			// In some cases generic types that are covariant in regular type checking mode become
-			// invariant in --strictFunctionTypes mode because one or more type parameters are used in
-			// both co- and contravariant positions. In order to make it easier to diagnose *why* such
-			// types are invariant, if any of the type parameters are invariant we reset the reported
-			// errors and instead force a structural comparison (which will include elaborations that
-			// reveal the reason).
-			// We can switch on `reportErrors` here, since varianceCheckFailed guarantees we return `False`,
-			// we can return `False` early here to skip calculating the structural error message we don't need.
-			if varianceCheckFailed && !(reportErrors && core.Some(variances, func(v VarianceFlags) bool { return (v & VarianceFlagsVarianceMask) == VarianceFlagsInvariant })) {
-				return TernaryFalse, true
-			}
-			// We remember the original error information so we can restore it in case the structural
-			// comparison unexpectedly succeeds. This can happen when the structural comparison result
-			// is a Ternary.Maybe for example caused by the recursion depth limiter.
-			originalErrorChain = r.errorChain
-			r.restoreErrorState(saveErrorState)
-		}
-		return TernaryFalse, false
-	}
 	switch {
 	case r.relation == r.c.identityRelation:
 		// We've already checked that source.flags and target.flags are identical
@@ -3433,7 +3977,7 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 		nodeIsInJsFile := ast.IsInJSFile(source.alias.symbol.ValueDeclaration())
 		sourceTypes := r.c.fillMissingTypeArguments(source.alias.typeArguments, params, minParams, nodeIsInJsFile)
 		targetTypes := r.c.fillMissingTypeArguments(target.alias.typeArguments, params, minParams, nodeIsInJsFile)
-		varianceResult, ok := relateVariances(sourceTypes, targetTypes, variances, intersectionState)
+		varianceResult, ok := r.relateVariances(sourceTypes, targetTypes, variances, reportErrors, intersectionState, saveErrorState, &varianceCheckFailed, &originalErrorChain)
 		if ok {
 			return varianceResult
 		}
@@ -3573,7 +4117,7 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 	case target.flags&TypeFlagsConditional != 0:
 		// If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
 		// conditional type and bail out with a Ternary.Maybe result.
-		if r.c.isDeeplyNestedType(target, r.targetStack, 10) {
+		if r.c.isDeeplyNestedOnStack(target, r.targetStack, 10) {
 			return TernaryMaybe
 		}
 		c := target.AsConditionalType()
@@ -3754,7 +4298,7 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 	case source.flags&TypeFlagsConditional != 0:
 		// If we reach 10 levels of nesting for the same conditional type, assume it is an infinitely expanding recursive
 		// conditional type and bail out with a Ternary.Maybe result.
-		if r.c.isDeeplyNestedType(source, r.sourceStack, 10) {
+		if r.c.isDeeplyNestedOnStack(source, r.sourceStack, 10) {
 			return TernaryMaybe
 		}
 		if target.flags&TypeFlagsConditional != 0 {
@@ -3764,9 +4308,10 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 			sourceParams := source.AsConditionalType().root.inferTypeParameters
 			sourceExtends := source.AsConditionalType().extendsType
 			var mapper *TypeMapper
+			var ctx *InferenceContext
 			if len(sourceParams) != 0 {
 				// If the source has infer type parameters, we instantiate them in the context of the target
-				ctx := r.c.newInferenceContext(sourceParams, nil /*signature*/, InferenceFlagsNone, r.isRelatedToWorker)
+				ctx = r.c.newInferenceContext(sourceParams, nil /*signature*/, InferenceFlagsNone, r.isRelatedToWorker)
 				r.c.inferTypes(ctx.inferences, target.AsConditionalType().extendsType, sourceExtends, InferencePriorityNoConstraints|InferencePriorityAlwaysStrict, false)
 				sourceExtends = r.c.instantiateType(sourceExtends, ctx.mapper)
 				mapper = ctx.mapper
@@ -3777,8 +4322,14 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 					result &= r.isRelatedTo(r.c.getFalseTypeFromConditionalType(source), r.c.getFalseTypeFromConditionalType(target), RecursionFlagsBoth, reportErrors)
 				}
 				if result != TernaryFalse {
+					if ctx != nil && !ctx.escaped {
+						r.c.releaseConditionalInferenceContext(ctx, nil, nil)
+					}
 					return result
 				}
+			}
+			if ctx != nil && !ctx.escaped {
+				r.c.releaseConditionalInferenceContext(ctx, nil, nil)
 			}
 		}
 		// conditionals can be related to one another via normal constraint, as, eg, `A extends B ? O : never` should be assignable to `O`
@@ -3867,7 +4418,7 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 			if len(variances) == 0 {
 				return TernaryUnknown
 			}
-			varianceResult, ok := relateVariances(r.c.getTypeArguments(source), r.c.getTypeArguments(target), variances, intersectionState)
+			varianceResult, ok := r.relateVariances(r.c.getTypeArguments(source), r.c.getTypeArguments(target), variances, reportErrors, intersectionState, saveErrorState, &varianceCheckFailed, &originalErrorChain)
 			if ok {
 				return varianceResult
 			}
@@ -4284,12 +4835,18 @@ func (r *Relater) propertiesRelatedTo(source *Type, target *Type, reportErrors b
 	// from the target union, across all members
 	properties := r.c.getPropertiesOfType(target)
 	numericNamesOnly := isTupleType(source) && isTupleType(target)
+	resolvedSource := r.c.isResolvedPlainObjectType(source)
 	for _, targetProp := range excludeProperties(properties, excludedProperties) {
 		name := targetProp.Name()
 		if targetProp.Flags()&ast.SymbolFlagsPrototype == 0 && (!numericNamesOnly || isNumericLiteralName(name) || name == "length") && (!optionalsOnly || targetProp.Flags()&ast.SymbolFlagsOptional != 0) {
-			sourceProp := r.c.getPropertyOfType(source, name)
+			var sourceProp *ast.Symbol
+			if resolvedSource {
+				sourceProp = r.c.getResolvedPropertyOfPlainObjectType(source, name)
+			} else {
+				sourceProp = r.c.getPropertyOfType(source, name)
+			}
 			if sourceProp != nil && sourceProp != targetProp {
-				related := r.propertyRelatedTo(source, target, sourceProp, targetProp, r.c.getNonMissingTypeOfSymbol, reportErrors, intersectionState, r.relation == r.c.comparableRelation)
+				related := r.propertyRelatedTo(source, target, sourceProp, targetProp, nil, reportErrors, intersectionState, r.relation == r.c.comparableRelation)
 				if related == TernaryFalse {
 					return TernaryFalse
 				}
@@ -4300,9 +4857,16 @@ func (r *Relater) propertiesRelatedTo(source *Type, target *Type, reportErrors b
 	return result
 }
 
+func getPropertyAccessibilityFlags(s *ast.Symbol) ast.ModifierFlags {
+	if s.CheckFlags()&ast.CheckFlagsSynthetic == 0 && (s.Parent() == nil || s.Parent().Flags()&ast.SymbolFlagsClass == 0) {
+		return ast.ModifierFlagsNone
+	}
+	return getDeclarationModifierFlagsFromSymbol(s)
+}
+
 func (r *Relater) propertyRelatedTo(source *Type, target *Type, sourceProp *ast.Symbol, targetProp *ast.Symbol, getTypeOfSourceProperty func(sym *ast.Symbol) *Type, reportErrors bool, intersectionState IntersectionState, skipOptional bool) Ternary {
-	sourcePropFlags := getDeclarationModifierFlagsFromSymbol(sourceProp)
-	targetPropFlags := getDeclarationModifierFlagsFromSymbol(targetProp)
+	sourcePropFlags := getPropertyAccessibilityFlags(sourceProp)
+	targetPropFlags := getPropertyAccessibilityFlags(targetProp)
 	switch {
 	case sourcePropFlags&ast.ModifierFlagsPrivate != 0 || targetPropFlags&ast.ModifierFlagsPrivate != 0:
 		if sourceProp.ValueDeclaration() != targetProp.ValueDeclaration() {
@@ -4371,7 +4935,12 @@ func (r *Relater) isPropertySymbolTypeRelated(sourceProp *ast.Symbol, targetProp
 	if effectiveTarget.flags&core.IfElse(r.relation == r.c.strictSubtypeRelation, TypeFlagsAny, TypeFlagsAnyOrUnknown) != 0 {
 		return TernaryTrue
 	}
-	effectiveSource := getTypeOfSourceProperty(sourceProp)
+	var effectiveSource *Type
+	if getTypeOfSourceProperty != nil {
+		effectiveSource = getTypeOfSourceProperty(sourceProp)
+	} else {
+		effectiveSource = r.c.getNonMissingTypeOfSymbol(sourceProp)
+	}
 	return r.isRelatedToEx(effectiveSource, effectiveTarget, RecursionFlagsBoth, reportErrors, nil /*headMessage*/, intersectionState)
 }
 

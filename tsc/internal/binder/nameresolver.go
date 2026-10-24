@@ -14,6 +14,7 @@ type NameResolver struct {
 	ArgumentsSymbol                  *ast.Symbol
 	RequireSymbol                    *ast.Symbol
 	Lookup                           func(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol
+	LookupSymbol                     func(symbol *ast.Symbol, meaning ast.SymbolFlags) *ast.Symbol
 	SymbolReferenced                 func(symbol *ast.Symbol, meaning ast.SymbolFlags)
 	SetRequiresScopeChangeCache      func(node *ast.Node, value core.Tristate)
 	GetRequiresScopeChangeCache      func(node *ast.Node) core.Tristate
@@ -22,6 +23,53 @@ type NameResolver struct {
 	OnSuccessfullyResolvedSymbol     func(location *ast.Node, result *ast.Symbol, meaning ast.SymbolFlags, lastLocation *ast.Node, associatedDeclarationForContainingInitializerOrBindingName *ast.Node, withinDeferredContext bool)
 }
 
+
+var isActiveScopeKind = [ast.KindCount + 4]bool{
+	ast.KindForStatement:                true,
+	ast.KindForInStatement:              true,
+	ast.KindForOfStatement:              true,
+	ast.KindCaseBlock:                   true,
+	ast.KindCatchClause:                 true,
+	ast.KindBlock:                       true,
+	ast.KindFunctionDeclaration:         true,
+	ast.KindClassDeclaration:            true,
+	ast.KindClassExpression:             true,
+	ast.KindTypeAliasDeclaration:        true,
+	ast.KindJSTypeAliasDeclaration:      true,
+	ast.KindCallSignature:               true,
+	ast.KindConstructSignature:          true,
+	ast.KindConstructor:                 true,
+	ast.KindGetAccessor:                 true,
+	ast.KindSetAccessor:                 true,
+	ast.KindIndexSignature:              true,
+	ast.KindMethodSignature:             true,
+	ast.KindMethodDeclaration:           true,
+	ast.KindClassStaticBlockDeclaration: true,
+	ast.KindArrowFunction:               true,
+	ast.KindFunctionExpression:          true,
+	ast.KindConditionalType:             true,
+	ast.KindMappedType:                  true,
+	ast.KindFunctionType:                true,
+	ast.KindConstructorType:             true,
+	ast.KindJSDocSignature:              true,
+	ast.KindSourceFile:                  true,
+	ast.KindModuleDeclaration:           true,
+	ast.KindImportAttributes:            true,
+	ast.KindEnumDeclaration:             true,
+	ast.KindPropertyDeclaration:         true,
+	ast.KindInterfaceDeclaration:        true,
+	ast.KindExpressionWithTypeArguments: true,
+	ast.KindComputedPropertyName:        true,
+	ast.KindDecorator:                   true,
+	ast.KindParameter:                   true,
+	ast.KindBindingElement:              true,
+	ast.KindInferType:                   true,
+	ast.KindExportSpecifier:             true,
+	ast.KindTypeQuery:                   true,
+	ast.KindJSDocParameterTag:           true,
+	ast.KindJSDocReturnTag:              true,
+	ast.KindJSDocTemplateTag:            true,
+}
 func (r *NameResolver) Resolve(location *ast.Node, name string, meaning ast.SymbolFlags, nameNotFoundMessage *diagnostics.Message, isUse bool, excludeGlobals bool) *ast.Symbol {
 	var result *ast.Symbol
 	var lastLocation *ast.Node
@@ -39,6 +87,11 @@ loop:
 			// (it refers to the constant type of the expression instead)
 			return nil
 		}
+		if !isActiveScopeKind[location.Kind] {
+			lastLocation = location
+			location = location.Parent
+			continue
+		}
 		if ast.IsModuleOrEnumDeclaration(location) && lastLocation != nil && location.Name() == lastLocation {
 			// If lastLocation is the name of a namespace or enum, skip the parent since it will have is own locals that could
 			// conflict.
@@ -50,7 +103,7 @@ loop:
 			lastLocation == location.AsModuleDeclaration().Attributes
 		locals := location.Locals()
 		// Locals of a source file are not in scope (because they get merged into the global symbol table)
-		if locals != nil && !ast.IsGlobalSourceFile(location) {
+		if len(locals) != 0 && !ast.IsGlobalSourceFile(location) {
 			result = r.lookup(locals, name, meaning)
 			if result != nil {
 				useResult := true
@@ -99,7 +152,7 @@ loop:
 				result = nil
 			}
 		}
-		withinDeferredContext = withinDeferredContext || getIsDeferredContext(location, lastLocation)
+		withinDeferredContext = withinDeferredContext || (nameNotFoundMessage != nil && getIsDeferredContext(location, lastLocation))
 		switch location.Kind {
 		case ast.KindSourceFile:
 			if !ast.IsExternalOrCommonJSModule(location.AsSourceFile()) {
@@ -176,23 +229,25 @@ loop:
 				}
 			}
 		case ast.KindClassDeclaration, ast.KindClassExpression, ast.KindInterfaceDeclaration:
-			result = r.lookup(r.getSymbolOfDeclaration(location).Members(), name, meaning&ast.SymbolFlagsType)
-			if result != nil {
-				if !isTypeParameterSymbolDeclaredInContainer(result, location) {
-					// ignore type parameters not declared in this container
-					result = nil
-					break
-				}
-				if lastLocation != nil && ast.IsStatic(lastLocation) {
-					// TypeScript 1.0 spec (April 2014): 3.4.1
-					// The scope of a type parameter extends over the entire declaration with which the type
-					// parameter list is associated, with the exception of static member declarations in classes.
-					if nameNotFoundMessage != nil {
-						r.error(originalLocation, diagnostics.Static_members_cannot_reference_class_type_parameters)
+			if meaning&ast.SymbolFlagsTypeParameter != 0 && (len(location.TypeParameters()) != 0 || ast.IsInJSFile(location)) {
+				result = r.lookup(r.getSymbolOfDeclaration(location).Members(), name, meaning&ast.SymbolFlagsType)
+				if result != nil {
+					if !isTypeParameterSymbolDeclaredInContainer(result, location) {
+						// ignore type parameters not declared in this container
+						result = nil
+						break
 					}
-					return nil
+					if lastLocation != nil && ast.IsStatic(lastLocation) {
+						// TypeScript 1.0 spec (April 2014): 3.4.1
+						// The scope of a type parameter extends over the entire declaration with which the type
+						// parameter list is associated, with the exception of static member declarations in classes.
+						if nameNotFoundMessage != nil {
+							r.error(originalLocation, diagnostics.Static_members_cannot_reference_class_type_parameters)
+						}
+						return nil
+					}
+					break loop
 				}
-				break loop
 			}
 			if ast.IsClassExpression(location) && meaning&ast.SymbolFlagsClass != 0 {
 				className := location.Name()
@@ -204,7 +259,7 @@ loop:
 		case ast.KindExpressionWithTypeArguments:
 			if lastLocation == location.Expression() && ast.IsHeritageClause(location.Parent) && location.Parent.AsHeritageClause().Token == ast.KindExtendsKeyword {
 				container := location.Parent.Parent
-				if ast.IsClassLike(container) {
+				if ast.IsClassLike(container) && meaning&ast.SymbolFlagsTypeParameter != 0 && (len(container.TypeParameters()) != 0 || ast.IsInJSFile(container)) {
 					result = r.lookup(r.getSymbolOfDeclaration(container).Members(), name, meaning&ast.SymbolFlagsType)
 					if result != nil {
 						if nameNotFoundMessage != nil {
@@ -223,8 +278,7 @@ loop:
 		//   }
 		case ast.KindComputedPropertyName:
 			grandparent = location.Parent.Parent
-			if ast.IsClassLike(grandparent) || ast.IsInterfaceDeclaration(grandparent) {
-				// A reference to this grandparent's type parameters would be an error
+			if (ast.IsClassLike(grandparent) || ast.IsInterfaceDeclaration(grandparent)) && meaning&ast.SymbolFlagsTypeParameter != 0 && (len(grandparent.TypeParameters()) != 0 || ast.IsInJSFile(grandparent)) {
 				result = r.lookup(r.getSymbolOfDeclaration(grandparent).Members(), name, meaning&ast.SymbolFlagsType)
 				if result != nil {
 					if nameNotFoundMessage != nil {
@@ -424,17 +478,21 @@ func (r *NameResolver) getSymbolOfDeclaration(node *ast.Node) *ast.Symbol {
 }
 
 func (r *NameResolver) lookup(symbols ast.SymbolTable, name string, meaning ast.SymbolFlags) *ast.Symbol {
+	if meaning == 0 || len(symbols) == 0 {
+		return nil
+	}
+	if r.LookupSymbol != nil {
+		if symbol := symbols[name]; symbol != nil {
+			return r.LookupSymbol(symbol, meaning)
+		}
+		return nil
+	}
 	if r.Lookup != nil {
 		return r.Lookup(symbols, name, meaning)
 	}
 	// Default implementation does not support following aliases or merged symbols
-	if meaning != 0 {
-		symbol := symbols[name]
-		if symbol != nil {
-			if symbol.Flags()&meaning != 0 {
-				return symbol
-			}
-		}
+	if symbol := symbols[name]; symbol != nil && symbol.Flags()&meaning != 0 {
+		return symbol
 	}
 	return nil
 }

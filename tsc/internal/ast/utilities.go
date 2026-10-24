@@ -15,10 +15,10 @@ import (
 // Atomic ids
 
 var (
-	nextNodeId        atomic.Uint64
-	nextSymbolId      atomic.Uint64
-	nextNodeBlockId   atomic.Uint64
-	nextSymbolBlockId atomic.Uint64
+	nextNodeId        atomic.Uint32
+	nextSymbolId      atomic.Uint32
+	nextNodeBlockId   atomic.Uint32
+	nextSymbolBlockId atomic.Uint32
 )
 
 func GetNodeId(node *Node) NodeId {
@@ -45,14 +45,22 @@ func GetSymbolId(symbol *Symbol) SymbolId {
 	return SymbolId(id)
 }
 
+func PeekNodeId(node *Node) NodeId {
+	return NodeId(node.id.Load())
+}
+
+func PeekSymbolId(symbol *Symbol) SymbolId {
+	return SymbolId(symbol.id.Load())
+}
+
 const (
-	BlockIdOffset = 0x1_0000_0000_0000
+	BlockIdOffset = 0x4000_0000
 	BlockIdSize   = core.LinkPageSize
 )
 
 type NodeIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
@@ -72,8 +80,8 @@ func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
 }
 
 type SymbolIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *SymbolIdGenerator) GetSymbolId(symbol *Symbol) SymbolId {
@@ -100,11 +108,21 @@ func GetSymbolTable(data *SymbolTable) SymbolTable {
 }
 
 func GetMembers(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	return GetSymbolTable(&symbol.ensureExtra(arena).members)
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.members != nil {
+		return d.extra.members
+	}
+	return symbol.getMembersSlow(arena)
 }
 
 func GetExports(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	return GetSymbolTable(&symbol.ensureExtra(arena).exports)
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.exports != nil {
+		return d.extra.exports
+	}
+	return symbol.getExportsSlow(arena)
 }
 
 func GetLocals(container *Node) SymbolTable {
@@ -1406,17 +1424,16 @@ func IsVoidZero(node *Node) bool {
 }
 
 func IsExportsIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "exports"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "exports"
 }
 
 func IsModuleIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "module"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "module"
 }
 
 func IsThisIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "this"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "this"
 }
-
 func IsThisParameter(node *Node) bool {
 	return IsParameterDeclaration(node) && node.Name() != nil && IsThisIdentifier(node.Name())
 }
@@ -2814,30 +2831,26 @@ func nodeContainsPosition(node *Node, position int) bool {
 	return node.Kind >= KindFirstNode && node.Pos() <= position && (position < node.End() || position == node.End() && node.Kind == KindEndOfFile)
 }
 
-func findImportOrRequire(text string, start int) (index int, size int) {
-	index = max(start, 0)
-	n := len(text)
-	for index < n {
-		next := strings.IndexAny(text[index:], "ir")
-		if next < 0 {
-			break
-		}
-		index += next
-
-		var expected string
-		if text[index] == 'i' {
-			size = 6
-			expected = "import"
-		} else {
-			size = 7
-			expected = "require"
-		}
-		if index+size <= n && text[index:index+size] == expected {
-			return index, size
-		}
-		index++
+func findImportOrRequire(text string, start int, isJavaScriptFile bool) (index int, size int) {
+	start = max(start, 0)
+	if start >= len(text) {
+		return -1, 0
 	}
-
+	sub := text[start:]
+	imp := strings.Index(sub, "import")
+	if !isJavaScriptFile {
+		if imp < 0 {
+			return -1, 0
+		}
+		return start + imp, 6
+	}
+	req := strings.Index(sub, "require")
+	if imp >= 0 && (req < 0 || imp < req) {
+		return start + imp, 6
+	}
+	if req >= 0 {
+		return start + req, 7
+	}
 	return -1, 0
 }
 
@@ -2848,7 +2861,7 @@ func ForEachDynamicImportOrRequireCall(
 	cb func(node *Node, argument *Expression) bool,
 ) bool {
 	isJavaScriptFile := IsInJSFile(file.AsNode())
-	lastIndex, size := findImportOrRequire(file.Text(), 0)
+	lastIndex, size := findImportOrRequire(file.Text(), 0, isJavaScriptFile)
 	for lastIndex >= 0 {
 		node := GetNodeAtPosition(file, lastIndex, isJavaScriptFile && includeTypeSpaceImports)
 		if isJavaScriptFile && IsRequireCall(node, requireStringLiteralLikeArgument) {
@@ -2866,7 +2879,7 @@ func ForEachDynamicImportOrRequireCall(
 		}
 		// skip past import/require
 		lastIndex += size
-		lastIndex, size = findImportOrRequire(file.Text(), lastIndex)
+		lastIndex, size = findImportOrRequire(file.Text(), lastIndex, isJavaScriptFile)
 	}
 	return false
 }
