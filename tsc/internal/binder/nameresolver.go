@@ -23,6 +23,53 @@ type NameResolver struct {
 	OnSuccessfullyResolvedSymbol     func(location *ast.Node, result *ast.Symbol, meaning ast.SymbolFlags, lastLocation *ast.Node, associatedDeclarationForContainingInitializerOrBindingName *ast.Node, withinDeferredContext bool)
 }
 
+
+var isActiveScopeKind = [ast.KindCount + 4]bool{
+	ast.KindForStatement:                true,
+	ast.KindForInStatement:              true,
+	ast.KindForOfStatement:              true,
+	ast.KindCaseBlock:                   true,
+	ast.KindCatchClause:                 true,
+	ast.KindBlock:                       true,
+	ast.KindFunctionDeclaration:         true,
+	ast.KindClassDeclaration:            true,
+	ast.KindClassExpression:             true,
+	ast.KindTypeAliasDeclaration:        true,
+	ast.KindJSTypeAliasDeclaration:      true,
+	ast.KindCallSignature:               true,
+	ast.KindConstructSignature:          true,
+	ast.KindConstructor:                 true,
+	ast.KindGetAccessor:                 true,
+	ast.KindSetAccessor:                 true,
+	ast.KindIndexSignature:              true,
+	ast.KindMethodSignature:             true,
+	ast.KindMethodDeclaration:           true,
+	ast.KindClassStaticBlockDeclaration: true,
+	ast.KindArrowFunction:               true,
+	ast.KindFunctionExpression:          true,
+	ast.KindConditionalType:             true,
+	ast.KindMappedType:                  true,
+	ast.KindFunctionType:                true,
+	ast.KindConstructorType:             true,
+	ast.KindJSDocSignature:              true,
+	ast.KindSourceFile:                  true,
+	ast.KindModuleDeclaration:           true,
+	ast.KindImportAttributes:            true,
+	ast.KindEnumDeclaration:             true,
+	ast.KindPropertyDeclaration:         true,
+	ast.KindInterfaceDeclaration:        true,
+	ast.KindExpressionWithTypeArguments: true,
+	ast.KindComputedPropertyName:        true,
+	ast.KindDecorator:                   true,
+	ast.KindParameter:                   true,
+	ast.KindBindingElement:              true,
+	ast.KindInferType:                   true,
+	ast.KindExportSpecifier:             true,
+	ast.KindTypeQuery:                   true,
+	ast.KindJSDocParameterTag:           true,
+	ast.KindJSDocReturnTag:              true,
+	ast.KindJSDocTemplateTag:            true,
+}
 func (r *NameResolver) Resolve(location *ast.Node, name string, meaning ast.SymbolFlags, nameNotFoundMessage *diagnostics.Message, isUse bool, excludeGlobals bool) *ast.Symbol {
 	var result *ast.Symbol
 	var lastLocation *ast.Node
@@ -40,6 +87,11 @@ loop:
 			// (it refers to the constant type of the expression instead)
 			return nil
 		}
+		if !isActiveScopeKind[location.Kind] {
+			lastLocation = location
+			location = location.Parent
+			continue
+		}
 		if ast.IsModuleOrEnumDeclaration(location) && lastLocation != nil && location.Name() == lastLocation {
 			// If lastLocation is the name of a namespace or enum, skip the parent since it will have is own locals that could
 			// conflict.
@@ -51,7 +103,7 @@ loop:
 			lastLocation == location.AsModuleDeclaration().Attributes
 		locals := location.Locals()
 		// Locals of a source file are not in scope (because they get merged into the global symbol table)
-		if locals != nil && !ast.IsGlobalSourceFile(location) {
+		if len(locals) != 0 && !ast.IsGlobalSourceFile(location) {
 			result = r.lookup(locals, name, meaning)
 			if result != nil {
 				useResult := true

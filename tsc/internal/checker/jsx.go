@@ -712,7 +712,7 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 	if c.strictNullChecks {
 		allAttributesTable = make(ast.SymbolTable)
 	}
-	attributesTable := make(ast.SymbolTable)
+	attributesTable := c.acquireSymbolTable()
 	var attributesSymbol *ast.Symbol
 	attributeParent := openingLikeElement
 	spread := c.emptyJsxObjectType
@@ -723,6 +723,8 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 	createJsxAttributesType := func() *Type {
 		objectFlags |= ObjectFlagsFreshLiteral
 		result := c.newAnonymousType(attributesSymbol, attributesTable, nil, nil, nil)
+		c.releaseSymbolTableIfUnused(result, attributesTable)
+		attributesTable = nil
 		result.objectFlags |= objectFlags | ObjectFlagsObjectLiteral | ObjectFlagsContainsObjectOrArrayLiteral
 		return result
 	}
@@ -741,12 +743,8 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 			if ast.IsJsxAttribute(attributeDecl) {
 				exprType := c.checkJsxAttribute(attributeDecl, checkMode)
 				objectFlags |= exprType.objectFlags & ObjectFlagsPropagatingFlags
-				attributeSymbol := c.newSymbol(ast.SymbolFlagsProperty|member.Flags(), member.Name())
-				attributeSymbol.SetDeclarations(member.Declarations())
-				attributeSymbol.SetParent(member.Parent())
-				if member.ValueDeclaration() != nil {
-					attributeSymbol.SetValueDeclaration(member.ValueDeclaration())
-				}
+				attributeSymbol := c.newSharedDataSymbol(member)
+				attributeSymbol.SetFlags(attributeSymbol.Flags() | ast.SymbolFlagsProperty)
 				links := c.valueSymbolLinks.Get(attributeSymbol)
 				links.resolvedType = exprType
 				links.target = member
@@ -768,7 +766,7 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 				debug.Assert(attributeDecl.Kind == ast.KindJsxSpreadAttribute)
 				if len(attributesTable) != 0 {
 					spread = c.getSpreadType(spread, createJsxAttributesType(), attributesSymbol, objectFlags, false /*readonly*/)
-					attributesTable = make(ast.SymbolTable)
+					attributesTable = c.acquireSymbolTable()
 				}
 				exprType := c.getReducedType(c.checkExpressionEx(attributeDecl.Expression(), checkMode&CheckModeInferential))
 				if IsTypeAny(exprType) {
@@ -846,15 +844,19 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 			childrenPropSymbol.SetValueDeclaration(c.factory.NewPropertySignatureDeclaration(nil, c.factory.NewIdentifier(jsxChildrenPropertyName), nil /*postfixToken*/, nil /*type*/, nil /*initializer*/))
 			childrenPropSymbol.ValueDeclaration().Parent = attributeParent
 			childrenPropSymbol.ValueDeclaration().AsPropertySignatureDeclaration().Symbol = childrenPropSymbol
-			childPropMap := make(ast.SymbolTable)
+			childPropMap := c.acquireSymbolTable()
 			childPropMap[jsxChildrenPropertyName] = childrenPropSymbol
-			spread = c.getSpreadType(spread, c.newAnonymousType(attributesSymbol, childPropMap, nil, nil, nil), attributesSymbol, objectFlags|c.getPropagatingFlagsOfTypes(childTypes, TypeFlagsNone), false /*readonly*/)
+			childType := c.newAnonymousType(attributesSymbol, childPropMap, nil, nil, nil)
+			c.releaseSymbolTableIfUnused(childType, childPropMap)
+			spread = c.getSpreadType(spread, childType, attributesSymbol, objectFlags|c.getPropagatingFlagsOfTypes(childTypes, TypeFlagsNone), false /*readonly*/)
 		}
 	}
 	if hasSpreadAnyType {
+		c.releaseSymbolTable(attributesTable)
 		return c.anyType
 	}
 	if typeToIntersect != nil {
+		c.releaseSymbolTable(attributesTable)
 		if spread != c.emptyJsxObjectType {
 			return c.getIntersectionType([]*Type{typeToIntersect, spread})
 		}
@@ -863,6 +865,7 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 	if spread == c.emptyJsxObjectType {
 		return createJsxAttributesType()
 	}
+	c.releaseSymbolTable(attributesTable)
 	return spread
 }
 

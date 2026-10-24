@@ -1460,7 +1460,7 @@ func (c *Checker) isTypeCloselyMatchedBy(s *Type, t *Type) bool {
 
 // Create an object with properties named in the string literal type. Every property has type `any`.
 func (c *Checker) createEmptyObjectTypeFromStringLiteral(t *Type) *Type {
-	members := make(ast.SymbolTable)
+	members := c.acquireSymbolTable()
 	for _, t := range t.Distributed() {
 		if t.flags&TypeFlagsStringLiteral == 0 {
 			continue
@@ -1478,7 +1478,9 @@ func (c *Checker) createEmptyObjectTypeFromStringLiteral(t *Type) *Type {
 	if t.flags&TypeFlagsString != 0 {
 		indexInfos = []*IndexInfo{c.newIndexInfo(c.stringType, c.emptyObjectType, false /*isReadonly*/, nil, nil)}
 	}
-	return c.newAnonymousType(nil, members, nil, nil, indexInfos)
+	res := c.newAnonymousType(nil, members, nil, nil, indexInfos)
+	c.releaseSymbolTableIfUnused(res, members)
+	return res
 }
 
 func (c *Checker) newInferenceContext(typeParameters []*Type, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {

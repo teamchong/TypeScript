@@ -1425,11 +1425,18 @@ func (c *Checker) getUnmatchedProperties(source *Type, target *Type, requireOpti
 
 func (c *Checker) getUnmatchedPropertiesWorker(source *Type, target *Type, requireOptionalProperties bool, matchDiscriminantProperties bool, propsOut *[]*ast.Symbol) *ast.Symbol {
 	properties, lazyType := c.getPropertiesOfTypeLazily(target)
+	resolvedSource := c.isResolvedPlainObjectType(source)
 	for _, targetProp := range properties {
 		// TODO: remove this when we support static private identifier fields and find other solutions to get privateNamesAndStaticFields test to pass
 		if (requireOptionalProperties || targetProp.Flags()&ast.SymbolFlagsOptional == 0 && targetProp.CheckFlags()&ast.CheckFlagsPartial == 0) && !isStaticPrivateIdentifierProperty(targetProp) {
 			if !matchDiscriminantProperties {
-				if !c.hasPropertyOfType(source, targetProp.Name()) {
+				var hasProp bool
+				if resolvedSource {
+					hasProp = c.getResolvedPropertyOfPlainObjectType(source, targetProp.Name()) != nil
+				} else {
+					hasProp = c.hasPropertyOfType(source, targetProp.Name())
+				}
+				if !hasProp {
 					if lazyType != nil {
 						targetProp = c.getPropertyOfType(lazyType, targetProp.Name())
 					}
@@ -1440,7 +1447,12 @@ func (c *Checker) getUnmatchedPropertiesWorker(source *Type, target *Type, requi
 				}
 				continue
 			}
-			sourceProp := c.getPropertyOfType(source, targetProp.Name())
+			var sourceProp *ast.Symbol
+			if resolvedSource {
+				sourceProp = c.getResolvedPropertyOfPlainObjectType(source, targetProp.Name())
+			} else {
+				sourceProp = c.getPropertyOfType(source, targetProp.Name())
+			}
 			if sourceProp == nil {
 				if lazyType != nil {
 					targetProp = c.getPropertyOfType(lazyType, targetProp.Name())
@@ -4823,12 +4835,18 @@ func (r *Relater) propertiesRelatedTo(source *Type, target *Type, reportErrors b
 	// from the target union, across all members
 	properties := r.c.getPropertiesOfType(target)
 	numericNamesOnly := isTupleType(source) && isTupleType(target)
+	resolvedSource := r.c.isResolvedPlainObjectType(source)
 	for _, targetProp := range excludeProperties(properties, excludedProperties) {
 		name := targetProp.Name()
 		if targetProp.Flags()&ast.SymbolFlagsPrototype == 0 && (!numericNamesOnly || isNumericLiteralName(name) || name == "length") && (!optionalsOnly || targetProp.Flags()&ast.SymbolFlagsOptional != 0) {
-			sourceProp := r.c.getPropertyOfType(source, name)
+			var sourceProp *ast.Symbol
+			if resolvedSource {
+				sourceProp = r.c.getResolvedPropertyOfPlainObjectType(source, name)
+			} else {
+				sourceProp = r.c.getPropertyOfType(source, name)
+			}
 			if sourceProp != nil && sourceProp != targetProp {
-				related := r.propertyRelatedTo(source, target, sourceProp, targetProp, r.c.getNonMissingTypeOfSymbol, reportErrors, intersectionState, r.relation == r.c.comparableRelation)
+				related := r.propertyRelatedTo(source, target, sourceProp, targetProp, nil, reportErrors, intersectionState, r.relation == r.c.comparableRelation)
 				if related == TernaryFalse {
 					return TernaryFalse
 				}
@@ -4917,7 +4935,12 @@ func (r *Relater) isPropertySymbolTypeRelated(sourceProp *ast.Symbol, targetProp
 	if effectiveTarget.flags&core.IfElse(r.relation == r.c.strictSubtypeRelation, TypeFlagsAny, TypeFlagsAnyOrUnknown) != 0 {
 		return TernaryTrue
 	}
-	effectiveSource := getTypeOfSourceProperty(sourceProp)
+	var effectiveSource *Type
+	if getTypeOfSourceProperty != nil {
+		effectiveSource = getTypeOfSourceProperty(sourceProp)
+	} else {
+		effectiveSource = r.c.getNonMissingTypeOfSymbol(sourceProp)
+	}
 	return r.isRelatedToEx(effectiveSource, effectiveTarget, RecursionFlagsBoth, reportErrors, nil /*headMessage*/, intersectionState)
 }
 

@@ -1327,8 +1327,35 @@ func (t *StructuredType) getMember(name string) *ast.Symbol {
 	if len(slots) == 0 {
 		return nil
 	}
+	return t.getMemberFromSlots(name, hashMemberName(name), properties, slots)
+}
+
+func (t *StructuredType) getMemberWithHash(name string, h uint64) *ast.Symbol {
+	if t.extra == nil {
+		return nil
+	}
+	properties := t.extra.properties
+	members := t.extra.members
+	if members == nil {
+		for _, symbol := range properties {
+			if symbol.Name() == name {
+				return symbol
+			}
+		}
+		return nil
+	}
+	if members.fallback != nil {
+		return members.fallback[name]
+	}
+	slots := members.slots
+	if len(slots) == 0 {
+		return nil
+	}
+	return t.getMemberFromSlots(name, h, properties, slots)
+}
+
+func (t *StructuredType) getMemberFromSlots(name string, h uint64, properties []*ast.Symbol, slots []uint32) *ast.Symbol {
 	mask := uint64(len(slots) - 1)
-	h := hashMemberName(name)
 	slot := h & mask
 	if len(properties) < 0xffff {
 		tag := uint32(h>>16) & 0xffff0000
