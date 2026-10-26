@@ -245,6 +245,8 @@ func main() {
 			"IdenticalBaseTypeCalculated":       toInt32(checker.ObjectFlagsIdenticalBaseTypeCalculated),
 			"IdenticalBaseTypeExists":           toInt32(checker.ObjectFlagsIdenticalBaseTypeExists),
 			"FromTypeNode":                      toInt32(checker.ObjectFlagsFromTypeNode),
+			"HasGenericArgumentsComputed":       toInt32(checker.ObjectFlagsHasGenericArgumentsComputed),
+			"HasGenericArguments":               toInt32(checker.ObjectFlagsHasGenericArguments),
 			"IsGenericTypeComputed":             toInt32(checker.ObjectFlagsIsGenericTypeComputed),
 			"IsGenericObjectType":               toInt32(checker.ObjectFlagsIsGenericObjectType),
 			"IsGenericIndexType":                toInt32(checker.ObjectFlagsIsGenericIndexType),

@@ -1,5 +1,6 @@
 package checker
 
+
 import (
 	"math/bits"
 	"slices"
@@ -1096,6 +1097,11 @@ func (c *Checker) isDiscriminantProperty(t *Type, name string) bool {
 	return false
 }
 
+type unionDiscriminant struct {
+	keyPropertyName string
+	constituentMap  map[*Type]*Type
+}
+
 func (c *Checker) getMatchingUnionConstituentForType(unionType *Type, t *Type) *Type {
 	keyPropertyName := c.getKeyPropertyName(unionType)
 	if keyPropertyName == "" {
@@ -1113,19 +1119,24 @@ func (c *Checker) getMatchingUnionConstituentForType(unionType *Type, t *Type) *
 // an empty string if no such discriminant property exists.
 func (c *Checker) getKeyPropertyName(t *Type) string {
 	u := t.AsUnionType()
-	if u.keyPropertyName == "" {
-		u.keyPropertyName, u.constituentMap = c.computeKeyPropertyNameAndMap(t)
+	disc := c.unionDiscriminants[u]
+	if disc.keyPropertyName == "" {
+		disc.keyPropertyName, disc.constituentMap = c.computeKeyPropertyNameAndMap(t)
+		if c.unionDiscriminants == nil {
+			c.unionDiscriminants = make(map[*UnionType]unionDiscriminant)
+		}
+		c.unionDiscriminants[u] = disc
 	}
-	if u.keyPropertyName == ast.InternalSymbolNameMissing {
+	if disc.keyPropertyName == ast.InternalSymbolNameMissing {
 		return ""
 	}
-	return u.keyPropertyName
+	return disc.keyPropertyName
 }
 
 // Given a union type for which getKeyPropertyName returned a non-empty string, return the constituent
 // that corresponds to the given key type for that property name.
 func (c *Checker) getConstituentTypeForKeyType(t *Type, keyType *Type) *Type {
-	result := t.AsUnionType().constituentMap[c.getRegularTypeOfLiteralType(keyType)]
+	result := c.unionDiscriminants[t.AsUnionType()].constituentMap[c.getRegularTypeOfLiteralType(keyType)]
 	if result != c.unknownType {
 		return result
 	}

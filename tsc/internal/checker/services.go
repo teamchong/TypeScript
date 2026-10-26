@@ -153,10 +153,17 @@ func (c *Checker) ForEachExportAndPropertyOfModule(moduleSymbol *ast.Symbol, cb 
 	if reducedType.flags&TypeFlagsStructuredType == 0 {
 		return
 	}
-	for name, symbol := range c.resolveStructuredTypeMembers(reducedType).getMembers().All() {
-		if c.isNamedMember(symbol, name) {
-			cb(symbol, name)
+	resolved := c.resolveStructuredTypeMembers(reducedType)
+	if m := resolved.getMembersIndex(); m != nil && m.fallback != nil {
+		for name, symbol := range m.fallback.All() {
+			if c.isNamedMember(symbol, name) {
+				cb(symbol, name)
+			}
 		}
+		return
+	}
+	for _, symbol := range resolved.Properties() {
+		cb(symbol, symbol.Name())
 	}
 }
 
@@ -257,11 +264,11 @@ func (c *Checker) GetElementTypeOfArrayType(t *Type) *Type {
 }
 
 func (c *Checker) GetCallSignatures(t *Type) []*Signature {
-	return c.getSignaturesOfType(t, SignatureKindCall)
+	return c.resolveExportedSignatures(c.getSignaturesOfType(t, SignatureKindCall))
 }
 
 func (c *Checker) GetConstructSignatures(t *Type) []*Signature {
-	return c.getSignaturesOfType(t, SignatureKindConstruct)
+	return c.resolveExportedSignatures(c.getSignaturesOfType(t, SignatureKindConstruct))
 }
 
 func (c *Checker) GetApparentProperties(t *Type) []*ast.Symbol {
@@ -434,10 +441,9 @@ func (c *Checker) getImmediateRootSymbols(symbol *ast.Symbol) []*ast.Symbol {
 				return []*ast.Symbol{leftSpread, rightSpread}
 			}
 		}
-		if c.mappedSymbolLinks.Has(symbol) {
-			syntheticOrigin := c.mappedSymbolLinks.Get(symbol).syntheticOrigin
-			if syntheticOrigin != nil {
-				return []*ast.Symbol{syntheticOrigin}
+		if symbol.CheckFlags()&ast.CheckFlagsInstantiated == 0 {
+			if links := c.valueSymbolLinks.TryGet(symbol); links != nil && links.target != nil {
+				return []*ast.Symbol{links.target}
 			}
 		}
 		target := c.tryGetTarget(symbol)
@@ -902,7 +908,7 @@ func (c *Checker) getResolvedSignatureWorker(node *ast.Node, checkMode CheckMode
 		res = c.getResolvedSignature(node, candidatesOutArray, checkMode)
 	}
 	c.apparentArgumentCount = nil
-	return res, *candidatesOutArray
+	return c.resolveExportedSignature(res), c.resolveExportedSignatures(*candidatesOutArray)
 }
 
 func (c *Checker) GetCandidateSignaturesForStringLiteralCompletions(call *ast.CallLikeExpression, editingArgument *ast.Node) []*Signature {

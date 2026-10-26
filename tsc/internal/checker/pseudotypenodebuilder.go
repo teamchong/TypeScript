@@ -178,7 +178,7 @@ func (b *NodeBuilderImpl) pseudoTypeToNode(t *pseudochecker.PseudoType) *ast.Nod
 		d := t.AsPseudoTypeSingleCallSignature()
 		signature := b.ch.getSignatureFromDeclaration(d.Signature)
 		expandedParams := b.ch.getExpandedParameters(signature, true /*skipUnionExpanding*/)[0]
-		cleanup := b.enterNewScope(d.Signature, expandedParams, signature.TypeParameters(), signature.parameters, signature.mapper)
+		cleanup := b.enterNewScope(d.Signature, expandedParams, signature.TypeParameters(), b.ch.getSignatureParameters(signature), signature.mapper)
 		defer cleanup()
 		var typeParams *ast.NodeList
 		if len(d.TypeParameters) > 0 {
@@ -233,7 +233,7 @@ func (b *NodeBuilderImpl) pseudoTypeToNode(t *pseudochecker.PseudoType) *ast.Nod
 			if e.Kind != pseudochecker.PseudoObjectElementKindPropertyAssignment {
 				signature := b.ch.getSignatureFromDeclaration(e.Signature())
 				expandedParams := b.ch.getExpandedParameters(signature, true /*skipUnionExpanding*/)[0]
-				cleanup = b.enterNewScope(e.Signature(), expandedParams, signature.TypeParameters(), signature.parameters, signature.mapper)
+				cleanup = b.enterNewScope(e.Signature(), expandedParams, signature.TypeParameters(), b.ch.getSignatureParameters(signature), signature.mapper)
 			}
 			var newProp *ast.Node
 			switch e.Kind {
@@ -589,7 +589,7 @@ func (b *NodeBuilderImpl) pseudoParametersEquivalentToParameters(params []*pseud
 		}
 		return false
 	} else if targetSig.ThisParameter() != nil && ast.IsThisIdentifier(params[0].Name) {
-		targetParam := targetSig.ThisParameter()
+		targetParam := b.ch.getSignatureThisParameter(targetSig)
 		paramType := b.ch.getTypeOfParameter(targetParam)
 		if !b.pseudoTypeEquivalentToType(params[0].Type, paramType, params[0].Optional, false) {
 			if reportErrors {
@@ -611,7 +611,7 @@ func (b *NodeBuilderImpl) pseudoParametersEquivalentToParameters(params []*pseud
 		return false // TODO: spread tuple params may mess with this check
 	}
 	for i, p := range params {
-		targetParam := targetSig.parameters[i]
+		targetParam := b.ch.getSignatureParameters(targetSig)[i]
 		if p.Optional != b.ch.isOptionalParameter(targetParam.ValueDeclaration()) {
 			if reportErrors {
 				b.ctx.tracker.ReportInferenceFallback(p.Name.Parent)
