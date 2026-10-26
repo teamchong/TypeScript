@@ -54,11 +54,7 @@ func EmitAndReportStatistics(input EmitInput) (CompileAndEmitResult, *Statistics
 
 	if input.Config.CompilerOptions().Diagnostics.IsTrue() || input.Config.CompilerOptions().ExtendedDiagnostics.IsTrue() {
 		var memStats runtime.MemStats
-		// GC must be called twice to allow things to settle.
-		runtime.GC()
-		runtime.GC()
 		runtime.ReadMemStats(&memStats)
-
 		statistics = statisticsFromProgram(input, &memStats)
 		statistics.Report(input.Writer, input.Testing)
 	}

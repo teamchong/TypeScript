@@ -1,9 +1,12 @@
+//go:build !wasip1
+
 package main
 
 import (
 	"context"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/microsoft/TypeScript/tsc/internal/core"
@@ -17,6 +20,12 @@ func main() {
 
 func runMain() int {
 	core.ApplyDebugStackLimit()
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(300)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(8 << 30)
+	}
 	args := osutil.Args()[1:]
 	if len(args) > 0 {
 		switch args[0] {

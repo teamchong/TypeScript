@@ -3,9 +3,11 @@ package compiler
 import (
 	"context"
 	"math"
+	"runtime"
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/checker"
@@ -32,7 +34,16 @@ type checkerPool struct {
 	createCheckersOnce sync.Once
 	checkers           []*checker.Checker
 	locks              []*sync.Mutex
-	fileAssociations   map[*ast.SourceFile]*checker.Checker
+	fileAssociations   map[*ast.SourceFile]int
+
+	maxMemoryBytes              uint64
+	recycleMu                   sync.Mutex
+	retiredGlobalDiagnostics    []*ast.Diagnostic
+	retiredSymbolCount          atomic.Uint64
+	retiredTypeCount            atomic.Uint64
+	retiredInstantiationCount   atomic.Uint64
+	retiredCheckerCount         atomic.Uint64
+	readMemoryAllocationInBytes func() uint64
 }
 
 var _ CheckerPool = (*checkerPool)(nil)
@@ -321,6 +332,21 @@ func newCheckerPoolWithTracing(program *Program, tr *tracing.Tracing) *checkerPo
 		checkers: make([]*checker.Checker, checkerCount),
 		locks:    make([]*sync.Mutex, checkerCount),
 		tracing:  tr,
+		readMemoryAllocationInBytes: func() uint64 {
+			var stats runtime.MemStats
+			runtime.ReadMemStats(&stats)
+			return stats.Alloc
+		},
+	}
+	options := program.Options()
+	if maxMemory := options.MaxMemory; maxMemory != nil &&
+		*maxMemory > 0 &&
+		options.NoEmit.IsTrue() &&
+		!options.GetEmitDeclarations() &&
+		!options.IsIncremental() &&
+		options.GenerateTrace == "" &&
+		options.Watch.IsFalseOrUnknown() {
+		pool.maxMemoryBytes = uint64(*maxMemory) * 1024 * 1024
 	}
 
 	return pool
@@ -345,14 +371,14 @@ func (p *checkerPool) GetChecker(ctx context.Context, file *ast.SourceFile) (*ch
 // e.g. for read-only operations like obtaining an emit resolver.
 func (p *checkerPool) getCheckerForFileNonExclusive(file *ast.SourceFile) (*checker.Checker, func()) {
 	p.createCheckers()
-	return p.fileAssociations[file], noop
+	return p.checkers[p.fileAssociations[file]], noop
 }
 
 func (p *checkerPool) getCheckerForFileExclusive(ctx context.Context, file *ast.SourceFile) (*checker.Checker, func()) {
 	p.createCheckers()
-	c := p.fileAssociations[file]
-	idx := slices.Index(p.checkers, c)
+	idx := p.fileAssociations[file]
 	p.locks[idx].Lock()
+	c := p.checkers[idx]
 	return c, sync.OnceFunc(func() {
 		p.locks[idx].Unlock()
 	})
@@ -412,9 +438,9 @@ func (p *checkerPool) createCheckers() {
 			fileOrder := getCheckerAssociationOrder(fileWeights, isDeclarationFile, policy.prioritizeSourceFiles)
 			associations = getCheckerAssociationsInOrder(fileWeights, adjacentFiles, fileOrder, checkerCount, policy.balancePenaltyMultiplier)
 		}
-		p.fileAssociations = make(map[*ast.SourceFile]*checker.Checker, len(p.program.files))
+		p.fileAssociations = make(map[*ast.SourceFile]int, len(p.program.files))
 		for i, file := range p.program.files {
-			p.fileAssociations[file] = p.checkers[associations[i]]
+			p.fileAssociations[file] = associations[i]
 		}
 	})
 }
@@ -451,11 +477,11 @@ func (p *checkerPool) getImportAdjacency() [][]int {
 func (p *checkerPool) forEachCheckerParallel(cb func(idx int, c *checker.Checker)) {
 	p.createCheckers()
 	wg := core.NewWorkGroup(p.program.SingleThreaded())
-	for idx, checker := range p.checkers {
+	for idx := range p.checkers {
 		wg.Queue(func() {
 			p.locks[idx].Lock()
 			defer p.locks[idx].Unlock()
-			cb(idx, checker)
+			cb(idx, p.checkers[idx])
 		})
 	}
 	wg.RunAndWait()
@@ -467,29 +493,204 @@ func (p *checkerPool) GetGlobalDiagnostics() []*ast.Diagnostic {
 	p.forEachCheckerParallel(func(idx int, checker *checker.Checker) {
 		globalDiagnostics[idx] = checker.GetGlobalDiagnostics()
 	})
-	return SortAndDeduplicateDiagnostics(slices.Concat(globalDiagnostics...))
+	p.recycleMu.Lock()
+	retired := slices.Clone(p.retiredGlobalDiagnostics)
+	p.recycleMu.Unlock()
+	return SortAndDeduplicateDiagnostics(append(slices.Concat(globalDiagnostics...), retired...))
 }
 
 // forEachCheckerGroupDo runs one task per checker in parallel. Each task iterates
 // the provided files, processing only those assigned to its checker. Within each
 // checker's set, files are visited in their original order.
+type checkerWorkQueue struct {
+	items []int
+	state atomic.Uint64 // low 32 bits: head, high 32 bits: tail
+}
+
+func (q *checkerWorkQueue) popFront() (int, bool) {
+	for {
+		s := q.state.Load()
+		head := uint32(s)
+		tail := uint32(s >> 32)
+		if head >= tail {
+			return 0, false
+		}
+		if q.state.CompareAndSwap(s, uint64(head+1)|(uint64(tail)<<32)) {
+			return q.items[head], true
+		}
+	}
+}
+
+func (q *checkerWorkQueue) popBack() (int, bool) {
+	for {
+		s := q.state.Load()
+		head := uint32(s)
+		tail := uint32(s >> 32)
+		if head >= tail {
+			return 0, false
+		}
+		newTail := tail - 1
+		if q.state.CompareAndSwap(s, uint64(head)|(uint64(newTail)<<32)) {
+			return q.items[newTail], true
+		}
+	}
+}
+
+func (q *checkerWorkQueue) remaining() uint32 {
+	s := q.state.Load()
+	head := uint32(s)
+	tail := uint32(s >> 32)
+	if head >= tail {
+		return 0
+	}
+	return tail - head
+}
+
 func (p *checkerPool) forEachCheckerGroupDo(ctx context.Context, files []*ast.SourceFile, singleThreaded bool, cb func(c *checker.Checker, fileIndex int, file *ast.SourceFile)) {
 	p.createCheckers()
-
 	checkerCount := len(p.checkers)
+	if checkerCount == 1 {
+		if prev := runtime.GOMAXPROCS(0); prev > 1 {
+			runtime.GOMAXPROCS(1)
+			defer runtime.GOMAXPROCS(prev)
+		}
+		p.locks[0].Lock()
+		defer p.locks[0].Unlock()
+		current := p.checkers[0]
+		if p.maxMemoryBytes == 0 {
+			for i, file := range files {
+				cb(current, i, file)
+			}
+			return
+		}
+		remaining := 0
+		for _, file := range files {
+			if !p.program.SkipTypeChecking(file, false) {
+				remaining++
+			}
+		}
+		for i, file := range files {
+			cb(current, i, file)
+			if p.program.SkipTypeChecking(file, false) {
+				continue
+			}
+			remaining--
+			if remaining != 0 {
+				current = p.recycleCheckerIfOverBudget(0, current)
+			}
+		}
+		return
+	}
+	if !singleThreaded && p.maxMemoryBytes == 0 {
+		if prev := runtime.GOMAXPROCS(0); prev > checkerCount {
+			runtime.GOMAXPROCS(checkerCount)
+			defer runtime.GOMAXPROCS(prev)
+		}
+		queues := make([]checkerWorkQueue, checkerCount)
+		counts := make([]int, checkerCount)
+		fileCheckers := make([]int, len(files))
+		for i, file := range files {
+			cIdx := p.fileAssociations[file]
+			fileCheckers[i] = cIdx
+			counts[cIdx]++
+		}
+		allItems := make([]int, len(files))
+		offset := 0
+		for cIdx, cnt := range counts {
+			queues[cIdx].items = allItems[offset : offset : offset+cnt]
+			queues[cIdx].state.Store(uint64(cnt) << 32)
+			offset += cnt
+		}
+		for i, cIdx := range fileCheckers {
+			queues[cIdx].items = append(queues[cIdx].items, i)
+		}
+		wg := core.NewWorkGroup(false)
+		for checkerIdx := range checkerCount {
+			wg.Queue(func() {
+				p.locks[checkerIdx].Lock()
+				defer p.locks[checkerIdx].Unlock()
+				current := p.checkers[checkerIdx]
+				for {
+					if i, ok := queues[checkerIdx].popFront(); ok {
+						cb(current, i, files[i])
+						continue
+					}
+					bestVictim := -1
+					bestRem := uint32(0)
+					for v := range checkerCount {
+						if v != checkerIdx {
+							if rem := queues[v].remaining(); rem > bestRem {
+								bestRem = rem
+								bestVictim = v
+							}
+						}
+					}
+					if bestVictim < 0 {
+						break
+					}
+					if i, ok := queues[bestVictim].popBack(); ok {
+						p.recycleMu.Lock()
+						p.fileAssociations[files[i]] = checkerIdx
+						p.recycleMu.Unlock()
+						cb(current, i, files[i])
+					}
+				}
+			})
+		}
+		wg.RunAndWait()
+		return
+	}
+	remainingCheckable := make([]int, checkerCount)
+	for _, file := range files {
+		if !p.program.SkipTypeChecking(file, false) {
+			remainingCheckable[p.fileAssociations[file]]++
+		}
+	}
 	wg := core.NewWorkGroup(singleThreaded)
 	for checkerIdx := range checkerCount {
 		wg.Queue(func() {
 			p.locks[checkerIdx].Lock()
 			defer p.locks[checkerIdx].Unlock()
+			current := p.checkers[checkerIdx]
 			for i, file := range files {
-				if checker := p.checkers[checkerIdx]; checker == p.fileAssociations[file] {
-					cb(checker, i, file)
+				if checkerIdx == p.fileAssociations[file] {
+					cb(current, i, file)
+					if p.program.SkipTypeChecking(file, false) {
+						continue
+					}
+					remainingCheckable[checkerIdx]--
+					if remainingCheckable[checkerIdx] != 0 {
+						current = p.recycleCheckerIfOverBudget(checkerIdx, current)
+					}
 				}
 			}
 		})
 	}
 	wg.RunAndWait()
+}
+
+func (p *checkerPool) recycleCheckerIfOverBudget(checkerIdx int, current *checker.Checker) *checker.Checker {
+	if p.maxMemoryBytes == 0 || p.readMemoryAllocationInBytes() <= p.maxMemoryBytes {
+		return current
+	}
+
+	p.recycleMu.Lock()
+	defer p.recycleMu.Unlock()
+	if p.readMemoryAllocationInBytes() <= p.maxMemoryBytes {
+		return current
+	}
+
+	p.retiredGlobalDiagnostics = append(p.retiredGlobalDiagnostics, current.GetGlobalDiagnostics()...)
+	p.retiredSymbolCount.Add(uint64(current.SymbolCount))
+	p.retiredTypeCount.Add(uint64(current.TypeCount))
+	p.retiredInstantiationCount.Add(uint64(current.TotalInstantiationCount))
+	p.retiredCheckerCount.Add(1)
+
+	replacement, _ := checker.NewChecker(p.program, nil)
+	p.checkers[checkerIdx] = replacement
+	current = nil
+	runtime.GC()
+	return replacement
 }
 
 func noop() {}
