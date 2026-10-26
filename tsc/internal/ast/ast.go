@@ -47,6 +47,9 @@ func visitNodes(v Visitor, nodes []*Node) bool {
 
 func visitNodeList(v Visitor, nodeList *NodeList) bool {
 	if nodeList != nil {
+		if unsafe.SliceData(nodeList.Nodes) == &lazySentinelElem {
+			return visitNodes(v, nodeList.forceLazy())
+		}
 		return visitNodes(v, nodeList.Nodes)
 	}
 	return false
@@ -95,6 +98,11 @@ func (f *NodeFactory) TextCount() int {
 	return f.textCount
 }
 
+func (f *NodeFactory) ResetCounts() {
+	f.nodeCount = 0
+	f.textCount = 0
+}
+
 func (f *NodeFactory) AsNodeFactory() *NodeFactory {
 	return f
 }
@@ -136,15 +144,16 @@ func (list *NodeList) Pos() int { return list.Loc.Pos() }
 func (list *NodeList) End() int { return list.Loc.End() }
 
 func (list *NodeList) HasTrailingComma() bool {
-	if len(list.Nodes) == 0 {
+	nodes := list.Slice()
+	if len(nodes) == 0 {
 		return false
 	}
-	last := list.Nodes[len(list.Nodes)-1]
+	last := nodes[len(nodes)-1]
 	return last.End() < list.End()
 }
 
 func (list *NodeList) Clone(f NodeFactoryCoercible) *NodeList {
-	result := f.AsNodeFactory().NewNodeList(list.Nodes)
+	result := f.AsNodeFactory().NewNodeList(list.Slice())
 	result.Loc = list.Loc
 	return result
 }
@@ -174,12 +183,14 @@ func (list *ModifierList) Clone(f *NodeFactory) *ModifierList {
 
 // Every concrete AST node embeds Node at offset zero. Kind identifies the
 // enclosing allocation, which generated accessors recover without a data pointer.
+// Initialize Kind only in newNode; transformations must construct a new node
+// rather than retagging one. The unsafelayout linter enforces this boundary.
 
 type Node struct {
 	Kind   Kind
 	Flags  NodeFlags
 	Loc    core.TextRange
-	id     atomic.Uint64
+	id     atomic.Uint32
 	Parent *Node
 }
 
@@ -244,32 +255,35 @@ func (n *Node) Body() *Node {
 	return nil
 }
 
+const nodeFlagsOffset = uint8(unsafe.Offsetof(Node{}.Flags))
+
+var nodeTextOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindIdentifier:                    uint8(unsafe.Offsetof(Identifier{}.Text)) - nodeFlagsOffset,
+	KindPrivateIdentifier:             uint8(unsafe.Offsetof(PrivateIdentifier{}.Text)) - nodeFlagsOffset,
+	KindStringLiteral:                 uint8(unsafe.Offsetof(StringLiteral{}.Text)) - nodeFlagsOffset,
+	KindNumericLiteral:                uint8(unsafe.Offsetof(NumericLiteral{}.Text)) - nodeFlagsOffset,
+	KindBigIntLiteral:                 uint8(unsafe.Offsetof(BigIntLiteral{}.Text)) - nodeFlagsOffset,
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.Text)) - nodeFlagsOffset,
+	KindTemplateHead:                  uint8(unsafe.Offsetof(TemplateHead{}.Text)) - nodeFlagsOffset,
+	KindTemplateMiddle:                uint8(unsafe.Offsetof(TemplateMiddle{}.Text)) - nodeFlagsOffset,
+	KindTemplateTail:                  uint8(unsafe.Offsetof(TemplateTail{}.Text)) - nodeFlagsOffset,
+	KindJsxText:                       uint8(unsafe.Offsetof(JsxText{}.Text)) - nodeFlagsOffset,
+	KindRegularExpressionLiteral:      uint8(unsafe.Offsetof(RegularExpressionLiteral{}.Text)) - nodeFlagsOffset,
+}
+
 func (n *Node) Text() string {
+	if offset := nodeTextOffset[n.Kind]; offset != 0 {
+		return *(*string)(unsafe.Add(unsafe.Pointer(&n.Flags), offset))
+	}
+	return n.textSlow()
+}
+
+func (n *Node) textSlow() string {
 	switch n.Kind {
-	case KindIdentifier:
-		return n.AsIdentifier().Text
-	case KindPrivateIdentifier:
-		return n.AsPrivateIdentifier().Text
-	case KindStringLiteral:
-		return n.AsStringLiteral().Text
-	case KindNumericLiteral:
-		return n.AsNumericLiteral().Text
-	case KindBigIntLiteral:
-		return n.AsBigIntLiteral().Text
 	case KindMetaProperty:
 		return n.AsMetaProperty().Name().Text()
-	case KindNoSubstitutionTemplateLiteral:
-		return n.AsNoSubstitutionTemplateLiteral().Text
-	case KindTemplateHead:
-		return n.AsTemplateHead().Text
-	case KindTemplateMiddle:
-		return n.AsTemplateMiddle().Text
-	case KindTemplateTail:
-		return n.AsTemplateTail().Text
 	case KindJsxNamespacedName:
 		return n.AsJsxNamespacedName().Namespace.Text() + ":" + n.AsJsxNamespacedName().name.Text()
-	case KindRegularExpressionLiteral:
-		return n.AsRegularExpressionLiteral().Text
 	case KindJSDocText:
 		return strings.Join(n.AsJSDocText().text, "")
 	case KindJSDocLink:
@@ -282,80 +296,50 @@ func (n *Node) Text() string {
 	panic(fmt.Sprintf("Unhandled case in Node.Text: %s", n.Kind))
 }
 
+var nodeExpressionOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindPropertyAccessExpression:    uint8(unsafe.Offsetof(PropertyAccessExpression{}.Expression)),
+	KindElementAccessExpression:     uint8(unsafe.Offsetof(ElementAccessExpression{}.Expression)),
+	KindParenthesizedExpression:     uint8(unsafe.Offsetof(ParenthesizedExpression{}.Expression)),
+	KindCallExpression:              uint8(unsafe.Offsetof(CallExpression{}.Expression)),
+	KindNewExpression:               uint8(unsafe.Offsetof(NewExpression{}.Expression)),
+	KindExpressionWithTypeArguments: uint8(unsafe.Offsetof(ExpressionWithTypeArguments{}.Expression)),
+	KindComputedPropertyName:        uint8(unsafe.Offsetof(ComputedPropertyName{}.Expression)),
+	KindNonNullExpression:           uint8(unsafe.Offsetof(NonNullExpression{}.Expression)),
+	KindTypeAssertionExpression:     uint8(unsafe.Offsetof(TypeAssertion{}.Expression)),
+	KindAsExpression:                uint8(unsafe.Offsetof(AsExpression{}.Expression)),
+	KindSatisfiesExpression:         uint8(unsafe.Offsetof(SatisfiesExpression{}.Expression)),
+	KindTypeOfExpression:            uint8(unsafe.Offsetof(TypeOfExpression{}.Expression)),
+	KindSpreadAssignment:            uint8(unsafe.Offsetof(SpreadAssignment{}.Expression)),
+	KindSpreadElement:               uint8(unsafe.Offsetof(SpreadElement{}.Expression)),
+	KindTemplateSpan:                uint8(unsafe.Offsetof(TemplateSpan{}.Expression)),
+	KindDeleteExpression:            uint8(unsafe.Offsetof(DeleteExpression{}.Expression)),
+	KindVoidExpression:              uint8(unsafe.Offsetof(VoidExpression{}.Expression)),
+	KindAwaitExpression:             uint8(unsafe.Offsetof(AwaitExpression{}.Expression)),
+	KindYieldExpression:             uint8(unsafe.Offsetof(YieldExpression{}.Expression)),
+	KindPartiallyEmittedExpression:  uint8(unsafe.Offsetof(PartiallyEmittedExpression{}.Expression)),
+	KindIfStatement:                 uint8(unsafe.Offsetof(IfStatement{}.Expression)),
+	KindDoStatement:                 uint8(unsafe.Offsetof(DoStatement{}.Expression)),
+	KindWhileStatement:              uint8(unsafe.Offsetof(WhileStatement{}.Expression)),
+	KindWithStatement:               uint8(unsafe.Offsetof(WithStatement{}.Expression)),
+	KindForInStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.Expression)),
+	KindForOfStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.Expression)),
+	KindSwitchStatement:             uint8(unsafe.Offsetof(SwitchStatement{}.Expression)),
+	KindCaseClause:                  uint8(unsafe.Offsetof(CaseOrDefaultClause{}.Expression)),
+	KindExpressionStatement:         uint8(unsafe.Offsetof(ExpressionStatement{}.Expression)),
+	KindReturnStatement:             uint8(unsafe.Offsetof(ReturnStatement{}.Expression)),
+	KindThrowStatement:              uint8(unsafe.Offsetof(ThrowStatement{}.Expression)),
+	KindExternalModuleReference:     uint8(unsafe.Offsetof(ExternalModuleReference{}.Expression)),
+	KindExportAssignment:            uint8(unsafe.Offsetof(ExportAssignment{}.Expression)),
+	KindDecorator:                   uint8(unsafe.Offsetof(Decorator{}.Expression)),
+	KindJsxExpression:               uint8(unsafe.Offsetof(JsxExpression{}.Expression)),
+	KindJsxSpreadAttribute:          uint8(unsafe.Offsetof(JsxSpreadAttribute{}.Expression)),
+}
+
 func (n *Node) Expression() *Node {
-	switch n.Kind {
-	case KindPropertyAccessExpression:
-		return n.AsPropertyAccessExpression().Expression
-	case KindElementAccessExpression:
-		return n.AsElementAccessExpression().Expression
-	case KindParenthesizedExpression:
-		return n.AsParenthesizedExpression().Expression
-	case KindCallExpression:
-		return n.AsCallExpression().Expression
-	case KindNewExpression:
-		return n.AsNewExpression().Expression
-	case KindExpressionWithTypeArguments:
-		return n.AsExpressionWithTypeArguments().Expression
-	case KindComputedPropertyName:
-		return n.AsComputedPropertyName().Expression
-	case KindNonNullExpression:
-		return n.AsNonNullExpression().Expression
-	case KindTypeAssertionExpression:
-		return n.AsTypeAssertion().Expression
-	case KindAsExpression:
-		return n.AsAsExpression().Expression
-	case KindSatisfiesExpression:
-		return n.AsSatisfiesExpression().Expression
-	case KindTypeOfExpression:
-		return n.AsTypeOfExpression().Expression
-	case KindSpreadAssignment:
-		return n.AsSpreadAssignment().Expression
-	case KindSpreadElement:
-		return n.AsSpreadElement().Expression
-	case KindTemplateSpan:
-		return n.AsTemplateSpan().Expression
-	case KindDeleteExpression:
-		return n.AsDeleteExpression().Expression
-	case KindVoidExpression:
-		return n.AsVoidExpression().Expression
-	case KindAwaitExpression:
-		return n.AsAwaitExpression().Expression
-	case KindYieldExpression:
-		return n.AsYieldExpression().Expression
-	case KindPartiallyEmittedExpression:
-		return n.AsPartiallyEmittedExpression().Expression
-	case KindIfStatement:
-		return n.AsIfStatement().Expression
-	case KindDoStatement:
-		return n.AsDoStatement().Expression
-	case KindWhileStatement:
-		return n.AsWhileStatement().Expression
-	case KindWithStatement:
-		return n.AsWithStatement().Expression
-	case KindForInStatement, KindForOfStatement:
-		return n.AsForInOrOfStatement().Expression
-	case KindSwitchStatement:
-		return n.AsSwitchStatement().Expression
-	case KindCaseClause:
-		return n.AsCaseOrDefaultClause().Expression
-	case KindExpressionStatement:
-		return n.AsExpressionStatement().Expression
-	case KindReturnStatement:
-		return n.AsReturnStatement().Expression
-	case KindThrowStatement:
-		return n.AsThrowStatement().Expression
-	case KindExternalModuleReference:
-		return n.AsExternalModuleReference().Expression
-	case KindExportAssignment:
-		return n.AsExportAssignment().Expression
-	case KindDecorator:
-		return n.AsDecorator().Expression
-	case KindJsxExpression:
-		return n.AsJsxExpression().Expression
-	case KindJsxSpreadAttribute:
-		return n.AsJsxSpreadAttribute().Expression
+	if offset := nodeExpressionOffset[n.Kind]; offset != 0 {
+		return *(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
 	}
-	panic("Unhandled case in Node.Expression: " + n.Kind.String())
+	panic("Unhandled case in Node.Expression")
 }
 
 func (n *Node) RawText() string {
@@ -372,80 +356,11 @@ func (n *Node) RawText() string {
 
 func (m *MutableNode) SetExpression(expr *Node) {
 	n := (*Node)(m)
-	switch n.Kind {
-	case KindPropertyAccessExpression:
-		n.AsPropertyAccessExpression().Expression = expr
-	case KindElementAccessExpression:
-		n.AsElementAccessExpression().Expression = expr
-	case KindParenthesizedExpression:
-		n.AsParenthesizedExpression().Expression = expr
-	case KindCallExpression:
-		n.AsCallExpression().Expression = expr
-	case KindNewExpression:
-		n.AsNewExpression().Expression = expr
-	case KindExpressionWithTypeArguments:
-		n.AsExpressionWithTypeArguments().Expression = expr
-	case KindComputedPropertyName:
-		n.AsComputedPropertyName().Expression = expr
-	case KindNonNullExpression:
-		n.AsNonNullExpression().Expression = expr
-	case KindTypeAssertionExpression:
-		n.AsTypeAssertion().Expression = expr
-	case KindAsExpression:
-		n.AsAsExpression().Expression = expr
-	case KindSatisfiesExpression:
-		n.AsSatisfiesExpression().Expression = expr
-	case KindTypeOfExpression:
-		n.AsTypeOfExpression().Expression = expr
-	case KindSpreadAssignment:
-		n.AsSpreadAssignment().Expression = expr
-	case KindSpreadElement:
-		n.AsSpreadElement().Expression = expr
-	case KindTemplateSpan:
-		n.AsTemplateSpan().Expression = expr
-	case KindDeleteExpression:
-		n.AsDeleteExpression().Expression = expr
-	case KindVoidExpression:
-		n.AsVoidExpression().Expression = expr
-	case KindAwaitExpression:
-		n.AsAwaitExpression().Expression = expr
-	case KindYieldExpression:
-		n.AsYieldExpression().Expression = expr
-	case KindPartiallyEmittedExpression:
-		n.AsPartiallyEmittedExpression().Expression = expr
-	case KindIfStatement:
-		n.AsIfStatement().Expression = expr
-	case KindDoStatement:
-		n.AsDoStatement().Expression = expr
-	case KindWhileStatement:
-		n.AsWhileStatement().Expression = expr
-	case KindWithStatement:
-		n.AsWithStatement().Expression = expr
-	case KindForInStatement, KindForOfStatement:
-		n.AsForInOrOfStatement().Expression = expr
-	case KindSwitchStatement:
-		n.AsSwitchStatement().Expression = expr
-	case KindCaseClause:
-		n.AsCaseOrDefaultClause().Expression = expr
-	case KindExpressionStatement:
-		n.AsExpressionStatement().Expression = expr
-	case KindReturnStatement:
-		n.AsReturnStatement().Expression = expr
-	case KindThrowStatement:
-		n.AsThrowStatement().Expression = expr
-	case KindExternalModuleReference:
-		n.AsExternalModuleReference().Expression = expr
-	case KindExportAssignment:
-		n.AsExportAssignment().Expression = expr
-	case KindDecorator:
-		n.AsDecorator().Expression = expr
-	case KindJsxExpression:
-		n.AsJsxExpression().Expression = expr
-	case KindJsxSpreadAttribute:
-		n.AsJsxSpreadAttribute().Expression = expr
-	default:
-		panic("Unhandled case in mutableNode.SetExpression: " + n.Kind.String())
+	if offset := nodeExpressionOffset[n.Kind]; offset != 0 {
+		*(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset)) = expr
+		return
 	}
+	panic("Unhandled case in mutableNode.SetExpression")
 }
 
 func (n *Node) ArgumentList() *NodeList {
@@ -466,26 +381,21 @@ func (n *Node) Arguments() []*Node {
 	return nil
 }
 
+var nodeTypeArgumentsOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindCallExpression:              uint8(unsafe.Offsetof(CallExpression{}.TypeArguments)),
+	KindNewExpression:               uint8(unsafe.Offsetof(NewExpression{}.TypeArguments)),
+	KindTaggedTemplateExpression:    uint8(unsafe.Offsetof(TaggedTemplateExpression{}.TypeArguments)),
+	KindTypeReference:               uint8(unsafe.Offsetof(TypeReferenceNode{}.TypeArguments)),
+	KindExpressionWithTypeArguments: uint8(unsafe.Offsetof(ExpressionWithTypeArguments{}.TypeArguments)),
+	KindImportType:                  uint8(unsafe.Offsetof(ImportTypeNode{}.TypeArguments)),
+	KindTypeQuery:                   uint8(unsafe.Offsetof(TypeQueryNode{}.TypeArguments)),
+	KindJsxOpeningElement:           uint8(unsafe.Offsetof(JsxOpeningElement{}.TypeArguments)),
+	KindJsxSelfClosingElement:       uint8(unsafe.Offsetof(JsxSelfClosingElement{}.TypeArguments)),
+}
+
 func (n *Node) TypeArgumentList() *NodeList {
-	switch n.Kind {
-	case KindCallExpression:
-		return n.AsCallExpression().TypeArguments
-	case KindNewExpression:
-		return n.AsNewExpression().TypeArguments
-	case KindTaggedTemplateExpression:
-		return n.AsTaggedTemplateExpression().TypeArguments
-	case KindTypeReference:
-		return n.AsTypeReferenceNode().TypeArguments
-	case KindExpressionWithTypeArguments:
-		return n.AsExpressionWithTypeArguments().TypeArguments
-	case KindImportType:
-		return n.AsImportTypeNode().TypeArguments
-	case KindTypeQuery:
-		return n.AsTypeQueryNode().TypeArguments
-	case KindJsxOpeningElement:
-		return n.AsJsxOpeningElement().TypeArguments
-	case KindJsxSelfClosingElement:
-		return n.AsJsxSelfClosingElement().TypeArguments
+	if offset := nodeTypeArgumentsOffset[n.Kind]; offset != 0 {
+		return *(**NodeList)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
 	}
 	panic("Unhandled case in Node.TypeArguments")
 }
@@ -498,23 +408,21 @@ func (n *Node) TypeArguments() []*Node {
 	return nil
 }
 
+var nodeTypeParametersOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindClassDeclaration:       uint8(unsafe.Offsetof(ClassDeclaration{}.TypeParameters)),
+	KindClassExpression:        uint8(unsafe.Offsetof(ClassExpression{}.TypeParameters)),
+	KindInterfaceDeclaration:   uint8(unsafe.Offsetof(InterfaceDeclaration{}.TypeParameters)),
+	KindTypeAliasDeclaration:   uint8(unsafe.Offsetof(TypeAliasDeclaration{}.TypeParameters)),
+	KindJSTypeAliasDeclaration: uint8(unsafe.Offsetof(TypeAliasDeclaration{}.TypeParameters)),
+	KindJSDocTemplateTag:       uint8(unsafe.Offsetof(JSDocTemplateTag{}.TypeParameters)),
+}
+
 func (n *Node) TypeParameterList() *NodeList {
-	switch n.Kind {
-	case KindClassDeclaration:
-		return n.AsClassDeclaration().TypeParameters
-	case KindClassExpression:
-		return n.AsClassExpression().TypeParameters
-	case KindInterfaceDeclaration:
-		return n.AsInterfaceDeclaration().TypeParameters
-	case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
-		return n.AsTypeAliasDeclaration().TypeParameters
-	case KindJSDocTemplateTag:
-		return n.AsJSDocTemplateTag().TypeParameters
-	default:
-		funcLike := n.FunctionLikeData()
-		if funcLike != nil {
-			return funcLike.TypeParameters
-		}
+	if offset := nodeTypeParametersOffset[n.Kind]; offset != 0 {
+		return *(**NodeList)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
+	}
+	if funcLike := n.FunctionLikeData(); funcLike != nil {
+		return funcLike.TypeParameters
 	}
 	panic("Unhandled case in Node.TypeParameterList")
 }
@@ -527,44 +435,46 @@ func (n *Node) TypeParameters() []*Node {
 	return nil
 }
 
+var nodeMembersOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindClassDeclaration:     uint8(unsafe.Offsetof(ClassDeclaration{}.Members)),
+	KindClassExpression:      uint8(unsafe.Offsetof(ClassExpression{}.Members)),
+	KindInterfaceDeclaration: uint8(unsafe.Offsetof(InterfaceDeclaration{}.Members)),
+	KindEnumDeclaration:      uint8(unsafe.Offsetof(EnumDeclaration{}.Members)),
+	KindTypeLiteral:          uint8(unsafe.Offsetof(TypeLiteralNode{}.Members)),
+	KindMappedType:           uint8(unsafe.Offsetof(MappedTypeNode{}.Members)),
+}
+
 func (n *Node) MemberList() *NodeList {
-	switch n.Kind {
-	case KindClassDeclaration:
-		return n.AsClassDeclaration().Members
-	case KindClassExpression:
-		return n.AsClassExpression().Members
-	case KindInterfaceDeclaration:
-		return n.AsInterfaceDeclaration().Members
-	case KindEnumDeclaration:
-		return n.AsEnumDeclaration().Members
-	case KindTypeLiteral:
-		return n.AsTypeLiteralNode().Members
-	case KindMappedType:
-		return n.AsMappedTypeNode().Members
+	if offset := nodeMembersOffset[n.Kind]; offset != 0 {
+		return *(**NodeList)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
 	}
-	panic("Unhandled case in Node.MemberList: " + n.Kind.String())
+	panic("Unhandled case in Node.MemberList")
 }
 
 func (n *Node) Members() []*Node {
 	list := n.MemberList()
 	if list != nil {
+		if unsafe.SliceData(list.Nodes) == &lazySentinelElem {
+			return list.forceLazy()
+		}
 		return list.Nodes
 	}
 	return nil
 }
 
+var nodeStatementsOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindSourceFile:    uint8(unsafe.Offsetof(SourceFile{}.Statements)),
+	KindBlock:         uint8(unsafe.Offsetof(Block{}.Statements)),
+	KindModuleBlock:   uint8(unsafe.Offsetof(ModuleBlock{}.Statements)),
+	KindCaseClause:    uint8(unsafe.Offsetof(CaseOrDefaultClause{}.Statements)),
+	KindDefaultClause: uint8(unsafe.Offsetof(CaseOrDefaultClause{}.Statements)),
+}
+
 func (n *Node) StatementList() *NodeList {
-	switch n.Kind {
-	case KindSourceFile:
-		return n.AsSourceFile().Statements
-	case KindBlock:
-		return n.AsBlock().Statements
-	case KindModuleBlock:
-		return n.AsModuleBlock().Statements
-	case KindCaseClause, KindDefaultClause:
-		return n.AsCaseOrDefaultClause().Statements
+	if offset := nodeStatementsOffset[n.Kind]; offset != 0 {
+		return *(**NodeList)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
 	}
-	panic("Unhandled case in Node.StatementList: " + n.Kind.String())
+	panic("Unhandled case in Node.StatementList")
 }
 
 func (n *Node) Statements() []*Node {
@@ -600,180 +510,87 @@ func (n *Node) ModifierNodes() []*Node {
 	return nil
 }
 
+var nodeTypeOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindVariableDeclaration:         uint8(unsafe.Offsetof(VariableDeclaration{}.Type)),
+	KindParameter:                   uint8(unsafe.Offsetof(ParameterDeclaration{}.Type)),
+	KindPropertySignature:           uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.Type)),
+	KindPropertyDeclaration:         uint8(unsafe.Offsetof(PropertyDeclaration{}.Type)),
+	KindPropertyAssignment:          uint8(unsafe.Offsetof(PropertyAssignment{}.Type)),
+	KindShorthandPropertyAssignment: uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.Type)),
+	KindTypePredicate:               uint8(unsafe.Offsetof(TypePredicateNode{}.Type)),
+	KindParenthesizedType:           uint8(unsafe.Offsetof(ParenthesizedTypeNode{}.Type)),
+	KindTypeOperator:                uint8(unsafe.Offsetof(TypeOperatorNode{}.Type)),
+	KindMappedType:                  uint8(unsafe.Offsetof(MappedTypeNode{}.Type)),
+	KindTypeAssertionExpression:     uint8(unsafe.Offsetof(TypeAssertion{}.Type)),
+	KindAsExpression:                uint8(unsafe.Offsetof(AsExpression{}.Type)),
+	KindSatisfiesExpression:         uint8(unsafe.Offsetof(SatisfiesExpression{}.Type)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.Type)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.Type)),
+	KindNamedTupleMember:            uint8(unsafe.Offsetof(NamedTupleMember{}.Type)),
+	KindOptionalType:                uint8(unsafe.Offsetof(OptionalTypeNode{}.Type)),
+	KindRestType:                    uint8(unsafe.Offsetof(RestTypeNode{}.Type)),
+	KindTemplateLiteralTypeSpan:     uint8(unsafe.Offsetof(TemplateLiteralTypeSpan{}.Type)),
+	KindJSDocTypeExpression:         uint8(unsafe.Offsetof(JSDocTypeExpression{}.Type)),
+	KindJSDocParameterTag:           uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.TypeExpression)),
+	KindJSDocPropertyTag:            uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.TypeExpression)),
+	KindJSDocNullableType:           uint8(unsafe.Offsetof(JSDocNullableType{}.Type)),
+	KindJSDocNonNullableType:        uint8(unsafe.Offsetof(JSDocNonNullableType{}.Type)),
+	KindJSDocOptionalType:           uint8(unsafe.Offsetof(JSDocOptionalType{}.Type)),
+	KindExportAssignment:            uint8(unsafe.Offsetof(ExportAssignment{}.Type)),
+	KindBinaryExpression:            uint8(unsafe.Offsetof(BinaryExpression{}.Type)),
+}
+
 func (n *Node) Type() *Node {
-	switch n.Kind {
-	case KindVariableDeclaration:
-		return n.AsVariableDeclaration().Type
-	case KindParameter:
-		return n.AsParameterDeclaration().Type
-	case KindPropertySignature:
-		return n.AsPropertySignatureDeclaration().Type
-	case KindPropertyDeclaration:
-		return n.AsPropertyDeclaration().Type
-	case KindPropertyAssignment:
-		return n.AsPropertyAssignment().Type
-	case KindShorthandPropertyAssignment:
-		return n.AsShorthandPropertyAssignment().Type
-	case KindTypePredicate:
-		return n.AsTypePredicateNode().Type
-	case KindParenthesizedType:
-		return n.AsParenthesizedTypeNode().Type
-	case KindTypeOperator:
-		return n.AsTypeOperatorNode().Type
-	case KindMappedType:
-		return n.AsMappedTypeNode().Type
-	case KindTypeAssertionExpression:
-		return n.AsTypeAssertion().Type
-	case KindAsExpression:
-		return n.AsAsExpression().Type
-	case KindSatisfiesExpression:
-		return n.AsSatisfiesExpression().Type
-	case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
-		return n.AsTypeAliasDeclaration().Type
-	case KindNamedTupleMember:
-		return n.AsNamedTupleMember().Type
-	case KindOptionalType:
-		return n.AsOptionalTypeNode().Type
-	case KindRestType:
-		return n.AsRestTypeNode().Type
-	case KindTemplateLiteralTypeSpan:
-		return n.AsTemplateLiteralTypeSpan().Type
-	case KindJSDocTypeExpression:
-		return n.AsJSDocTypeExpression().Type
-	case KindJSDocParameterTag, KindJSDocPropertyTag:
-		return n.AsJSDocParameterOrPropertyTag().TypeExpression
-	case KindJSDocNullableType:
-		return n.AsJSDocNullableType().Type
-	case KindJSDocNonNullableType:
-		return n.AsJSDocNonNullableType().Type
-	case KindJSDocOptionalType:
-		return n.AsJSDocOptionalType().Type
-	case KindExportAssignment:
-		return n.AsExportAssignment().Type
-	case KindBinaryExpression:
-		return n.AsBinaryExpression().Type
-	default:
-		if funcLike := n.FunctionLikeData(); funcLike != nil {
-			return funcLike.Type
-		}
+	if offset := nodeTypeOffset[n.Kind]; offset != 0 {
+		return *(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
+	}
+	if funcLike := n.FunctionLikeData(); funcLike != nil {
+		return funcLike.Type
 	}
 	return nil
 }
 
 func (m *MutableNode) SetType(t *Node) {
 	n := (*Node)(m)
-	switch m.Kind {
-	case KindVariableDeclaration:
-		n.AsVariableDeclaration().Type = t
-	case KindParameter:
-		n.AsParameterDeclaration().Type = t
-	case KindPropertySignature:
-		n.AsPropertySignatureDeclaration().Type = t
-	case KindPropertyDeclaration:
-		n.AsPropertyDeclaration().Type = t
-	case KindPropertyAssignment:
-		n.AsPropertyAssignment().Type = t
-	case KindShorthandPropertyAssignment:
-		n.AsShorthandPropertyAssignment().Type = t
-	case KindTypePredicate:
-		n.AsTypePredicateNode().Type = t
-	case KindParenthesizedType:
-		n.AsParenthesizedTypeNode().Type = t
-	case KindTypeOperator:
-		n.AsTypeOperatorNode().Type = t
-	case KindMappedType:
-		n.AsMappedTypeNode().Type = t
-	case KindTypeAssertionExpression:
-		n.AsTypeAssertion().Type = t
-	case KindAsExpression:
-		n.AsAsExpression().Type = t
-	case KindSatisfiesExpression:
-		n.AsSatisfiesExpression().Type = t
-	case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
-		n.AsTypeAliasDeclaration().Type = t
-	case KindNamedTupleMember:
-		n.AsNamedTupleMember().Type = t
-	case KindOptionalType:
-		n.AsOptionalTypeNode().Type = t
-	case KindRestType:
-		n.AsRestTypeNode().Type = t
-	case KindTemplateLiteralTypeSpan:
-		n.AsTemplateLiteralTypeSpan().Type = t
-	case KindJSDocTypeExpression:
-		n.AsJSDocTypeExpression().Type = t
-	case KindJSDocParameterTag, KindJSDocPropertyTag:
-		n.AsJSDocParameterOrPropertyTag().TypeExpression = t
-	case KindJSDocNullableType:
-		n.AsJSDocNullableType().Type = t
-	case KindJSDocNonNullableType:
-		n.AsJSDocNonNullableType().Type = t
-	case KindJSDocOptionalType:
-		n.AsJSDocOptionalType().Type = t
-	case KindExportAssignment:
-		n.AsExportAssignment().Type = t
-	case KindBinaryExpression:
-		n.AsBinaryExpression().Type = t
-	default:
-		if funcLike := n.FunctionLikeData(); funcLike != nil {
-			funcLike.Type = t
-		} else {
-			panic("Unhandled case in mutableNode.SetType: " + n.Kind.String())
-		}
+	if offset := nodeTypeOffset[n.Kind]; offset != 0 {
+		*(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset)) = t
+		return
 	}
+	if funcLike := n.FunctionLikeData(); funcLike != nil {
+		funcLike.Type = t
+		return
+	}
+	panic("Unhandled case in mutableNode.SetType")
+}
+
+var nodeInitializerOffset = [kindFlowReduceLabelData + 1]uint8{
+	KindVariableDeclaration: uint8(unsafe.Offsetof(VariableDeclaration{}.Initializer)),
+	KindParameter:           uint8(unsafe.Offsetof(ParameterDeclaration{}.Initializer)),
+	KindBindingElement:      uint8(unsafe.Offsetof(BindingElement{}.Initializer)),
+	KindPropertyDeclaration: uint8(unsafe.Offsetof(PropertyDeclaration{}.Initializer)),
+	KindPropertySignature:   uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.Initializer)),
+	KindPropertyAssignment:  uint8(unsafe.Offsetof(PropertyAssignment{}.Initializer)),
+	KindEnumMember:          uint8(unsafe.Offsetof(EnumMember{}.Initializer)),
+	KindForStatement:        uint8(unsafe.Offsetof(ForStatement{}.Initializer)),
+	KindForInStatement:      uint8(unsafe.Offsetof(ForInOrOfStatement{}.Initializer)),
+	KindForOfStatement:      uint8(unsafe.Offsetof(ForInOrOfStatement{}.Initializer)),
+	KindJsxAttribute:        uint8(unsafe.Offsetof(JsxAttribute{}.Initializer)),
 }
 
 func (n *Node) Initializer() *Node {
-	switch n.Kind {
-	case KindVariableDeclaration:
-		return n.AsVariableDeclaration().Initializer
-	case KindParameter:
-		return n.AsParameterDeclaration().Initializer
-	case KindBindingElement:
-		return n.AsBindingElement().Initializer
-	case KindPropertyDeclaration:
-		return n.AsPropertyDeclaration().Initializer
-	case KindPropertySignature:
-		return n.AsPropertySignatureDeclaration().Initializer
-	case KindPropertyAssignment:
-		return n.AsPropertyAssignment().Initializer
-	case KindEnumMember:
-		return n.AsEnumMember().Initializer
-	case KindForStatement:
-		return n.AsForStatement().Initializer
-	case KindForInStatement, KindForOfStatement:
-		return n.AsForInOrOfStatement().Initializer
-	case KindJsxAttribute:
-		return n.AsJsxAttribute().Initializer
+	if offset := nodeInitializerOffset[n.Kind]; offset != 0 {
+		return *(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
 	}
 	panic("Unhandled case in Node.Initializer")
 }
 
 func (m *MutableNode) SetInitializer(initializer *Node) {
 	n := (*Node)(m)
-	switch n.Kind {
-	case KindVariableDeclaration:
-		n.AsVariableDeclaration().Initializer = initializer
-	case KindParameter:
-		n.AsParameterDeclaration().Initializer = initializer
-	case KindBindingElement:
-		n.AsBindingElement().Initializer = initializer
-	case KindPropertyDeclaration:
-		n.AsPropertyDeclaration().Initializer = initializer
-	case KindPropertySignature:
-		n.AsPropertySignatureDeclaration().Initializer = initializer
-	case KindPropertyAssignment:
-		n.AsPropertyAssignment().Initializer = initializer
-	case KindEnumMember:
-		n.AsEnumMember().Initializer = initializer
-	case KindForStatement:
-		n.AsForStatement().Initializer = initializer
-	case KindForInStatement, KindForOfStatement:
-		n.AsForInOrOfStatement().Initializer = initializer
-	case KindJsxAttribute:
-		n.AsJsxAttribute().Initializer = initializer
-	default:
-		panic("Unhandled case in mutableNode.SetInitializer")
+	if offset := nodeInitializerOffset[n.Kind]; offset != 0 {
+		*(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset)) = initializer
+		return
 	}
+	panic("Unhandled case in mutableNode.SetInitializer")
 }
 
 func (n *Node) TagName() *Node {
@@ -1524,12 +1341,25 @@ func (node *Node) EagerJSDoc(file *SourceFile) []*Node {
 
 // CompositeBase
 
+var subtreeFactsShards [64]struct {
+	mu sync.RWMutex
+	m  map[*Node]SubtreeFacts
+}
+
 func (node *CompositeBase) subtreeFactsWorker(self *Node) SubtreeFacts {
 	// computeSubtreeFacts() is expected to be idempotent, so races will only impact time, not correctness.
-	facts := SubtreeFacts(node.facts.Load())
+	shard := &subtreeFactsShards[(uintptr(unsafe.Pointer(&self.Flags))>>4)&63]
+	shard.mu.RLock()
+	facts := shard.m[self]
+	shard.mu.RUnlock()
 	if facts&SubtreeFactsComputed == 0 {
-		facts |= self.computeSubtreeFacts() | SubtreeFactsComputed
-		node.facts.Store(uint32(facts))
+		facts = self.computeSubtreeFacts() | SubtreeFactsComputed
+		shard.mu.Lock()
+		if shard.m == nil {
+			shard.m = make(map[*Node]SubtreeFacts)
+		}
+		shard.m[self] = facts
+		shard.mu.Unlock()
 	}
 	return facts &^ SubtreeFactsComputed
 }
@@ -2317,9 +2147,9 @@ type sourceFileDataKey uint64
 
 var sourceFileDataKeyCounter atomic.Uint64
 
-type sourceFileDataCell[T any] struct {
+type sourceFileDataCell struct {
 	once  sync.Once
-	value T
+	value unsafe.Pointer
 }
 
 func NewSourceFileDataKey[T any]() *SourceFileDataKey[T] {
@@ -2327,15 +2157,16 @@ func NewSourceFileDataKey[T any]() *SourceFileDataKey[T] {
 }
 
 func (file *SourceFile) GetOrComputeData[T any](key *SourceFileDataKey[T], compute func(*SourceFile) T) T {
-	cell := file.getDataCell(key)
+	cell := file.getDataCell(key.key)
 	cell.once.Do(func() {
-		cell.value = compute(file)
+		v := compute(file)
+		cell.value = unsafe.Pointer(&v)
 	})
-	return cell.value
+	return *(*T)(cell.value)
 }
 
-func (file *SourceFile) getDataCell[T any](key *SourceFileDataKey[T]) *sourceFileDataCell[T] {
-	if key == nil || key.key == 0 {
+func (file *SourceFile) getDataCell(key sourceFileDataKey) *sourceFileDataCell {
+	if key == 0 {
 		panic("invalid SourceFileDataKey; use NewSourceFileDataKey")
 	}
 
@@ -2343,13 +2174,13 @@ func (file *SourceFile) getDataCell[T any](key *SourceFileDataKey[T]) *sourceFil
 	defer file.dataMu.Unlock()
 
 	if file.data == nil {
-		file.data = make(map[sourceFileDataKey]any)
+		file.data = make(map[sourceFileDataKey]*sourceFileDataCell)
 	}
-	if cell, ok := file.data[key.key]; ok {
-		return cell.(*sourceFileDataCell[T])
+	if cell, ok := file.data[key]; ok {
+		return cell
 	}
-	cell := &sourceFileDataCell[T]{}
-	file.data[key.key] = cell
+	cell := &sourceFileDataCell{}
+	file.data[key] = cell
 	return cell
 }
 
@@ -2384,7 +2215,7 @@ type SourceFile struct {
 
 	// Fields for lazily-computed data owned by packages outside ast.
 	dataMu sync.Mutex
-	data   map[sourceFileDataKey]any
+	data   map[sourceFileDataKey]*sourceFileDataCell
 
 	// Fields set by parser
 	diagnostics                 []*Diagnostic
@@ -2425,7 +2256,7 @@ type SourceFile struct {
 	SymbolCount           int
 	PatternAmbientModules []*PatternAmbientModule
 	GlobalExports         SymbolTable
-
+	LazyLists             []*LazyNodeList
 	// Fields set by ECMALineMap
 
 	ecmaLineMapMu sync.RWMutex

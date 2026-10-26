@@ -4735,8 +4735,10 @@ func (p *Printer) emitListRange(emit func(p *Printer, node *ast.Node), parentNod
 	isNil := children == nil
 
 	length := 0
+	var childrenNodes []*ast.Node
 	if !isNil {
-		length = len(children.Nodes)
+		childrenNodes = children.Slice()
+		length = len(childrenNodes)
 	}
 
 	if start < 0 {
@@ -4783,7 +4785,7 @@ func (p *Printer) emitListRange(emit func(p *Printer, node *ast.Node), parentNod
 	} else {
 		end := min(start+count, length)
 
-		p.emitListItems(emit, parentNode, children.Nodes[start:end], format, p.hasTrailingComma(parentNode, children), children.Loc)
+		p.emitListItems(emit, parentNode, childrenNodes[start:end], format, p.hasTrailingComma(parentNode, children), children.Loc)
 	}
 
 	if p.OnAfterEmitNodeList != nil {

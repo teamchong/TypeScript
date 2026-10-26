@@ -167,8 +167,8 @@ func (c *Checker) getTypeAtFlowNode(f *FlowState, flow *ast.FlowNode) FlowType {
 			}
 			t = c.getTypeAtFlowBranchLabel(f, flow, antecedents)
 		case flags&ast.FlowFlagsLoopLabel != 0:
-			if flow.Antecedents.Next == nil {
-				flow = flow.Antecedents.Flow
+			if flow.Antecedents().Next == nil {
+				flow = flow.Antecedents().Flow
 				continue
 			}
 			t = c.getTypeAtFlowLoopLabel(f, flow)
@@ -214,7 +214,7 @@ func getBranchLabelAntecedents(flow *ast.FlowNode, reduceLabels []*ast.FlowReduc
 			return data.Antecedents
 		}
 	}
-	return flow.Antecedents
+	return flow.Antecedents()
 }
 
 func (c *Checker) getTypeAtFlowAssignment(f *FlowState, flow *ast.FlowNode) FlowType {
@@ -1354,7 +1354,7 @@ func (c *Checker) getTypeAtFlowLoopLabel(f *FlowState, flow *ast.FlowNode) FlowT
 	antecedentTypes := make([]*Type, 0, 4)
 	subtypeReduction := false
 	var firstAntecedentType FlowType
-	for list := flow.Antecedents; list != nil; list = list.Next {
+	for list := flow.Antecedents(); list != nil; list = list.Next {
 		var flowType FlowType
 		if firstAntecedentType.isNil() {
 			// The first antecedent of a loop junction is always the non-looping control
@@ -2560,11 +2560,11 @@ func (c *Checker) isReachableFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 			}
 			return false
 		case flags&ast.FlowFlagsLoopLabel != 0:
-			if flow.Antecedents == nil {
+			if flow.Antecedents() == nil {
 				return false
 			}
 			// A loop is reachable if the control flow path that leads to the top is reachable.
-			flow = flow.Antecedents.Flow
+			flow = flow.Antecedents().Flow
 		case flags&ast.FlowFlagsSwitchClause != 0:
 			// The control flow path representing an unmatched value in a switch statement with
 			// no default clause is unreachable if the switch statement is exhaustive.
@@ -2638,7 +2638,7 @@ func (c *Checker) isPostSuperFlowNodeWorker(f *FlowState, flow *ast.FlowNode, no
 			return true
 		case flags&ast.FlowFlagsLoopLabel != 0:
 			// A loop is post-super if the control flow path that leads to the top is post-super.
-			flow = flow.Antecedents.Flow
+			flow = flow.Antecedents().Flow
 		case flags&ast.FlowFlagsReduceLabel != 0:
 			f.reduceLabels = append(f.reduceLabels, flow.Node.AsFlowReduceLabelData())
 			result := c.isPostSuperFlowNodeWorker(f, flow.Antecedent, false /*noCacheCheck*/)
