@@ -317,6 +317,11 @@ func performIncrementalCompilation(
 
 	tr := startTracingIfNeeded(sys, config, testing)
 
+	if testing == nil && config.CompilerOptions().MaxMemory == nil {
+		core.SuspendGC()
+	}
+	parser.EnableLazyDts(testing == nil && (config.CompilerOptions().SkipLibCheck.IsTrue() || config.CompilerOptions().NoCheck.IsTrue()))
+	defer parser.EnableLazyDts(false)
 	parseStart := sys.Now()
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		Config:  config,
@@ -378,6 +383,11 @@ func performCompilation(
 
 	tr := startTracingIfNeeded(sys, config, testing)
 
+	if testing == nil && config.CompilerOptions().MaxMemory == nil {
+		core.SuspendGC()
+	}
+	parser.EnableLazyDts(testing == nil && (config.CompilerOptions().SkipLibCheck.IsTrue() || config.CompilerOptions().NoCheck.IsTrue()))
+	defer parser.EnableLazyDts(false)
 	parseStart := sys.Now()
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		Config:  config,

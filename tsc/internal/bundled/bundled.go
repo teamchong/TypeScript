@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
-	"testing"
 
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 	"github.com/microsoft/TypeScript/tsc/internal/vfs"
@@ -44,9 +43,6 @@ var bundledSourceDir = sync.OnceValue(func() tspath.RootedDirectoryPath {
 })
 
 var testingLibPath = sync.OnceValue(func() string {
-	if !testing.Testing() {
-		panic("bundled: TestingLibPath should only be called during tests")
-	}
 	return bundledSourceDir().ResolveDirectory("libs").AsString()
 })
 
