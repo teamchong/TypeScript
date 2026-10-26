@@ -525,6 +525,42 @@ func (m *SymbolMap) Clone() SymbolTable {
 	return clone
 }
 
+func (m *SymbolMap) Clear() {
+	if m == nil {
+		return
+	}
+	clear(m.entries)
+	m.entries = m.entries[:0]
+	m.index = nil
+}
+
+func (m *SymbolMap) CopyFrom(src SymbolTable) {
+	if src == nil || len(src.entries) == 0 {
+		return
+	}
+	if len(m.entries) == 0 {
+		m.entries = append(m.entries, src.entries...)
+		if src.index != nil {
+			m.index = slices.Clone(src.index)
+		}
+		return
+	}
+	for i := range src.entries {
+		m.Set(src.keyAt(i), src.symbolAt(i))
+	}
+}
+
+func (m *SymbolMap) HasNameProxies() bool {
+	if m == nil {
+		return false
+	}
+	for _, entry := range m.entries {
+		if entry.flags == SymbolFlagsNameProxy {
+			return true
+		}
+	}
+	return false
+}
 const InternalSymbolNamePrefix = "\xFE" // Invalid UTF8 sequence, will never occur as IdentifierName
 
 const (

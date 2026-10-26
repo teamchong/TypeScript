@@ -2046,7 +2046,7 @@ func (c *Checker) getTypeOfSwitchClause(clause *ast.Node) *Type {
 
 func (c *Checker) getEffectsSignature(node *ast.Node) *Signature {
 	links := c.signatureLinks.Get(node)
-	signature := links.effectsSignature
+	signature := links.effectsOrDecoratorSignature
 	if signature == nil {
 		// A call expression parented by an expression statement is a potential assertion. Other call
 		// expressions are potential type predicate function calls. In order to avoid triggering
@@ -2079,7 +2079,7 @@ func (c *Checker) getEffectsSignature(node *ast.Node) *Signature {
 		if !(signature != nil && c.hasTypePredicateOrNeverReturnType(signature)) {
 			signature = c.unknownSignature
 		}
-		links.effectsSignature = signature
+		links.effectsOrDecoratorSignature = signature
 	}
 	if signature == c.unknownSignature {
 		return nil
@@ -2163,7 +2163,7 @@ func (c *Checker) getExplicitTypeOfSymbol(symbol *ast.Symbol, diagnostic *ast.Di
 	}
 	if symbol.Flags()&(ast.SymbolFlagsVariable|ast.SymbolFlagsProperty) != 0 {
 		if symbol.CheckFlags()&ast.CheckFlagsMapped != 0 {
-			origin := c.mappedSymbolLinks.Get(symbol).syntheticOrigin
+			origin := c.valueSymbolLinks.TryGet(symbol).target
 			if origin != nil && c.getExplicitTypeOfSymbol(origin, diagnostic) != nil {
 				return c.getTypeOfSymbol(symbol)
 			}

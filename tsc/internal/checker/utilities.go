@@ -358,8 +358,102 @@ func createSymbolTable(symbols []*ast.Symbol) ast.SymbolTable {
 	return result
 }
 
+type symbolSortEntry struct {
+	key    uint64
+	symbol *ast.Symbol
+}
+
+type nodeFileIndexEntry struct {
+	node      *ast.Node
+	file      *ast.SourceFile
+	fileIndex int
+}
+
+func (c *Checker) getNodeFileAndIndex(n *ast.Node) (*ast.SourceFile, int) {
+	if c.nodeFileIndexCache == nil {
+		c.nodeFileIndexCache = new([4096]nodeFileIndexEntry)
+	}
+	if p := n.Parent; p != nil {
+		pslot := (uint32(p.Pos())*2654435761 ^ uint32(p.End()) ^ uint32(p.Kind)) & 4095
+		pentry := &c.nodeFileIndexCache[pslot]
+		if pentry.node == p {
+			return pentry.file, pentry.fileIndex
+		}
+		sf := ast.GetSourceFileOfNode(p)
+		idx := c.fileIndexMap[sf]
+		*pentry = nodeFileIndexEntry{node: p, file: sf, fileIndex: idx}
+		return sf, idx
+	}
+	slot := (uint32(n.Pos())*2654435761 ^ uint32(n.End()) ^ uint32(n.Kind)) & 4095
+	entry := &c.nodeFileIndexCache[slot]
+	if entry.node == n {
+		return entry.file, entry.fileIndex
+	}
+	sf := ast.GetSourceFileOfNode(n)
+	idx := c.fileIndexMap[sf]
+	*entry = nodeFileIndexEntry{node: n, file: sf, fileIndex: idx}
+	return sf, idx
+}
+
 func (c *Checker) sortSymbols(symbols []*ast.Symbol) {
-	slices.SortFunc(symbols, c.compareSymbols)
+	n := len(symbols)
+	if n <= 1 {
+		return
+	}
+	if n == 2 || len(c.files) == 0 {
+		slices.SortFunc(symbols, c.compareSymbols)
+		return
+	}
+	buf := c.symbolSortBuf
+	if cap(buf) < n {
+		buf = make([]symbolSortEntry, n)
+	} else {
+		buf = buf[:n]
+	}
+	var lastParent *ast.Node
+	var lastFileIndex uint64
+	var prevKey uint64
+	alreadySorted := true
+	for i, s := range symbols {
+		var key uint64
+		if s == nil {
+			key = ^uint64(0)
+		} else if d := s.FirstDeclaration(); d != nil {
+			var fileIndex uint64
+			if d.Parent != nil && d.Parent == lastParent {
+				fileIndex = lastFileIndex
+			} else {
+				_, idx := c.getNodeFileAndIndex(d)
+				fileIndex = uint64(uint32(idx))
+				lastParent = d.Parent
+				lastFileIndex = fileIndex
+			}
+			key = (fileIndex << 32) | uint64(uint32(d.Pos()))
+		} else {
+			key = uint64(^uint32(0)) << 32
+		}
+		if i > 0 && key <= prevKey {
+			alreadySorted = false
+		}
+		prevKey = key
+		buf[i] = symbolSortEntry{key: key, symbol: s}
+	}
+	if !alreadySorted {
+		slices.SortFunc(buf, func(a, b symbolSortEntry) int {
+			if a.key < b.key {
+				return -1
+			}
+			if a.key > b.key {
+				return 1
+			}
+			return c.compareSymbolsWorker(a.symbol, b.symbol)
+		})
+		for i, e := range buf {
+			symbols[i] = e.symbol
+		}
+	}
+	clear(buf)
+	c.symbolSortBuf = buf[:0]
 }
 
 func (c *Checker) compareSymbolsWorker(s1, s2 *ast.Symbol) int {
@@ -372,13 +466,14 @@ func (c *Checker) compareSymbolsWorker(s1, s2 *ast.Symbol) int {
 	if s2 == nil {
 		return -1
 	}
-	if len(s1.Declarations()) != 0 && len(s2.Declarations()) != 0 {
-		if r := c.compareNodes(s1.Declarations()[0], s2.Declarations()[0]); r != 0 {
+	d1, d2 := s1.FirstDeclaration(), s2.FirstDeclaration()
+	if d1 != nil && d2 != nil {
+		if r := c.compareNodes(d1, d2); r != 0 {
 			return r
 		}
-	} else if len(s1.Declarations()) != 0 {
+	} else if d1 != nil {
 		return -1
-	} else if len(s2.Declarations()) != 0 {
+	} else if d2 != nil {
 		return 1
 	}
 	if r := strings.Compare(s1.Name(), s2.Name()); r != 0 {
@@ -399,14 +494,12 @@ func (c *Checker) compareNodes(n1, n2 *ast.Node) int {
 	if n2 == nil {
 		return -1
 	}
-	if n1.Parent != nil && n1.Parent == n2.Parent {
+	if n1.Parent != nil && n2.Parent != nil && (n1.Parent == n2.Parent || (n1.Parent.Parent != nil && n1.Parent.Parent == n2.Parent.Parent)) {
 		return n1.Pos() - n2.Pos()
 	}
-	s1 := ast.GetSourceFileOfNode(n1)
-	s2 := ast.GetSourceFileOfNode(n2)
+	s1, f1 := c.getNodeFileAndIndex(n1)
+	s2, f2 := c.getNodeFileAndIndex(n2)
 	if s1 != s2 {
-		f1 := c.fileIndexMap[s1]
-		f2 := c.fileIndexMap[s2]
 		// Order by index of file in the containing program
 		return f1 - f2
 	}
@@ -431,11 +524,22 @@ func CompareTypes(t1, t2 *Type) int {
 	if c := getSortOrderFlags(t1) - getSortOrderFlags(t2); c != 0 {
 		return c
 	}
+	if t1.flags == TypeFlagsStringLiteral && t2.flags == TypeFlagsStringLiteral && t1.alias == nil && t2.alias == nil {
+		if c := strings.Compare(t1.AsLiteralType().value.(string), t2.AsLiteralType().value.(string)); c != 0 {
+			return c
+		}
+		return int(t1.id) - int(t2.id)
+	}
+	if t1.flags&(TypeFlagsEnum|TypeFlagsEnumLiteral) != 0 && t1.alias == nil && t2.alias == nil {
+		if c := t1.checker.compareSymbols(t1.symbol, t2.symbol); c != 0 {
+			return c
+		}
+		return int(t1.id) - int(t2.id)
+	}
 	// Order named types by name and, in the case of aliased types, by alias type arguments.
 	if c := compareTypeNames(t1, t2); c != 0 {
 		return c
 	}
-	// We have unnamed types or types with identical names. Now sort by data specific to the type.
 	switch {
 	case t1.flags&(TypeFlagsAny|TypeFlagsUnknown|TypeFlagsString|TypeFlagsNumber|TypeFlagsBoolean|TypeFlagsBigInt|TypeFlagsESSymbol|TypeFlagsVoid|TypeFlagsUndefined|TypeFlagsNull|TypeFlagsNever|TypeFlagsNonPrimitive) != 0:
 		// Only distinguished by type IDs, handled below.
@@ -444,11 +548,11 @@ func CompareTypes(t1, t2 *Type) int {
 		// Order other unnamed or identically named object types by symbol.
 		if t1.objectFlags&ObjectFlagsInstantiationExpressionType != 0 && t2.objectFlags&ObjectFlagsInstantiationExpressionType != 0 {
 			var declaration1, declaration2 *ast.Node
-			if t1.symbol != nil && len(t1.symbol.Declarations()) != 0 {
-				declaration1 = t1.symbol.Declarations()[0]
+			if t1.symbol != nil {
+				declaration1 = t1.symbol.FirstDeclaration()
 			}
-			if t2.symbol != nil && len(t2.symbol.Declarations()) != 0 {
-				declaration2 = t2.symbol.Declarations()[0]
+			if t2.symbol != nil {
+				declaration2 = t2.symbol.FirstDeclaration()
 			}
 			// A single instantiation expression can produce multiple types for union constituents,
 			// so compare their source declarations before comparing the shared expression node.
@@ -458,8 +562,10 @@ func CompareTypes(t1, t2 *Type) int {
 			if c := t1.checker.compareNodes(t1.AsInstantiationExpressionType().node, t2.AsInstantiationExpressionType().node); c != 0 {
 				return c
 			}
-		} else if c := t1.checker.compareSymbols(t1.symbol, t2.symbol); c != 0 {
-			return c
+		} else if t1.symbol != t2.symbol {
+			if c := t1.checker.compareSymbols(t1.symbol, t2.symbol); c != 0 {
+				return c
+			}
 		}
 		// When object types have the same or no symbol, order by kind. We order type references before other kinds.
 		if t1.objectFlags&ObjectFlagsReference != 0 && t2.objectFlags&ObjectFlagsReference != 0 {
@@ -636,6 +742,9 @@ func compareTypeNames(t1, t2 *Type) int {
 	s1 := getTypeNameSymbol(t1)
 	s2 := getTypeNameSymbol(t2)
 	if s1 == s2 {
+		if t1.alias == t2.alias {
+			return 0
+		}
 		return compareTypeLists(t1.alias.TypeArguments(), t2.alias.TypeArguments())
 	}
 	if s1 == nil {
@@ -742,10 +851,10 @@ func compareTypeMappers(m1, m2 *TypeMapper) int {
 	case TypeMapperKindArray:
 		m1 := castTypeMapper[ArrayTypeMapper](m1, TypeMapperKindArray)
 		m2 := castTypeMapper[ArrayTypeMapper](m2, TypeMapperKindArray)
-		if c := compareTypeLists(m1.sources, m2.sources); c != 0 {
+		if c := compareTypeLists(m1.sources(), m2.sources()); c != 0 {
 			return c
 		}
-		return compareTypeLists(m1.targets, m2.targets)
+		return compareTypeLists(m1.targets(), m2.targets())
 	case TypeMapperKindMerged:
 		m1 := castTypeMapper[MergedTypeMapper](m1, TypeMapperKindMerged)
 		m2 := castTypeMapper[MergedTypeMapper](m2, TypeMapperKindMerged)
@@ -920,11 +1029,14 @@ func (c *Checker) releaseTemporaryTypeSet(set *temporaryTypeSet) {
 	if cap(set.values) > len(set.inline) {
 		clear(set.inline[:])
 	}
-	clear(set.valuesByKey)
+	if len(set.valuesByKey) > 256 || cap(set.values) > 4096 {
+		set.valuesByKey = nil
+	} else if len(set.valuesByKey) != 0 {
+		clear(set.valuesByKey)
+	}
 	// Do not retain arbitrarily large temporary unions and their dedup maps.
 	if cap(set.values) > 4096 {
 		set.values = set.inline[:0]
-		set.valuesByKey = nil
 	} else {
 		set.values = set.values[:0]
 	}
@@ -1000,8 +1112,30 @@ func (c *Checker) releaseTemporaryPropertyCounts(counts *temporaryPropertyCounts
 	c.freePropertyCounts = counts
 }
 
+// Property enumeration of a combined type may recursively enumerate other
+// combined types, so each call borrows a separate name set.
+func (c *Checker) getTemporaryNameSet() map[string]struct{} {
+	if n := len(c.freeNameSets); n != 0 {
+		set := c.freeNameSets[n-1]
+		c.freeNameSets = c.freeNameSets[:n-1]
+		return set
+	}
+	return make(map[string]struct{})
+}
+
+func (c *Checker) releaseTemporaryNameSet(set map[string]struct{}) {
+	// Do not retain unusually large tables in the free list.
+	if len(set) > 256 {
+		return
+	}
+	if len(set) != 0 {
+		clear(set)
+	}
+	c.freeNameSets = append(c.freeNameSets, set)
+}
+
 func (s *orderedSet[T]) contains(value T) bool {
-	if s.valuesByKey == nil {
+	if len(s.values) <= orderedSetMapThreshold {
 		return slices.Contains(s.values, value)
 	}
 	_, ok := s.valuesByKey[value]
@@ -1012,11 +1146,13 @@ func (s *orderedSet[T]) add(value T) {
 	s.values = append(s.values, value)
 	// Small sets are served by a linear scan over values; only materialize the map once the set
 	// grows large enough for hashing to win.
-	if s.valuesByKey == nil {
-		if len(s.values) <= orderedSetMapThreshold {
-			return
+	if len(s.values) <= orderedSetMapThreshold {
+		return
+	}
+	if len(s.values) == orderedSetMapThreshold+1 {
+		if s.valuesByKey == nil {
+			s.valuesByKey = make(map[T]struct{}, len(s.values))
 		}
-		s.valuesByKey = make(map[T]struct{}, len(s.values))
 		for _, v := range s.values[:len(s.values)-1] {
 			s.valuesByKey[v] = struct{}{}
 		}

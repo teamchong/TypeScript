@@ -1897,7 +1897,7 @@ func (b *NodeBuilderImpl) signatureToSignatureDeclarationHelper(signature *Signa
 	// If the expanded parameter list had a variadic in a non-trailing position, don't expand it
 	parameters := core.Map(core.IfElse(core.Some(expandedParams, func(p *ast.Symbol) bool {
 		return p != expandedParams[len(expandedParams)-1] && p.CheckFlags()&ast.CheckFlagsRestParameter != 0
-	}), signature.parameters, expandedParams), func(parameter *ast.Symbol) *ast.Node {
+	}), b.ch.getSignatureParameters(signature), expandedParams), func(parameter *ast.Symbol) *ast.Node {
 		return b.symbolToParameterDeclaration(parameter, kind == ast.KindConstructor)
 	})
 	var thisParameter *ast.Node
@@ -1996,9 +1996,10 @@ func (b *NodeBuilderImpl) signatureToSignatureDeclarationHelper(signature *Signa
 }
 
 func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool) [][]*ast.Symbol {
+	params := c.getSignatureParameters(sig)
 	if signatureHasRestParameter(sig) {
-		restIndex := len(sig.parameters) - 1
-		restSymbol := sig.parameters[restIndex]
+		restIndex := len(params) - 1
+		restSymbol := params[restIndex]
 		restType := c.getTypeOfSymbol(restSymbol)
 		getUniqAssociatedNamesFromTupleType := func(t *Type, restSymbol *ast.Symbol) []string {
 			names := core.MapIndex(t.Target().AsTupleType().elementInfos, func(info TupleElementInfo, i int) string {
@@ -2069,7 +2070,7 @@ func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool)
 				}
 				return symbol
 			})
-			return core.Concatenate(sig.parameters[0:restIndex], restParams)
+			return core.Concatenate(params[0:restIndex], restParams)
 		}
 
 		if isTupleType(restType) {
@@ -2080,12 +2081,12 @@ func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool)
 			})
 		}
 	}
-	return [][]*ast.Symbol{sig.parameters}
+	return [][]*ast.Symbol{params}
 }
 
 func (b *NodeBuilderImpl) tryGetThisParameterDeclaration(signature *Signature) *ast.Node {
 	if signature.ThisParameter() != nil {
-		return b.symbolToParameterDeclaration(signature.ThisParameter(), false)
+		return b.symbolToParameterDeclaration(b.ch.getSignatureThisParameter(signature), false)
 	}
 	if signature.declaration != nil && ast.IsInJSFile(signature.declaration) {
 		// !!! JSDoc Support
@@ -2758,7 +2759,7 @@ func (b *NodeBuilderImpl) createTypeNodesFromResolvedType(resolvedType *Structur
 		typeElements = slices.Concat(typeElements, b.indexInfoToObjectComputedNamesOrSignatureDeclaration(info, typeNode))
 	}
 
-	properties := resolvedType.getProperties()
+	properties := resolvedType.getPropertiesSlice()
 	if len(properties) == 0 {
 		return b.f.NewNodeList(typeElements)
 	}
@@ -2807,7 +2808,7 @@ func (b *NodeBuilderImpl) createTypeNodeFromObjectType(t *Type) *ast.TypeNode {
 	resolved := b.ch.resolveStructuredTypeMembers(t)
 	callSigs := resolved.CallSignatures()
 	ctorSigs := resolved.ConstructSignatures()
-	if len(resolved.getProperties()) == 0 && len(resolved.getIndexInfos()) == 0 {
+	if len(resolved.getPropertiesSlice()) == 0 && len(resolved.getIndexInfos()) == 0 {
 		if len(callSigs) == 0 && len(ctorSigs) == 0 {
 			b.ctx.approximateLength += 2
 			result := b.f.NewTypeLiteralNode(b.f.NewNodeList([]*ast.Node{}))
@@ -2836,9 +2837,9 @@ func (b *NodeBuilderImpl) createTypeNodeFromObjectType(t *Type) *ast.TypeNode {
 			return b.ch.getOrCreateTypeFromSignature(s)
 		})
 		// count the number of type elements excluding abstract constructors
-		typeElementCount := len(callSigs) + (len(ctorSigs) - len(abstractSignatures)) + len(resolved.getIndexInfos()) + core.IfElse(b.ctx.flags&nodebuilder.FlagsWriteClassExpressionAsTypeLiteral != 0, core.CountWhere(resolved.getProperties(), func(p *ast.Symbol) bool {
+		typeElementCount := len(callSigs) + (len(ctorSigs) - len(abstractSignatures)) + len(resolved.getIndexInfos()) + core.IfElse(b.ctx.flags&nodebuilder.FlagsWriteClassExpressionAsTypeLiteral != 0, core.CountWhere(resolved.getPropertiesSlice(), func(p *ast.Symbol) bool {
 			return p.Flags()&ast.SymbolFlagsPrototype == 0
-		}), len(resolved.getProperties()))
+		}), len(resolved.getPropertiesSlice()))
 		// don't include an empty object literal if there were no other static-side
 		// properties to write, i.e. `abstract class C { }` becomes `abstract new () => {}`
 		// and not `(abstract new () => {}) & {}`

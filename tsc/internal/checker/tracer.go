@@ -191,7 +191,10 @@ func (a *tracedTypeAdapter) ConditionalTrueType() tracing.TracedType {
 	if a.t.flags&TypeFlagsConditional == 0 {
 		return nil
 	}
-	t := a.t.AsConditionalType().resolvedTrueType
+	var t *Type
+	if ex := a.t.AsConditionalType().extra; ex != nil {
+		t = ex.resolvedTrueType
+	}
 	if t == nil {
 		return nil
 	}
@@ -202,7 +205,10 @@ func (a *tracedTypeAdapter) ConditionalFalseType() tracing.TracedType {
 	if a.t.flags&TypeFlagsConditional == 0 {
 		return nil
 	}
-	t := a.t.AsConditionalType().resolvedFalseType
+	var t *Type
+	if ex := a.t.AsConditionalType().extra; ex != nil {
+		t = ex.resolvedFalseType
+	}
 	if t == nil {
 		return nil
 	}
