@@ -292,6 +292,8 @@ func parseCompilerOptions(key string, value any, allOptions *core.CompilerOption
 		allOptions.Quiet = ParseTristate(value)
 	case "checkers":
 		allOptions.Checkers = parseNumber(value)
+	case "maxMemory":
+		allOptions.MaxMemory = parseNumber(value)
 	default:
 		return false
 	}
@@ -1681,6 +1683,11 @@ func mergeCompilerOptionFields(targetOptions, sourceOptions *core.CompilerOption
 		targetOptions.Checkers = nil
 	} else if sourceOptions.Checkers != nil {
 		targetOptions.Checkers = sourceOptions.Checkers
+	}
+	if explicitNullFields.Has("maxMemory") {
+		targetOptions.MaxMemory = nil
+	} else if sourceOptions.MaxMemory != nil {
+		targetOptions.MaxMemory = sourceOptions.MaxMemory
 	}
 }
 
