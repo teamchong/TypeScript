@@ -728,6 +728,8 @@ type Checker struct {
 	resolutionCycleCount                        uint32
 	inferMemoSteps                              uint32
 	inferLongTargets                            map[*Type]bool
+	inferMemoEntries                            map[CacheHashKey]*inferMemoEntry
+	flowMemo                                    flowMemo
 	indexedAccessUnionMemo                      map[indexedAccessUnionKey]*Type
 	globalObjectAugmentFilter                   [4]uint64
 	unionConstituentFlags                       map[*Type]TypeFlags
@@ -735,6 +737,8 @@ type Checker struct {
 	freeTypeSets                                *temporaryTypeSet
 	freePropertyCounts                          *temporaryPropertyCounts
 	freeNameSets                                []map[string]struct{}
+	freeInferenceContexts                       []*InferenceContext
+	freeInferenceInfos                          []*InferenceInfo
 	templateScratchPool                         []*templateLiteralScratch
 	leafKeyBuilder                              keyBuilder
 	namedUnionMemberSet                         map[*Type]struct{}
@@ -886,11 +890,11 @@ type Checker struct {
 	antecedentTypes                             []*Type
 	flowAnalysisDisabled                        bool
 	flowInvocationCount                         int
-	flowTypeCache                     map[*ast.Node]*Type
-	lastFlowNode                      *ast.FlowNode
-	lastFlowNodeReachable             bool
-	flowNodeReachable                 map[*ast.FlowNode]bool
-	flowNodePostSuper                 map[*ast.FlowNode]bool
+	flowTypeCache                               map[*ast.Node]*Type
+	lastFlowNode                                *ast.FlowNode
+	lastFlowNodeReachable                       bool
+	flowReachableGen                            uint32
+	flowReachableSlots                          [2048]flowReachableSlot
 	renamedBindingElementsInTypes               []*ast.Node
 	contextualInfos                             []ContextualInfo
 	inferenceContextInfos                       []InferenceContextInfo
@@ -989,7 +993,7 @@ type Checker struct {
 func NewChecker(program Program, tracer *Tracer) (*Checker, *sync.Mutex) {
 	program.BindSourceFiles()
 
-	c := &Checker{}
+	c := &Checker{flowMemo: newFlowMemo()}
 	c.id = nextCheckerID.Add(1)
 	c.tracer = tracer
 	c.program = program
@@ -1136,14 +1140,8 @@ func NewChecker(program Program, tracer *Tracer) (*Checker, *sync.Mutex) {
 	c.zeroBigIntType = c.getBigIntLiteralType(jsnum.PseudoBigInt{})
 	c.typeofType = c.getUnionType(core.Map(slices.Sorted(maps.Keys(typeofNEFacts)), c.getStringLiteralType))
 	c.flowLoopCache = make(map[FlowLoopKey]*Type)
-	c.lastFlowNode = nil
-	c.flowNodeReachable = make(map[*ast.FlowNode]bool)
-	c.flowNodePostSuper = make(map[*ast.FlowNode]bool)
-	c.subtypeRelation = &Relation{}
-	c.strictSubtypeRelation = &Relation{}
-	c.assignableRelation = &Relation{}
-	c.comparableRelation = &Relation{}
-	c.identityRelation = &Relation{}
+	c.flowReachableGen = 2
+	c.subtypeRelation, c.strictSubtypeRelation, c.assignableRelation, c.comparableRelation, c.identityRelation = newRelations()
 	c.enumRelation = make(map[EnumRelationKey]RelationComparisonResult)
 	c.moduleImportAttributesTypes = make(map[*ast.Symbol]*Type)
 	c.getGlobalESSymbolType = c.getGlobalTypeResolver("Symbol", 0 /*arity*/, false /*reportErrors*/)
@@ -2371,7 +2369,8 @@ func (c *Checker) checkSourceFile(ctx context.Context, sourceFile *ast.SourceFil
 		}
 		c.produceDeferredDiagnostics()
 		c.reportedUnreachableNodes.Clear()
-			links.typeChecked = true
+		c.flowReachableGen += 2
+		links.typeChecked = true
 	}
 	if checkUnused && !links.unusedChecked {
 		// The unused identifiers check relies on a full type check having first been performed
@@ -7644,6 +7643,7 @@ func (c *Checker) getTypeOfExpression(node *ast.Node) *Type {
 	// If a type has been cached for the node, return it.
 	if cachedType := c.flowTypeCache[node]; cachedType != nil {
 		c.resolutionCycleCount++
+		c.flowMemo.addFlags(flowMemoFlagTypeCache)
 		return cachedType
 	}
 	startInvocationCount := c.flowInvocationCount
@@ -7654,6 +7654,7 @@ func (c *Checker) getTypeOfExpression(node *ast.Node) *Type {
 			c.flowTypeCache = make(map[*ast.Node]*Type)
 		}
 		c.flowTypeCache[node] = t
+		c.flowMemo.typeCacheEpoch = c.flowMemo.nextSerial()
 	}
 	return t
 }
@@ -7824,10 +7825,10 @@ func (c *Checker) checkExpressionCachedEx(node *ast.Node, checkMode CheckMode) *
 	if links.resolvedType == nil {
 		// When computing a type that we're going to cache, we need to ignore any ongoing control flow
 		saveFlowLoopStack := c.flowLoopStack
-		saveFlowTypeCache := c.flowTypeCache; c.flowTypeCache = nil
+		saveFlowTypeCache := c.takeFlowTypeCache()
 		c.flowLoopStack = nil
 		links.resolvedType = c.checkExpressionEx(node, checkMode)
-		c.flowTypeCache = saveFlowTypeCache
+		c.restoreFlowTypeCache(saveFlowTypeCache)
 		c.flowLoopStack = saveFlowLoopStack
 	}
 	return links.resolvedType
@@ -8737,6 +8738,7 @@ func (c *Checker) getResolvedSignature(node *ast.Node, candidatesOutArray *[]*Si
 		c.resolutionStart = len(c.typeResolutions)
 	} else if cached == c.resolvingSignature {
 		c.resolutionCycleCount++
+		c.flowMemo.taint(0)
 	}
 	links.resolvedSignature = c.resolvingSignature
 	result := c.resolveSignature(node, candidatesOutArray, checkMode)
@@ -9449,6 +9451,9 @@ func (c *Checker) chooseOverload(s *CallState, relation *Relation) *Signature {
 			// signature with different arity and we need to perform another arity check.
 			if c.getNonArrayRestType(candidate) != nil && !c.hasCorrectArity(s.node, s.args, checkCandidate, s.signatureHelpTrailingComma) {
 				s.candidateForArgumentArityError = checkCandidate
+				if inferenceContext != nil && !inferenceContext.escaped {
+					c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
+				}
 				continue
 			}
 		} else {
@@ -9457,6 +9462,9 @@ func (c *Checker) chooseOverload(s *CallState, relation *Relation) *Signature {
 		if !c.isSignatureApplicable(s.node, s.args, checkCandidate, relation, s.argCheckMode, false /*reportErrors*/, nil /*diagnosticOutput*/) {
 			// Give preference to error candidates that have no rest parameters (as they are more specific)
 			s.candidatesForArgumentError = append(s.candidatesForArgumentError, checkCandidate)
+			if inferenceContext != nil && !inferenceContext.escaped {
+				c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
+			}
 			continue
 		}
 		if s.argCheckMode != 0 {
@@ -9471,14 +9479,23 @@ func (c *Checker) chooseOverload(s *CallState, relation *Relation) *Signature {
 				// signature with different arity and we need to perform another arity check.
 				if c.getNonArrayRestType(candidate) != nil && !c.hasCorrectArity(s.node, s.args, checkCandidate, s.signatureHelpTrailingComma) {
 					s.candidateForArgumentArityError = checkCandidate
+					if !inferenceContext.escaped {
+						c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
+					}
 					continue
 				}
 			}
 			if !c.isSignatureApplicable(s.node, s.args, checkCandidate, relation, s.argCheckMode, false /*reportErrors*/, nil /*diagnosticOutput*/) {
 				// Give preference to error candidates that have no rest parameters (as they are more specific)
 				s.candidatesForArgumentError = append(s.candidatesForArgumentError, checkCandidate)
+				if inferenceContext != nil && !inferenceContext.escaped {
+					c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
+				}
 				continue
 			}
+		}
+		if inferenceContext != nil && !inferenceContext.escaped {
+			c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
 		}
 		s.candidates[candidateIndex] = checkCandidate
 		return checkCandidate
@@ -9838,6 +9855,9 @@ func (c *Checker) inferTypeArguments(node *ast.Node, signature *Signature, args 
 				} else {
 					context.returnMapper = nil
 				}
+				if !returnContext.escaped {
+					c.releaseConditionalInferenceContext(returnContext, nil, nil)
+				}
 			}
 		}
 	}
@@ -9957,6 +9977,9 @@ func (c *Checker) getTypeArgumentsFromNodes(typeArgumentNodes []*ast.Node, typeP
 func (c *Checker) inferSignatureInstantiationForOverloadFailure(node *ast.Node, typeParameters []*Type, candidate *Signature, args []*ast.Node, checkMode CheckMode) *Signature {
 	inferenceContext := c.newInferenceContext(typeParameters, candidate, core.IfElse(ast.IsInJSFile(node), InferenceFlagsAnyDefault, InferenceFlagsNone), nil)
 	typeArgumentTypes := c.inferTypeArguments(node, candidate, args, checkMode|CheckModeSkipContextSensitive|CheckModeSkipGenericFunctions, inferenceContext)
+	if !inferenceContext.escaped {
+		c.releaseConditionalInferenceContext(inferenceContext, nil, nil)
+	}
 	return c.createSignatureInstantiation(candidate, typeArgumentTypes)
 }
 
@@ -18981,22 +19004,38 @@ func getConditionalTypeKeySlow(typeArguments []*Type, alias *TypeAlias, forConst
 	return b.hash()
 }
 
-func getRelationKey(source *Type, target *Type, intersectionState IntersectionState, isIdentity bool, ignoreConstraints bool) (CacheHashKey, bool) {
+func getRelationKey(source *Type, target *Type, intersectionState IntersectionState, isIdentity bool, ignoreConstraints bool) (relationKey, bool) {
 	if isIdentity && source.id > target.id {
 		source, target = target, source
 	}
-	var b keyBuilder
-	var constrained bool
 	if isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) {
-		b.writeByte('g')
-		constrained = b.writeGenericTypeReferences(source, target, ignoreConstraints)
-	} else {
-		b.writeByte('s')
-		b.writeType(source)
-		b.writeType(target)
+		return getRelationKeyGeneric(source, target, intersectionState, ignoreConstraints)
 	}
+	if uint32(source.id) < 1<<27 && uint32(target.id) < 1<<27 {
+		return relationKey{value: CacheHashKey{
+			Lo: uint64(source.id)<<27 | uint64(target.id),
+			Hi: uint64(intersectionState),
+		}}, false
+	}
+	return relationKey{value: CacheHashKey{
+		Lo: uint64(source.id)<<32 | uint64(target.id),
+		Hi: uint64(intersectionState),
+	}, generic: true}, false
+}
+
+func getRelationKeyGeneric(source *Type, target *Type, intersectionState IntersectionState, ignoreConstraints bool) (relationKey, bool) {
+	if runtime.GOARCH == "wasm" {
+		b := acquireKeyBuilder()
+		b.writeByte('g')
+		constrained := b.writeGenericTypeReferences(source, target, ignoreConstraints)
+		b.writeUint32(uint32(intersectionState))
+		return relationKey{value: b.releaseHash(), generic: true}, constrained
+	}
+	var b keyBuilder
+	b.writeByte('g')
+	constrained := b.writeGenericTypeReferences(source, target, ignoreConstraints)
 	b.writeUint32(uint32(intersectionState))
-	return b.hash(), constrained
+	return relationKey{value: b.hash(), generic: true}, constrained
 }
 
 func getNodeListKey(nodes []*ast.Node) CacheHashKey {
@@ -20159,7 +20198,7 @@ func (c *Checker) pushTypeResolution(target TypeSystemEntity, propertyName TypeS
 		}
 		return false
 	}
-	c.typeResolutions = append(c.typeResolutions, TypeResolution{target: target, propertyName: propertyName, result: true, serial: 0})
+	c.typeResolutions = append(c.typeResolutions, TypeResolution{target: target, propertyName: propertyName, result: true, serial: c.flowMemo.sourceNow()})
 	return true
 }
 
@@ -20182,6 +20221,7 @@ func (c *Checker) findResolutionCycleStartIndex(target TypeSystemEntity, propert
 			return -1
 		}
 		if resolution.target == target && resolution.propertyName == propertyName {
+			c.flowMemo.taint(resolution.serial)
 			return i
 		}
 	}
@@ -21364,6 +21404,9 @@ func (c *Checker) instantiateSignatureInContextOf(signature *Signature, contextu
 		})
 	}
 	inferredTypes := c.getInferredTypes(context)
+	if !context.escaped {
+		c.releaseConditionalInferenceContext(context, nil, nil)
+	}
 	return c.getSignatureInstantiation(signature, inferredTypes, ast.IsInJSFile(contextualSignature.declaration), nil /*inferredTypeParameters*/)
 }
 
@@ -27223,6 +27266,8 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 		var combinedMapper *TypeMapper
 		if !checkTypeDeferred {
 			var context *InferenceContext
+			var nonFixingCombined *TypeMapper
+			var fixingCombined *TypeMapper
 			if len(root.inferTypeParameters) != 0 {
 				// When we're looking at making an inference for an `infer` type, when we get its constraint, it'll automagically be
 				// instantiated with the context, so it doesn't need the mapper for the inference context - however the constraint
@@ -27238,9 +27283,10 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 				// This means we have two mappers that need applying:
 				//   * The original `mapper` used to create this conditional
 				//   * The mapper that maps the infer type parameter to its inference result (`context.mapper`)
-				context = c.newInferenceContext(root.inferTypeParameters, nil, InferenceFlagsNone, nil)
+				context = c.acquireConditionalInferenceContext(root.inferTypeParameters)
 				if mapper != nil {
-					context.nonFixingMapper = c.combineTypeMappers(context.nonFixingMapper, mapper)
+					nonFixingCombined = c.combineTypeMappers(context.nonFixingMapper, mapper)
+					context.nonFixingMapper = nonFixingCombined
 				}
 				// We don't want inferences from constraints as they may cause us to eagerly resolve the
 				// conditional type instead of deferring resolution. Also, we always want strict function
@@ -27250,7 +27296,8 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 				// those type parameters are used in type references (see getInferredTypeParameterConstraint). For
 				// that reason we need context.mapper to be first in the combined mapper. See #42636 for examples.
 				if mapper != nil {
-					combinedMapper = c.combineTypeMappers(context.mapper, mapper)
+					fixingCombined = c.combineTypeMappers(context.mapper, mapper)
+					combinedMapper = fixingCombined
 				} else {
 					combinedMapper = context.mapper
 				}
@@ -27278,6 +27325,9 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 						return c.isTypeAssignableTo(t, c.getPermissiveInstantiation(checkType))
 					}) {
 						extraTypes = append(extraTypes, c.instantiateType(c.getTypeFromTypeNode(root.node.TrueType), core.OrElse(combinedMapper, mapper)))
+					}
+					if context != nil && !context.escaped {
+						c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
 					}
 					// If falseType is an immediately nested conditional type that isn't distributive or has an
 					// identical checkType, switch to that type and loop.
@@ -27310,6 +27360,9 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 					trueType := c.getTypeFromTypeNode(root.node.TrueType)
 					trueMapper := core.OrElse(combinedMapper, mapper)
 					if newRoot, newRootMapper := c.getTailRecursionRoot(trueType, trueMapper); newRoot != nil {
+						if context != nil && !context.escaped {
+							c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+						}
 						root = newRoot
 						mapper = newRootMapper
 						alias = nil
@@ -27319,6 +27372,9 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 						continue
 					}
 					result = c.instantiateType(trueType, trueMapper)
+					if context != nil && !context.escaped {
+						c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+					}
 					break
 				}
 			}
@@ -27476,17 +27532,25 @@ func (c *Checker) getInferredTrueTypeFromConditionalType(t *Type) *Type {
 	ex := d.ensureExtra(c)
 	if ex.resolvedInferredTrueType == nil {
 		combinedMapper := ex.combinedMapper
+		var context *InferenceContext
+		var nonFixingCombined *TypeMapper
+		var fixingCombined *TypeMapper
 		if combinedMapper == nil && len(d.root.inferTypeParameters) != 0 {
-			context := c.newInferenceContext(d.root.inferTypeParameters, nil, InferenceFlagsNone, nil)
+			context = c.acquireConditionalInferenceContext(d.root.inferTypeParameters)
 			if d.mapper != nil {
 				context.nonFixingMapper = c.combineTypeMappers(context.nonFixingMapper, d.mapper)
-				combinedMapper = c.combineTypeMappers(context.mapper, d.mapper)
+				fixingCombined = c.combineTypeMappers(context.mapper, d.mapper)
+				nonFixingCombined = context.nonFixingMapper
+				combinedMapper = fixingCombined
 			} else {
 				combinedMapper = context.mapper
 			}
 		}
 		if combinedMapper != nil {
 			ex.resolvedInferredTrueType = c.instantiateType(c.getTypeFromTypeNode(d.root.node.TrueType), combinedMapper)
+			if context != nil && !context.escaped {
+				c.releaseConditionalInferenceContext(context, fixingCombined, nonFixingCombined)
+			}
 		} else {
 			ex.resolvedInferredTrueType = c.getTrueTypeFromConditionalType(t)
 		}
@@ -33552,6 +33616,7 @@ func (c *Checker) getContextualTypeForArgumentAtIndex(callTarget *ast.Node, argI
 	var signature *Signature
 	if links := c.signatureLinks.TryGet(callTarget); links != nil && links.resolvedSignature == c.resolvingSignature {
 		c.resolutionCycleCount++
+		c.flowMemo.taint(0)
 		signature = c.resolvingSignature
 	} else {
 		signature = c.getResolvedSignature(callTarget, nil, CheckModeNormal)
@@ -35310,6 +35375,7 @@ func (c *Checker) getNarrowableTypeForReference(t *Type, reference *ast.Node, ch
 	// 'string | undefined' to give control flow analysis the opportunity to narrow to type 'string'.
 	substituteConstraints := checkMode&CheckModeInferential == 0 && c.someGenericTypeWithUnionConstraint(t) && (c.isConstraintPosition(t, reference) || c.hasContextualTypeWithNoGenericTypes(reference, checkMode))
 	if substituteConstraints {
+		c.flowMemo.taint(0)
 		return c.mapType(t, c.getBaseConstraintOrType)
 	}
 	return t

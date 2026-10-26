@@ -329,7 +329,10 @@ func (a *tracedTypeAdapter) Pattern() *ast.Node {
 }
 
 func (a *tracedTypeAdapter) RecursionIdentity() any {
-	return getRecursionIdentity(a.t).value
+	if id := getRecursionIdentity(a.t); id != 0 {
+		return id
+	}
+	return nil
 }
 
 func (a *tracedTypeAdapter) Display() string {
