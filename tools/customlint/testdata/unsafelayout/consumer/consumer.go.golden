@@ -1,0 +1,217 @@
+	package consumer
+	
+	import (
+		"unsafe"
+	
+		"testdata/unsafelayout/internal/ast"
+		"testdata/unsafelayout/internal/checker"
+	)
+	
+	type BadNode ast.Node
+	     ~
+!!! unsafelayout: defining a new compiler-record type bypasses checked construction; use a type alias
+	
+	type NodeAlias = ast.Node
+	
+	type BorrowedNode struct {
+		*ast.Node
+	}
+	
+	func uses(node *ast.Node, declaration *ast.ImportDeclaration, kind ast.Kind, typ *checker.Type) {
+		node.Kind = ast.KindIdentifier
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		declaration.Kind = ast.KindImportDeclaration
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		declaration.Kind = ast.KindJSImportDeclaration
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		node.AsImportDeclaration().Kind = ast.KindImportDeclaration
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		declaration.Kind = ast.KindIdentifier
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		declaration.Kind = kind
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		declaration.Kind++
+		~
+!!! unsafelayout: incrementing a compiler tag bypasses checked tag assignment
+		_ = &node.Kind
+		    ~
+!!! unsafelayout: taking a compiler tag's address bypasses checked tag assignment
+		_ = &ast.Node{Kind: ast.KindIdentifier}
+		     ~
+!!! unsafelayout: a bare compiler header has no concrete payload; use a concrete factory
+		     ~
+!!! unsafelayout: construct compiler records through their owning factories, not struct literals
+		              ~
+!!! unsafelayout: compiler tags must be assigned by checked construction, not struct literals
+		_ = &ast.Identifier{}
+		     ~
+!!! unsafelayout: construct compiler records through their owning factories, not struct literals
+		_ = new(ast.Node)
+		    ~
+!!! unsafelayout: a bare compiler header has no concrete payload; use a concrete factory
+		    ~
+!!! unsafelayout: allocate compiler records through their owning factories
+		_ = new(ast.Identifier)
+		    ~
+!!! unsafelayout: allocate compiler records through their owning factories
+		_ = new(NodeAlias)
+		    ~
+!!! unsafelayout: a bare compiler header has no concrete payload; use a concrete factory
+		    ~
+!!! unsafelayout: allocate compiler records through their owning factories
+		_ = unsafe.Sizeof(ast.Node{})
+		_ = unsafe.Offsetof(ast.Identifier{}.Node)
+		_ = (*ast.Identifier)(unsafe.Pointer(node))
+		    ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		                      ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		_ = *node
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = *declaration
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = *typ
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		copy := *node
+		~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+		        ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = copy
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		pointer := unsafe.Pointer(node)
+		           ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		_ = pointer
+		borrowed := BorrowedNode{Node: node}
+		borrowed.Kind = ast.KindIdentifier
+		~
+!!! unsafelayout: AST kind is immutable outside checked construction; create a new node
+		_ = &borrowed.Kind
+		    ~
+!!! unsafelayout: taking a compiler tag's address bypasses checked tag assignment
+	}
+	
+	type Pointer unsafe.Pointer
+	
+	type PointerAlias = unsafe.Pointer
+	
+	func zeroValues(node *ast.Node) {
+		var identifier ast.Identifier
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = &identifier
+		var identifiers [2]ast.Identifier
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = &identifiers[0]
+		var holder struct{ identifier ast.Identifier }
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = &holder.identifier
+		var pointers [2]*ast.Identifier
+		_ = pointers
+		_ = new([2]ast.Identifier)
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = make([]ast.Identifier, 1)
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = make([]*ast.Identifier, 1)
+		_ = [2]ast.Identifier{}
+		    ~
+!!! unsafelayout: a zero-value compiler record bypasses checked construction; use its owning factory
+		_ = (*ast.Identifier)(Pointer(node))
+		    ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		                      ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		_ = (*ast.Identifier)(PointerAlias(node))
+		    ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+		                      ~
+!!! unsafelayout: reinterpret compiler records only through checked casts or generated AST dispatch
+	}
+	
+	func retag(node *ast.Node, kinds []ast.Kind) {
+		for _, node.Kind = range kinds {
+		       ~
+!!! unsafelayout: range assignment to a compiler tag bypasses checked tag assignment
+		}
+	}
+	
+	func zeroResult() (n ast.Identifier) {
+	                   ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+		return
+	}
+	
+	func byValueParam(identifier ast.Identifier, identifiers [2]ast.Identifier) {}
+	                  ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+	                                             ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+	
+	func copies(records map[string]ast.Identifier, channel chan ast.Identifier, get func() ast.Identifier, slice []ast.Identifier) *ast.Identifier {
+		record := records["key"]
+		~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+		          ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = <-channel
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = get()
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = slice[0]
+		    ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		_ = &slice[0]
+		_ = slice[0].Text
+		_ = len(slice[:1])
+		return &record
+	}
+	
+	func rangeCopies(records []ast.Identifier, byKey map[string]ast.Identifier, channel chan ast.Identifier) {
+		for _, record := range records {
+		       ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+			_ = record.Text
+		}
+		for _, record := range byKey {
+		       ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+			_ = record.Text
+		}
+		for record := range channel {
+		    ~
+!!! unsafelayout: declaring a compiler record by value copies or detaches its tagged header; use a pointer
+			_ = record.Text
+		}
+		for i := range records {
+			_ = &records[i]
+		}
+	}
+	
+	func bulkCopies(dst, src []ast.Identifier, pointers []*ast.Identifier) []ast.Identifier {
+		copy(dst, src)
+		~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+		pointers = append(pointers, pointers...)
+		copy(pointers, pointers)
+		return append(dst, src...)
+		       ~
+!!! unsafelayout: copying a compiler record by value can detach its tagged header; keep a pointer
+	}
+	
