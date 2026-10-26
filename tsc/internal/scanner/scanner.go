@@ -198,6 +198,50 @@ var textToToken = func() map[string]ast.Kind {
 	return m
 }()
 
+type keywordEntry struct {
+	text string
+	kind ast.Kind
+}
+
+var keywordTable = func() [512]keywordEntry {
+	var table [512]keywordEntry
+	for text, kind := range textToKeyword {
+		n := len(text)
+		k := (uint32(text[0]) | uint32(text[1])<<8 | uint32(text[n-1])<<16 | uint32(text[n>>1])<<24) ^ (uint32(n) * 0x9e3779b9)
+		idx := (k * 0xa2053) >> 23
+		table[idx] = keywordEntry{text: text, kind: kind}
+	}
+	return table
+}()
+
+var isASCIIIdentPart = func() [256]bool {
+	var table [256]bool
+	for b := byte('a'); b <= 'z'; b++ {
+		table[b] = true
+	}
+	for b := byte('A'); b <= 'Z'; b++ {
+		table[b] = true
+	}
+	for b := byte('0'); b <= '9'; b++ {
+		table[b] = true
+	}
+	table['_'] = true
+	table['$'] = true
+	return table
+}()
+
+func lookupKeyword(str string) ast.Kind {
+	n := len(str)
+	if n >= 2 && n <= 11 && str[0] >= 'a' && str[0] <= 'z' {
+		k := (uint32(str[0]) | uint32(str[1])<<8 | uint32(str[n-1])<<16 | uint32(str[n>>1])<<24) ^ (uint32(n) * 0x9e3779b9)
+		entry := &keywordTable[(k*0xa2053)>>23]
+		if entry.text == str {
+			return entry.kind
+		}
+	}
+	return ast.KindUnknown
+}
+
 type ScannerState struct {
 	pos                       int            // Current position in text (and ending position of current token)
 	fullStartPos              int            // Starting position of current token including preceding whitespace
@@ -486,6 +530,12 @@ func (s *Scanner) Scan() ast.Kind {
 		case '\t', '\v', '\f', ' ':
 			s.pos++
 			if s.skipTrivia {
+				text := s.text
+				pos := s.pos
+				for pos < s.end && (text[pos] == ' ' || text[pos] == '\t') {
+					pos++
+				}
+				s.pos = pos
 				continue
 			}
 			for {
@@ -1489,13 +1539,15 @@ func (s *Scanner) scanIdentifier(prefixLength int, variant identifierVariant) bo
 	ch := s.char()
 	// Fast path for simple ASCII identifiers
 	if variant != identifierVariantJSX && (stringutil.IsASCIILetter(ch) || ch == '_' || ch == '$') {
-		s.pos++
-		s.scanASCIIWhile(func(b byte) bool {
-			return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '$'
-		})
+		text := s.text
+		pos := s.pos + 1
+		for pos < s.end && isASCIIIdentPart[text[pos]] {
+			pos++
+		}
+		s.pos = pos
 		ch = s.char()
 		if ch < utf8.RuneSelf && ch != '\\' {
-			s.tokenValue = s.text[start:s.pos]
+			s.tokenValue = text[start:pos]
 			return true
 		}
 		s.pos = identifierStart
@@ -2212,11 +2264,8 @@ func (s *Scanner) scanInvalidCharacter() {
 }
 
 func GetIdentifierToken(str string) ast.Kind {
-	if len(str) >= 2 && len(str) <= 12 && str[0] >= 'a' && str[0] <= 'z' {
-		keyword := textToKeyword[str]
-		if keyword != ast.KindUnknown {
-			return keyword
-		}
+	if keyword := lookupKeyword(str); keyword != ast.KindUnknown {
+		return keyword
 	}
 	return ast.KindIdentifier
 }
