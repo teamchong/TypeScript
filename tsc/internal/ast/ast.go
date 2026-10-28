@@ -31,6 +31,12 @@ type Visitor func(*Node) bool
 
 func visit(v Visitor, node *Node) bool {
 	if node != nil {
+		if node.Kind == KindUnknown {
+			node = node.forceLazyTypeNode()
+			if node == nil {
+				return false
+			}
+		}
 		return v(node)
 	}
 	return false
@@ -542,7 +548,11 @@ var nodeTypeOffset = [kindFlowReduceLabelData + 1]uint8{
 
 func (n *Node) Type() *Node {
 	if offset := nodeTypeOffset[n.Kind]; offset != 0 {
-		return *(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
+		t := *(**Node)(unsafe.Add(unsafe.Pointer(&n.Flags), offset-nodeFlagsOffset))
+		if t != nil && t.Kind == KindUnknown {
+			return t.forceLazyTypeNode()
+		}
+		return t
 	}
 	if funcLike := n.FunctionLikeData(); funcLike != nil {
 		return funcLike.Type

@@ -18241,6 +18241,11 @@ type keyBuilder struct {
 
 var wasmKeyBuilderPool []*keyBuilder
 
+func ResetWasmPools() {
+	wasmKeyBuilderPool = nil
+	primitiveTypeAliasSuggestions()
+}
+
 func acquireKeyBuilder() *keyBuilder {
 	if n := len(wasmKeyBuilderPool); n > 0 {
 		b := wasmKeyBuilderPool[n-1]
@@ -24626,8 +24631,13 @@ func (c *Checker) instantiateTypeWithAliasSlow(t *Type, m *TypeMapper, alias *Ty
 	if !(c.couldContainTypeVariables(t) || (t.alias != nil && len(t.alias.typeArguments) > 0 && c.anyCouldContainTypeVariables(t.alias.typeArguments))) {
 		return t
 	}
-	if len(c.instantiationStack) == 100 || c.instantiationCount >= 5_000_000 {
-		// We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
+	maxInstDepth := 100
+	maxInstCount := uint32(5_000_000)
+	if runtime.GOARCH == "wasm" {
+		maxInstDepth = 500
+		maxInstCount = 50_000_000
+	}
+	if len(c.instantiationStack) == maxInstDepth || c.instantiationCount >= maxInstCount {
 		// or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
 		// that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
 		if tr := c.tracer; tr != nil {
@@ -24838,7 +24848,26 @@ func (c *Checker) instantiateTypeWorker(t *Type, m *TypeMapper, alias *TypeAlias
 			alias = c.instantiateTypeAlias(t.alias, m)
 		}
 		d := t.AsIndexedAccessType()
-		return c.getIndexedAccessTypeEx(c.instantiateType(d.objectType, m), c.instantiateType(d.indexType, m), d.accessFlags, nil /*accessNode*/, alias)
+		objectType := c.instantiateType(d.objectType, m)
+		if d.accessFlags == AccessFlagsNone && isTupleType(objectType) && !c.compilerOptions.NoUncheckedIndexedAccess.IsTrue() {
+			tuple := objectType.TargetTupleType()
+			if tuple.combinedFlags&(ElementFlagsOptional|ElementFlagsVariable) == 0 && d.indexType.flags&TypeFlagsIntersection != 0 {
+				if iTypes := d.indexType.Types(); len(iTypes) == 2 {
+					var keyCand *Type
+					if iTypes[0].flags&TypeFlagsIndex != 0 && iTypes[0].AsIndexType().target == d.objectType && iTypes[0].AsIndexType().indexFlags == IndexFlagsNone {
+						keyCand = c.instantiateType(iTypes[1], m)
+					} else if iTypes[1].flags&TypeFlagsIndex != 0 && iTypes[1].AsIndexType().target == d.objectType && iTypes[1].AsIndexType().indexFlags == IndexFlagsNone {
+						keyCand = c.instantiateType(iTypes[0], m)
+					}
+					if keyCand != nil {
+						if fast := c.tryFastTupleIndexedAccess(objectType, keyCand); fast != nil {
+							return fast
+						}
+					}
+				}
+			}
+		}
+		return c.getIndexedAccessTypeEx(objectType, c.instantiateType(d.indexType, m), d.accessFlags, nil /*accessNode*/, alias)
 	case flags&TypeFlagsTemplateLiteral != 0:
 		newTypes, changed := c.instantiateTypesTemp(t.AsTemplateLiteralType().types, m)
 		res := c.getTemplateLiteralType(t.AsTemplateLiteralType().texts, newTypes)
@@ -25342,8 +25371,17 @@ func (c *Checker) instantiateMappedTupleType(tupleType *Type, mappedType *Type, 
 	}
 	modifiers := getMappedTypeModifiers(mappedType)
 	elementTypes := c.getElementTypes(tupleType)
+	tupleTarget := tupleType.TargetTupleType()
+	if modifiers == 0 && fixedLength == len(elementTypes) && tupleTarget.combinedFlags&(ElementFlagsOptional|ElementFlagsVariable) == 0 {
+		if fast := c.tryFastMappedTupleSet(tupleType, mappedType, typeVariable, elementTypes, elementInfos, tupleTarget.readonly, fixedMapper); fast != nil {
+			return fast
+		}
+	}
 	newElementTypes := make([]*Type, len(elementTypes))
-	newElementInfos := slices.Clone(elementInfos)
+	newElementInfos := elementInfos
+	if modifiers != 0 {
+		newElementInfos = slices.Clone(elementInfos)
+	}
 	for i, e := range elementTypes {
 		flags := elementInfos[i].flags
 		var mapped *Type
@@ -25354,9 +25392,9 @@ func (c *Checker) instantiateMappedTupleType(tupleType *Type, mappedType *Type, 
 			mapped = c.instantiateType(mappedType, prependTypeMapping(typeVariable, e, m))
 		default:
 			mapped = c.getElementTypeOfArrayType(c.instantiateType(mappedType, prependTypeMapping(typeVariable, c.createArrayType(e), m)))
-			if mapped == nil {
-				mapped = c.unknownType
-			}
+		}
+		if mapped == nil {
+			mapped = c.unknownType
 		}
 		switch {
 		case modifiers&MappedTypeModifiersIncludeOptional != 0:
@@ -25370,11 +25408,102 @@ func (c *Checker) instantiateMappedTupleType(tupleType *Type, mappedType *Type, 
 		}
 		newElementTypes[i] = mapped
 	}
-	newReadonly := getModifiedReadonlyState(tupleType.TargetTupleType().readonly, getMappedTypeModifiers(mappedType))
+	newReadonly := getModifiedReadonlyState(tupleTarget.readonly, modifiers)
 	if slices.Contains(newElementTypes, c.errorType) {
 		return c.errorType
 	}
 	return c.createTupleTypeEx(newElementTypes, newElementInfos, newReadonly)
+}
+
+func (c *Checker) tryFastMappedTupleSet(tupleType *Type, mappedType *Type, typeVariable *Type, elementTypes []*Type, elementInfos []TupleElementInfo, readonly bool, fixedMapper *TypeMapper) *Type {
+	target := core.OrElse(mappedType.AsMappedType().target, mappedType)
+	if target.AsMappedType().declaration.NameType != nil {
+		return nil
+	}
+	template := c.getTemplateTypeFromMappedType(target)
+	if template.flags&TypeFlagsConditional == 0 {
+		return nil
+	}
+	cond := template.AsConditionalType()
+	if cond.mapper != nil {
+		return nil
+	}
+	root := cond.root
+	if root.isDistributive && len(root.inferTypeParameters) != 0 {
+		return nil
+	}
+	typeParam := c.getTypeParameterFromMappedType(mappedType)
+	if root.checkType != typeParam {
+		return nil
+	}
+	falseNode := ast.SkipTypeParentheses(root.node.FalseType)
+	if falseNode.Kind != ast.KindIndexedAccessType {
+		return nil
+	}
+	ia := falseNode.AsIndexedAccessTypeNode()
+	if c.getTypeFromTypeNode(ia.ObjectType) != typeVariable || c.getTypeFromTypeNode(ia.IndexType) != typeParam {
+		return nil
+	}
+	instExtends := c.instantiateType(root.extendsType, fixedMapper)
+	if instExtends.flags&TypeFlagsStringLiteral == 0 {
+		return nil
+	}
+	idx, ok := parseSmallTupleIndex(instExtends.AsLiteralType().value.(string))
+	if !ok || idx < 0 || idx >= len(elementTypes) {
+		return nil
+	}
+	trueMapper := appendTypeMapping(fixedMapper, typeParam, instExtends)
+	mapped := c.instantiateType(c.getTrueTypeFromConditionalType(template), trueMapper)
+	if mapped == nil {
+		mapped = c.unknownType
+	}
+	if mapped == c.errorType {
+		return c.errorType
+	}
+	newElementTypes := slices.Clone(elementTypes)
+	newElementTypes[idx] = mapped
+	return c.createTupleTypeEx(newElementTypes, elementInfos, readonly)
+}
+
+func parseSmallTupleIndex(s string) (int, bool) {
+	if len(s) == 0 || len(s) > 6 {
+		return 0, false
+	}
+	if len(s) > 1 && s[0] == '0' {
+		return 0, false
+	}
+	n := 0
+	for i := range len(s) {
+		ch := s[i]
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, true
+}
+
+func (c *Checker) tryFastTupleIndexedAccess(objectType *Type, indexType *Type) *Type {
+	if indexType.flags&TypeFlagsNumberLiteral != 0 {
+		f := float64(indexType.AsLiteralType().value.(jsnum.Number))
+		idx := int(f)
+		if float64(idx) == f && idx >= 0 {
+			if typeArgs := c.getTypeArguments(objectType); idx < len(typeArgs) {
+				return typeArgs[idx]
+			}
+		}
+	} else if indexType.flags&TypeFlagsStringLiteral != 0 {
+		s := indexType.AsLiteralType().value.(string)
+		if s == "length" {
+			return c.getNumberLiteralType(jsnum.Number(len(c.getTypeArguments(objectType))))
+		}
+		if idx, ok := parseSmallTupleIndex(s); ok {
+			if typeArgs := c.getTypeArguments(objectType); idx < len(typeArgs) {
+				return typeArgs[idx]
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Checker) instantiateMappedTypeTemplate(t *Type, key *Type, isOptional bool, m *TypeMapper) *Type {
@@ -27242,8 +27371,12 @@ func (c *Checker) getConditionalType(root *ConditionalRoot, mapper *TypeMapper, 
 	// purposes of resolution. We also loop here when resolution of a conditional type ends in resolution of
 	// another (or, through recursion, possibly the same) conditional type. In the potentially tail-recursive
 	// cases we increment the tail recursion counter and stop after 1000 iterations.
+	maxTailCount := 1000
+	if runtime.GOARCH == "wasm" {
+		maxTailCount = 8192
+	}
 	for {
-		if tailCount == 1000 {
+		if tailCount == maxTailCount {
 			c.error(c.currentNode, diagnostics.Type_instantiation_is_excessively_deep_and_possibly_infinite)
 			return c.errorType
 		}
@@ -30529,8 +30662,14 @@ func (c *Checker) getIndexedAccessTypeOrUndefined(objectType *Type, indexType *T
 	if objectType == c.wildcardType || indexType == c.wildcardType {
 		return c.wildcardType
 	}
+	if accessNode == nil && alias == nil && accessFlags == AccessFlagsNone && !c.compilerOptions.NoUncheckedIndexedAccess.IsTrue() && isTupleType(objectType) {
+		if objectType.TargetTupleType().combinedFlags&(ElementFlagsOptional|ElementFlagsVariable) == 0 {
+			if fast := c.tryFastTupleIndexedAccess(objectType, indexType); fast != nil {
+				return fast
+			}
+		}
+	}
 	objectType = c.getReducedType(objectType)
-	// If the object type has a string index signature and no other members we know that the result will
 	// always be the type of that index signature and we can simplify accordingly.
 	if c.isStringIndexSignatureOnlyType(objectType) && indexType.flags&TypeFlagsNullable == 0 && c.isTypeAssignableToKind(indexType, TypeFlagsString|TypeFlagsNumber) {
 		indexType = c.stringType

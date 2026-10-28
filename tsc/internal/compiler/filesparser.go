@@ -242,6 +242,16 @@ var parseTaskDataPool = sync.Pool{
 	},
 }
 
+func resetParseTaskDataPool() {
+	parseTaskDataPool = sync.Pool{
+		New: func() any {
+			return &parseTaskData{
+				tasks: make(map[tspath.RootedFilePath]*parseTask, 1),
+			}
+		},
+	}
+}
+
 func getParseTaskData(task *parseTask) *parseTaskData {
 	td := parseTaskDataPool.Get().(*parseTaskData)
 	td.firstTask = task

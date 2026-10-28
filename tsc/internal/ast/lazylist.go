@@ -1,10 +1,12 @@
 package ast
 
 import (
+	"maps"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/microsoft/TypeScript/tsc/internal/collections"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 )
 
@@ -13,6 +15,8 @@ const (
 	LazyListDeferred uint32 = 1 // Binder visited owner and deferred binding
 	LazyListUnbound  uint32 = 2 // File finished binding without visiting owner
 	LazyListDone     uint32 = 3 // Forced (parsed and bound if deferred)
+
+	LazyParsingContextTypeAliasRHS uint8 = 255
 )
 
 var (
@@ -30,6 +34,7 @@ type LazyBindContext struct {
 
 type LazyNodeList struct {
 	NodeList        // Must be at offset 0 so (*LazyNodeList)(unsafe.Pointer(list)) is valid
+	Placeholder     Node
 	state           atomic.Uint32
 	ParsingContext  uint8
 	ContextFlags    NodeFlags
@@ -42,11 +47,83 @@ type LazyNodeList struct {
 	mu              sync.Mutex
 }
 
+type savedMemberSymbolState struct {
+	sym        *Symbol
+	declHeader uint32
+	declPtr    unsafe.Pointer
+	valueDecl  *Node
+}
+
+type forcedSymbolState struct {
+	owner        *Symbol
+	prevExtra    *symbolExtra
+	savedMembers []savedMemberSymbolState
+}
+
 var (
-	lazyReparseHook func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node
-	lazyBindHook    func(lazy *LazyNodeList, file *SourceFile, nodes []*Node)
-	lazySymbolLocks [256]sync.Mutex
+	lazyReparseHook   func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node
+	lazyBindHook      func(lazy *LazyNodeList, file *SourceFile, nodes []*Node)
+	lazySymbolLocks   [256]sync.Mutex
+	trackForcedLazy   atomic.Bool
+	forcedLazyMu      sync.Mutex
+	forcedLazyLists   []*LazyNodeList
+	forcedLazySymbols []forcedSymbolState
 )
+
+func SetTrackForcedLazy(enabled bool) {
+	trackForcedLazy.Store(enabled)
+}
+
+func ResetForcedLazyLists() {
+	forcedLazyMu.Lock()
+	defer forcedLazyMu.Unlock()
+	for i := len(forcedLazySymbols) - 1; i >= 0; i-- {
+		entry := forcedLazySymbols[i]
+		for _, sm := range entry.savedMembers {
+			md := &(*SymbolWithData)(unsafe.Pointer(sm.sym)).d
+			sm.sym.declHeader = sm.declHeader
+			md.declPtr = sm.declPtr
+			md.valueDeclaration = sm.valueDecl
+		}
+		d := &(*SymbolWithData)(unsafe.Pointer(entry.owner)).d
+		d.extra = entry.prevExtra
+		entry.owner.SetHasLazyMembers()
+	}
+	forcedLazySymbols = nil
+	for i := len(forcedLazyLists) - 1; i >= 0; i-- {
+		l := forcedLazyLists[i]
+		l.forcedNodes = nil
+		l.nestedLazyLists = nil
+		if l.BindCtx != nil {
+			l.state.Store(LazyListDeferred)
+		} else {
+			l.state.Store(LazyListUnbound)
+		}
+	}
+	forcedLazyLists = nil
+	for i := range subtreeFactsShards {
+		subtreeFactsShards[i].m = nil
+	}
+	setParentInChildrenPool = sync.Pool{
+		New: func() any {
+			return newParentInChildrenSetter()
+		},
+	}
+}
+
+func (node *SourceFile) ResetWasmCaches() {
+	node.jsdocCache = nil
+	node.identifiersOnce = sync.Once{}
+	node.identifiers = collections.Set[string]{}
+	node.declarationMap = nil
+	node.nameTableOnce = sync.Once{}
+	node.nameTable = nil
+	node.positionMapOnce = sync.Once{}
+	node.positionMap = nil
+	node.ecmaLineMap = nil
+	node.tokenCache = nil
+	node.tokenFactory = nil
+}
 
 func SetLazyParseHook(fn func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node) {
 	lazyReparseHook = fn
@@ -64,6 +141,45 @@ func NewLazyNodeList(loc core.TextRange, parsingContext uint8, contextFlags Node
 	list.ContextFlags = contextFlags
 	list.ParsingContexts = parsingContexts
 	return &list
+}
+
+func NewLazyTypeAliasRHS(loc core.TextRange, contextFlags NodeFlags, parsingContexts uint32) *LazyNodeList {
+	var list LazyNodeList
+	list.Loc = loc
+	list.Nodes = lazySentinelNodes
+	list.ParsingContext = LazyParsingContextTypeAliasRHS
+	list.ContextFlags = contextFlags
+	list.ParsingContexts = parsingContexts
+	list.Placeholder.Loc = loc
+	list.Placeholder.Kind = KindUnknown
+	list.Placeholder.Parent = (*Node)(unsafe.Pointer(&list))
+	return &list
+}
+
+func (n *Node) IsLazyTypeNode() bool {
+	return n != nil && n.Kind == KindUnknown && n.Parent != nil
+}
+
+func (n *Node) AsLazyTypeNode() *LazyNodeList {
+	return (*LazyNodeList)(unsafe.Pointer(n.Parent))
+}
+
+//go:noinline
+func (n *Node) forceLazyTypeNode() *Node {
+	if n.Parent == nil {
+		return nil
+	}
+	nodes := (*LazyNodeList)(unsafe.Pointer(n.Parent)).Force()
+	if len(nodes) > 0 {
+		return nodes[0]
+	}
+	return nil
+}
+
+func SetLazyTypeOwner(typeNode *Node, owner *Node) {
+	if typeNode.IsLazyTypeNode() {
+		typeNode.AsLazyTypeNode().Owner = owner
+	}
 }
 
 func (list *NodeList) IsLazy() bool {
@@ -156,10 +272,16 @@ func (lazy *LazyNodeList) Force() []*Node {
 	lazy.forcedNodes = nodes
 	if wasDeferred && lazy.BindCtx != nil {
 		lazyBindHook(lazy, lazy.File, nodes)
-		for _, nested := range lazy.nestedLazyLists {
-			nested.MarkUnbound(lazy.File)
-		}
-		lazy.nestedLazyLists = nil
+	}
+	for _, nested := range lazy.nestedLazyLists {
+		nested.MarkUnbound(lazy.File)
+	}
+	lazy.nestedLazyLists = nil
+	if trackForcedLazy.Load() {
+		forcedLazyMu.Lock()
+		forcedLazyLists = append(forcedLazyLists, lazy)
+		forcedLazyMu.Unlock()
+	} else {
 		lazy.BindCtx = nil
 	}
 	lazy.state.Store(LazyListDone)
@@ -262,6 +384,22 @@ func (s *Symbol) getExportsSlow(arena *SymbolExtraArena) SymbolTable {
 	return *m
 }
 
+func saveTableMemberStates(t SymbolTable, dst []savedMemberSymbolState) []savedMemberSymbolState {
+	for _, m := range t {
+		if m != nil {
+			mo := m.owner()
+			md := &(*SymbolWithData)(unsafe.Pointer(mo)).d
+			dst = append(dst, savedMemberSymbolState{
+				sym:        mo,
+				declHeader: mo.declHeader,
+				declPtr:    md.declPtr,
+				valueDecl:  md.valueDeclaration,
+			})
+		}
+	}
+	return dst
+}
+
 func (s *Symbol) forceLazyMembers() {
 	if s == nil {
 		return
@@ -275,6 +413,31 @@ func (s *Symbol) forceLazyMembers() {
 	defer mu.Unlock()
 	if atomic.LoadUint32(&owner.declHeader)&lazyStateMask != lazyStatePending {
 		return
+	}
+	tracking := trackForcedLazy.Load()
+	if tracking {
+		d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+		prevExtra := d.extra
+		var savedMembers []savedMemberSymbolState
+		if prevExtra != nil {
+			cloned := *prevExtra
+			if cloned.members != nil {
+				savedMembers = saveTableMemberStates(cloned.members, savedMembers)
+				cloned.members = maps.Clone(cloned.members)
+			}
+			if cloned.exports != nil {
+				savedMembers = saveTableMemberStates(cloned.exports, savedMembers)
+				cloned.exports = maps.Clone(cloned.exports)
+			}
+			d.extra = &cloned
+		}
+		forcedLazyMu.Lock()
+		forcedLazySymbols = append(forcedLazySymbols, forcedSymbolState{
+			owner:        owner,
+			prevExtra:    prevExtra,
+			savedMembers: savedMembers,
+		})
+		forcedLazyMu.Unlock()
 	}
 	for {
 		old := atomic.LoadUint32(&owner.declHeader)
@@ -299,7 +462,13 @@ func (s *Symbol) forceLazyMembers() {
 						nested.MarkUnbound(l.File)
 					}
 					l.nestedLazyLists = nil
-					l.BindCtx = nil
+					if tracking {
+						forcedLazyMu.Lock()
+						forcedLazyLists = append(forcedLazyLists, l)
+						forcedLazyMu.Unlock()
+					} else {
+						l.BindCtx = nil
+					}
 					l.state.Store(LazyListDone)
 				}
 			}

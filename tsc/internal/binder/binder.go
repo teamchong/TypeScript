@@ -113,6 +113,16 @@ var binderPool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	binderPool = sync.Pool{
+		New: func() any {
+			b := &Binder{}
+			b.bindFunc = b.bind
+			return b
+		},
+	}
+}
+
 func getBinder() *Binder {
 	return binderPool.Get().(*Binder)
 }
@@ -1755,6 +1765,9 @@ func (b *Binder) bindChildren(node *ast.Node) {
 	case ast.KindInterfaceDeclaration, ast.KindClassDeclaration, ast.KindClassExpression, ast.KindTypeLiteral:
 		b.bindEachChild(node)
 		b.bindLazyMemberList(node)
+	case ast.KindTypeAliasDeclaration:
+		b.bindEachChild(node)
+		b.bindLazyTypeAlias(node)
 	default:
 		b.bindEachChild(node)
 	}
@@ -1809,6 +1822,40 @@ func (b *Binder) bindLazyMemberList(node *ast.Node) {
 		UnreachableFlow:     b.unreachableFlow,
 	})
 	symbol.SetHasLazyMembers()
+}
+
+func (b *Binder) bindLazyTypeAlias(node *ast.Node) {
+	typeNode := node.AsTypeAliasDeclaration().Type
+	if !typeNode.IsLazyTypeNode() {
+		return
+	}
+	lazy := typeNode.AsLazyTypeNode()
+	plain := b.currentFlow != b.unreachableFlow &&
+		b.currentBreakTarget == nil &&
+		b.currentContinueTarget == nil &&
+		b.currentReturnTarget == nil &&
+		b.currentTrueTarget == nil &&
+		b.currentFalseTarget == nil &&
+		b.currentExceptionTarget == nil &&
+		b.preSwitchCaseFlow == nil &&
+		b.activeLabelList == nil &&
+		!b.inAssignmentPattern
+	if !plain {
+		nodes := lazy.ParseNow(b.file)
+		b.bindEach(nodes)
+		for _, nested := range lazy.NestedLazyLists() {
+			nested.MarkUnbound(b.file)
+		}
+		lazy.SetNestedLazyLists(nil)
+		return
+	}
+	lazy.Defer(b.file, &ast.LazyBindContext{
+		Container:           b.container,
+		ThisContainer:       b.thisContainer,
+		BlockScopeContainer: b.blockScopeContainer,
+		CurrentFlow:         b.currentFlow,
+		UnreachableFlow:     b.unreachableFlow,
+	})
 }
 
 func bindLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, nodes []*ast.Node) {

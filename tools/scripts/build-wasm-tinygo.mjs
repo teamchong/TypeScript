@@ -142,6 +142,33 @@ execFileSync(
         stdio: "inherit",
     },
 );
+function findWasmOpt() {
+    const res = spawnSync("wasm-opt", ["--version"], { encoding: "utf8" });
+    if (res.status === 0) return "wasm-opt";
+    for (const candidate of ["/opt/homebrew/bin/wasm-opt", "/usr/local/bin/wasm-opt"]) {
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+}
+
+const wasmOptBin = findWasmOpt();
+if (wasmOptBin) {
+    execFileSync(
+        wasmOptBin,
+        [
+            "-O3",
+            "--enable-bulk-memory",
+            "--enable-sign-ext",
+            "--enable-mutable-globals",
+            "--enable-nontrapping-float-to-int",
+            "--enable-simd",
+            outPath,
+            "-o",
+            outPath,
+        ],
+        { stdio: "inherit" },
+    );
+}
 
 const stat = fs.statSync(outPath);
 console.log(`Built ${outPath} (${(stat.size / (1024 * 1024)).toFixed(2)} MiB) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);

@@ -1,16 +1,81 @@
 package compiler
 
 import (
+	"runtime"
+	"strings"
+
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
+	"github.com/microsoft/TypeScript/tsc/internal/binder"
+	"github.com/microsoft/TypeScript/tsc/internal/checker"
 	"github.com/microsoft/TypeScript/tsc/internal/contentmapper"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
 	"github.com/microsoft/TypeScript/tsc/internal/parser"
+	"github.com/microsoft/TypeScript/tsc/internal/printer"
 	"github.com/microsoft/TypeScript/tsc/internal/tsoptions"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 	"github.com/microsoft/TypeScript/tsc/internal/vfs"
 	"github.com/microsoft/TypeScript/tsc/internal/vfs/cachedvfs"
 )
+
+type wasmCachedDts struct {
+	size  int64
+	mtime int64
+	file  *ast.SourceFile
+}
+
+var (
+	wasmStaticDtsCache map[ast.SourceFileParseOptions]wasmCachedDts
+	wasmHeapMarked     bool
+	wasmMarkHeapHook   func()
+	wasmResetHeapHook  func()
+)
+
+func SetWasmHeapHooks(markFn, resetFn func()) {
+	wasmMarkHeapHook = markFn
+	wasmResetHeapHook = resetFn
+}
+
+func isStaticWasmDts(fileName tspath.RootedFilePath) bool {
+	return !strings.Contains(fileName.AsString(), "state")
+}
+
+func resetAllWasmPools() {
+	ast.ResetForcedLazyLists()
+	for _, entry := range wasmStaticDtsCache {
+		if entry.file != nil {
+			entry.file.ResetWasmCaches()
+		}
+	}
+	core.ResetWasmPools()
+	parser.ResetWasmPools()
+	binder.ResetWasmPools()
+	printer.ResetWasmPools()
+	checker.ResetWasmPools()
+	resetParseTaskDataPool()
+}
+
+func FinishWasmProgramInit(program *Program) {
+	if runtime.GOARCH != "wasm" || wasmMarkHeapHook == nil {
+		return
+	}
+	if !wasmHeapMarked {
+		program.BindSourceFiles()
+		core.NodeCoreModules()
+		resetAllWasmPools()
+		wasmMarkHeapHook()
+		ast.SetTrackForcedLazy(true)
+		wasmHeapMarked = true
+	}
+}
+
+func ResetWasmHeapToWatermark() {
+	if !wasmHeapMarked || wasmResetHeapHook == nil {
+		return
+	}
+	resetAllWasmPools()
+	wasmResetHeapHook()
+}
 
 type CompilerHost interface {
 	FS() vfs.FS
@@ -81,6 +146,39 @@ func (h *compilerHost) Trace(msg *diagnostics.Message, args ...any) {
 }
 
 func (h *compilerHost) GetSourceFile(opts ast.SourceFileParseOptions) *ast.SourceFile {
+	if runtime.GOARCH == "wasm" && wasmMarkHeapHook != nil && opts.FileName.IsDeclarationFile() && isStaticWasmDts(opts.FileName) {
+		if wasmStaticDtsCache != nil {
+			if entry, ok := wasmStaticDtsCache[opts]; ok {
+				if fi := h.FS().Stat(opts.FileName.AsPath()); fi != nil && fi.Size() == entry.size && fi.ModTime().UnixNano() == entry.mtime {
+					return entry.file
+				}
+			}
+		}
+		if !wasmHeapMarked {
+			text, ok := h.FS().ReadFile(opts.FileName)
+			if !ok {
+				return nil
+			}
+			sf := parser.ParseSourceFile(opts, text, core.EnsureScriptKindFromFileName(opts.FileName))
+			binder.BindSourceFile(sf)
+			if wasmStaticDtsCache == nil {
+				wasmStaticDtsCache = make(map[ast.SourceFileParseOptions]wasmCachedDts, 64)
+			}
+			var size, mtime int64
+			if fi := h.FS().Stat(opts.FileName.AsPath()); fi != nil {
+				size = fi.Size()
+				mtime = fi.ModTime().UnixNano()
+			} else {
+				size = int64(len(text))
+			}
+			wasmStaticDtsCache[opts] = wasmCachedDts{
+				size:  size,
+				mtime: mtime,
+				file:  sf,
+			}
+			return sf
+		}
+	}
 	text, ok := h.FS().ReadFile(opts.FileName)
 	if !ok {
 		return nil
