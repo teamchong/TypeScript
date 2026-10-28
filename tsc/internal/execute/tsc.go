@@ -354,7 +354,8 @@ func performIncrementalCompilation(
 		testing.OnProgram(incrementalProgram)
 	}
 	return tsc.CommandLineResult{
-		Status: result.Status,
+		Status:      result.Status,
+		Diagnostics: result.Diagnostics,
 	}
 }
 
@@ -394,6 +395,7 @@ func performCompilation(
 		Host:    host,
 		Tracing: tr,
 	})
+	compiler.FinishWasmProgramInit(program)
 	compileTimes.ParseTime = sys.Now().Sub(parseStart)
 	if contentMapperHost != nil {
 		compileTimes.ContentMapperTimes = contentMapperHost.Timings()
@@ -414,7 +416,8 @@ func performCompilation(
 	stopTracing(sys, tr)
 
 	return tsc.CommandLineResult{
-		Status: result.Status,
+		Status:      result.Status,
+		Diagnostics: result.Diagnostics,
 	}
 }
 

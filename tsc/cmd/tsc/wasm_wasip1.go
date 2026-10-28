@@ -17,8 +17,16 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
+	"github.com/microsoft/TypeScript/tsc/internal/ast"
 	"github.com/microsoft/TypeScript/tsc/internal/bundled"
+	"github.com/microsoft/TypeScript/tsc/internal/compiler"
+	"github.com/microsoft/TypeScript/tsc/internal/core"
+	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
+	"github.com/microsoft/TypeScript/tsc/internal/diagnosticwriter"
 	"github.com/microsoft/TypeScript/tsc/internal/execute"
+	"github.com/microsoft/TypeScript/tsc/internal/json"
+	"github.com/microsoft/TypeScript/tsc/internal/locale"
+	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 	"github.com/microsoft/TypeScript/tsc/internal/vfs"
 )
@@ -40,14 +48,47 @@ func hostFS(op uint32, ptr unsafe.Pointer, length uint32) int32
 //go:wasmimport tsrs_host fs_take
 func hostFSTake(ptr unsafe.Pointer)
 
-var (
-	wasmInputBuf  []byte
-	wasmOutputBuf []byte
-	wasmDummyByte byte
+//go:linkname runtimeMarkHeap runtime.MarkHeap
+func runtimeMarkHeap()
+
+//go:linkname runtimeResetHeap runtime.ResetHeap
+func runtimeResetHeap()
+
+const (
+	wasmInitialInputCap  = 4 << 20
+	wasmInitialOutputCap = 8 << 20
 )
+
+var (
+	wasmInputBuf           []byte
+	wasmOutputBuf          []byte
+	wasmDummyByte          byte
+	wasmBuffersInitialized bool
+)
+
+func init() {
+	compiler.SetWasmHeapHooks(func() {
+		_, _ = json.Marshal([]wasmDiagnosticResponse{{
+			StartPosition:      &wasmDiagnosticPosition{},
+			EndPosition:        &wasmDiagnosticPosition{},
+			MessageChain:       []wasmDiagnosticResponse{{}},
+			RelatedInformation: []wasmDiagnosticResponse{{}},
+		}})
+		runtimeMarkHeap()
+	}, runtimeResetHeap)
+}
+
+func ensureWasmBuffers() {
+	if !wasmBuffersInitialized {
+		wasmInputBuf = make([]byte, 0, wasmInitialInputCap)
+		wasmOutputBuf = make([]byte, 0, wasmInitialOutputCap)
+		wasmBuffersInitialized = true
+	}
+}
 
 //go:wasmexport tsrs_input
 func tsrsInput(length uint32) unsafe.Pointer {
+	ensureWasmBuffers()
 	if int(length) <= cap(wasmInputBuf) {
 		wasmInputBuf = wasmInputBuf[:length]
 	} else {
@@ -61,6 +102,7 @@ func tsrsInput(length uint32) unsafe.Pointer {
 
 //go:wasmexport tsrs_run
 func tsrsRun() int32 {
+	ensureWasmBuffers()
 	req := string(wasmInputBuf)
 	wasmInputBuf = wasmInputBuf[:0]
 	wasmOutputBuf = wasmOutputBuf[:0]
@@ -81,18 +123,106 @@ func tsrsRun() int32 {
 		args = parts[2:]
 	}
 
+	jsonDiagnostics := (flags & 1) != 0
 	caseSensitive := (flags & 2) == 0
 	tty := (flags & 4) != 0
+	var writer io.Writer = os.Stdout
+	if jsonDiagnostics {
+		writer = io.Discard
+	}
 	sys := &wasmSys{
 		cwd:                tspath.RootedDirectoryPathFromAbsolute(tspath.NormalizePath(cwd)),
 		fs:                 bundled.WrapFS(&wasmHostFS{caseSensitive: caseSensitive}),
 		defaultLibraryPath: bundled.LibPath(),
-		writer:             os.Stdout,
+		writer:             writer,
 		tty:                tty,
 		start:              time.Now(),
 	}
 	result := execute.CommandLine(context.Background(), sys, args, nil)
+	if jsonDiagnostics {
+		responses := make([]wasmDiagnosticResponse, len(result.Diagnostics))
+		for i, d := range result.Diagnostics {
+			responses[i] = newWasmDiagnosticResponse(diagnosticwriter.WrapASTDiagnostic(d))
+		}
+		if encoded, err := json.Marshal(responses); err == nil {
+			if len(encoded) <= cap(wasmOutputBuf) {
+				wasmOutputBuf = wasmOutputBuf[:len(encoded)]
+				copy(wasmOutputBuf, encoded)
+			} else {
+				wasmOutputBuf = encoded
+			}
+		}
+	}
+	compiler.ResetWasmHeapToWatermark()
 	return int32(result.Status)
+}
+
+type wasmDiagnosticPosition struct {
+	Line      int `json:"line"`
+	Character int `json:"character"`
+}
+
+type wasmDiagnosticResponse struct {
+	FileName           string                   `json:"fileName,omitempty"`
+	Pos                int                      `json:"pos"`
+	End                int                      `json:"end"`
+	StartPosition      *wasmDiagnosticPosition  `json:"startPosition,omitempty"`
+	EndPosition        *wasmDiagnosticPosition  `json:"endPosition,omitempty"`
+	Code               int32                    `json:"code"`
+	Category           diagnostics.Category     `json:"category"`
+	Source             string                   `json:"source,omitempty"`
+	Text               string                   `json:"text"`
+	ReportsUnnecessary bool                     `json:"reportsUnnecessary,omitempty"`
+	ReportsDeprecated  bool                     `json:"reportsDeprecated,omitempty"`
+	MessageChain       []wasmDiagnosticResponse `json:"messageChain,omitempty"`
+	RelatedInformation []wasmDiagnosticResponse `json:"relatedInformation,omitempty"`
+}
+
+func newWasmDiagnosticResponse(d *diagnosticwriter.ASTDiagnostic) wasmDiagnosticResponse {
+	file := d.File()
+	pos, end := d.Pos(), d.End()
+	if file != nil {
+		pos = max(0, min(pos, len(file.Text())))
+		end = max(pos, min(end, len(file.Text())))
+	}
+	resp := wasmDiagnosticResponse{
+		Pos:                pos,
+		End:                end,
+		Code:               d.Code(),
+		Category:           d.Category(),
+		Source:             d.Source(),
+		Text:               d.Localize(locale.Default),
+		ReportsUnnecessary: d.Diagnostic.ReportsUnnecessary(),
+		ReportsDeprecated:  d.Diagnostic.ReportsDeprecated(),
+	}
+	if file != nil {
+		resp.FileName = file.FileName().AsString()
+		if sourceFile, ok := file.(*ast.SourceFile); ok {
+			positionMap := sourceFile.GetPositionMap()
+			resp.Pos = positionMap.UTF8ToUTF16(pos)
+			resp.End = positionMap.UTF8ToUTF16(end)
+		} else {
+			resp.Pos = int(core.UTF16Len(file.Text()[:pos]))
+			resp.End = int(core.UTF16Len(file.Text()[:end]))
+		}
+		startLine, startChar := scanner.GetECMALineAndUTF16CharacterOfPosition(file, pos)
+		endLine, endChar := scanner.GetECMALineAndUTF16CharacterOfPosition(file, end)
+		resp.StartPosition = &wasmDiagnosticPosition{Line: startLine, Character: int(startChar)}
+		resp.EndPosition = &wasmDiagnosticPosition{Line: endLine, Character: int(endChar)}
+	}
+	if chain := d.MessageChain(); len(chain) > 0 {
+		resp.MessageChain = make([]wasmDiagnosticResponse, len(chain))
+		for i, c := range chain {
+			resp.MessageChain[i] = newWasmDiagnosticResponse(c.(*diagnosticwriter.ASTDiagnostic))
+		}
+	}
+	if related := d.RelatedInformation(); len(related) > 0 {
+		resp.RelatedInformation = make([]wasmDiagnosticResponse, len(related))
+		for i, r := range related {
+			resp.RelatedInformation[i] = newWasmDiagnosticResponse(r.(*diagnosticwriter.ASTDiagnostic))
+		}
+	}
+	return resp
 }
 
 //go:wasmexport tsrs_output

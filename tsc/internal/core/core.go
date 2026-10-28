@@ -698,6 +698,14 @@ var levenshteinBuffersPool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	levenshteinBuffersPool = sync.Pool{
+		New: func() any {
+			return &levenshteinBuffers{}
+		},
+	}
+}
+
 func levenshteinWithMax(buffers *levenshteinBuffers, s1 []rune, s2 []rune, maxValue float64) float64 {
 	bufferSize := len(s2) + 1
 	buffers.previous = slices.Grow(buffers.previous[:0], bufferSize)[:bufferSize]

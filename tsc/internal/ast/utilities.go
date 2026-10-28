@@ -2835,13 +2835,34 @@ func GetNodeAtPosition(file *SourceFile, position int, includeJSDoc bool) *Node 
 			}
 		}
 		if child == nil {
-			current.ForEachChild(func(node *Node) bool {
-				if nodeContainsPosition(node, position) {
-					child = node
-					return true
+			if current.Kind == KindSourceFile {
+				sf := current.AsSourceFile()
+				if stmts := sf.Statements.Nodes; len(stmts) > 16 {
+					lo, hi := 0, len(stmts)
+					for lo < hi {
+						mid := int(uint(lo+hi) >> 1)
+						if stmts[mid].End() <= position {
+							lo = mid + 1
+						} else {
+							hi = mid
+						}
+					}
+					if lo < len(stmts) && nodeContainsPosition(stmts[lo], position) {
+						child = stmts[lo]
+					} else if sf.EndOfFileToken != nil && nodeContainsPosition(sf.EndOfFileToken, position) {
+						child = sf.EndOfFileToken
+					}
 				}
-				return false
-			})
+			}
+			if child == nil {
+				current.ForEachChild(func(node *Node) bool {
+					if nodeContainsPosition(node, position) {
+						child = node
+						return true
+					}
+					return false
+				})
+			}
 		}
 		if child == nil || IsMetaProperty(child) {
 			return current
@@ -2899,6 +2920,10 @@ func ForEachDynamicImportOrRequireCall(
 			if cb(node, node.AsImportTypeNode().Argument.AsLiteralTypeNode().Literal) {
 				return true
 			}
+		} else if node.Kind == KindTypeAliasDeclaration && node.AsTypeAliasDeclaration().Type.IsLazyTypeNode() && node.End() > lastIndex+size {
+			lastIndex = node.End()
+			lastIndex, size = findImportOrRequire(file.Text(), lastIndex, isJavaScriptFile)
+			continue
 		}
 		// skip past import/require
 		lastIndex += size

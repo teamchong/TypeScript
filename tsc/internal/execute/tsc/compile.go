@@ -63,10 +63,10 @@ type Watcher interface {
 }
 
 type CommandLineResult struct {
-	Status  ExitStatus
-	Watcher Watcher
+	Status      ExitStatus
+	Watcher     Watcher
+	Diagnostics []*ast.Diagnostic
 }
-
 type CommandLineTesting interface {
 	// Ensure that all emitted files are timestamped in order to ensure they are deterministic for test baseline
 	OnEmittedFiles(result *compiler.EmitResult, mTimesCache *collections.SyncMap[tspath.PathKey, time.Time])

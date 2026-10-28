@@ -20,9 +20,12 @@ func scanCurrentStack() {}
 
 // Ever-incrementing pointer: no memory is freed.
 var (
-	heapptr   uintptr
-	small4Ptr uintptr
-	small4End uintptr
+	heapptr            uintptr
+	small4Ptr          uintptr
+	small4End          uintptr
+	heapWatermark      uintptr
+	liveAllocWatermark uint64
+	heapPoolEpoch      uint32 = 1
 )
 
 // Total amount allocated for runtime.MemStats
@@ -190,10 +193,51 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 func initHeap() {
 	heapptr = heapStart
 }
-
 // setHeapEnd sets a new (larger) heapEnd pointer.
 func setHeapEnd(newHeapEnd uintptr) {
 	// This "heap" is so simple that simply assigning a new value is good
 	// enough.
 	heapEnd = newHeapEnd
+}
+
+//go:linkname PoolEpoch runtime.PoolEpoch
+func PoolEpoch() uint32 {
+	return heapPoolEpoch
+}
+
+//go:linkname MarkHeap runtime.MarkHeap
+func MarkHeap() {
+	gcLock.Lock()
+	small4Ptr = 0
+	small4End = 0
+	freeLists = [257]unsafe.Pointer{}
+	largeFreePtr = [256]unsafe.Pointer{}
+	largeFreeSize = [256]uintptr{}
+	heapWatermark = heapptr
+	liveAllocWatermark = gcLiveAlloc
+	if heapPoolEpoch == 1 {
+		heapPoolEpoch = 2
+	} else {
+		heapPoolEpoch++
+	}
+	gcLock.Unlock()
+}
+
+//go:linkname ResetHeap runtime.ResetHeap
+func ResetHeap() {
+	gcLock.Lock()
+	if heapWatermark != 0 && heapptr > heapWatermark {
+		memzero(unsafe.Pointer(heapWatermark), heapptr-heapWatermark)
+		heapptr = heapWatermark
+		small4Ptr = 0
+		small4End = 0
+		gcLiveAlloc = liveAllocWatermark
+		freeLists = [257]unsafe.Pointer{}
+		largeFreePtr = [256]unsafe.Pointer{}
+		largeFreeSize = [256]uintptr{}
+	}
+	if heapPoolEpoch >= 2 {
+		heapPoolEpoch++
+	}
+	gcLock.Unlock()
 }
