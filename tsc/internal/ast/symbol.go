@@ -1,7 +1,6 @@
 package ast
 
 import (
-	"hash/maphash"
 	"iter"
 	"slices"
 	"strings"
@@ -339,7 +338,27 @@ type SymbolMap struct {
 	index   []int32 // open addressing table of entry positions plus one (0 is empty), only past symbolTableLinearMax
 }
 
-var symbolTableSeed = maphash.MakeSeed()
+func hashSymbolName(s string) uint64 {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	p := unsafe.Pointer(unsafe.StringData(s))
+	var h uint64
+	if n >= 8 {
+		h = *(*uint64)(p)
+		for off := 8; off+8 < n; off += 8 {
+			h = (h ^ *(*uint64)(unsafe.Add(p, off))) * 0x9e3779b97f4a7c15
+		}
+		h ^= *(*uint64)(unsafe.Add(p, n-8)) * 0xbf58476d1ce4e5b9
+	} else if n >= 4 {
+		h = uint64(*(*uint32)(p)) | (uint64(*(*uint32)(unsafe.Add(p, n-4))) << 32)
+	} else {
+		h = uint64(*(*byte)(p)) | (uint64(*(*byte)(unsafe.Add(p, n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(p, n-1))) << 16)
+	}
+	h = (h ^ uint64(n)) * 0x94d049bb133111eb
+	return h ^ (h >> 32)
+}
 
 func NewSymbolTable() SymbolTable {
 	return NewSymbolTableWithCapacity(0)
@@ -381,7 +400,7 @@ func (m *SymbolMap) find(key string) int {
 	}
 	if m.index != nil {
 		mask := uint64(len(m.index) - 1)
-		for slot := maphash.String(symbolTableSeed, key) & mask; ; slot = (slot + 1) & mask {
+		for slot := hashSymbolName(key) & mask; ; slot = (slot + 1) & mask {
 			p := m.index[slot]
 			if p == 0 {
 				return -1
@@ -429,19 +448,41 @@ func (m *SymbolMap) Set(key string, symbol *Symbol) {
 		proxy.parentOrData = symbol
 		symbol = proxy
 	}
-	if i := m.find(key); i >= 0 {
-		m.entries[i] = symbol
+	if m.index != nil {
+		mask := uint64(len(m.index) - 1)
+		slot := hashSymbolName(key) & mask
+		for {
+			p := m.index[slot]
+			if p == 0 {
+				break
+			}
+			if i := int(p - 1); m.keyAt(i) == key {
+				m.entries[i] = symbol
+				return
+			}
+			slot = (slot + 1) & mask
+		}
+		i := int32(len(m.entries))
+		m.entries = append(m.entries, symbol)
+		if len(m.entries)*4 <= len(m.index)*3 {
+			m.index[slot] = i + 1
+		} else {
+			m.buildIndex()
+		}
 		return
 	}
-	i := int32(len(m.entries))
+	for i := range m.entries {
+		if m.keyAt(i) == key {
+			m.entries[i] = symbol
+			return
+		}
+	}
 	if cap(m.entries) == 0 {
 		// Most tables hold one or two entries, so start with room for two rather than growing from one.
 		m.entries = make([]*Symbol, 0, 2)
 	}
 	m.entries = append(m.entries, symbol)
-	if m.index != nil && len(m.entries)*4 <= len(m.index)*3 {
-		m.insertIndex(key, i)
-	} else if len(m.entries) > symbolTableLinearMax {
+	if len(m.entries) > symbolTableLinearMax {
 		m.buildIndex()
 	}
 }
@@ -456,7 +497,7 @@ func indexSizeFor(n int) int {
 
 func (m *SymbolMap) insertIndex(key string, i int32) {
 	mask := uint64(len(m.index) - 1)
-	slot := maphash.String(symbolTableSeed, key) & mask
+	slot := hashSymbolName(key) & mask
 	for m.index[slot] != 0 {
 		slot = (slot + 1) & mask
 	}
@@ -509,8 +550,12 @@ func (m *SymbolMap) Keys() iter.Seq[string] {
 
 func (m *SymbolMap) Values() iter.Seq[*Symbol] {
 	return func(yield func(*Symbol) bool) {
-		for _, symbol := range m.All() {
-			if !yield(symbol) {
+		if m == nil {
+			return
+		}
+		entries := m.entries
+		for i := range entries {
+			if !yield(m.symbolAt(i)) {
 				return
 			}
 		}

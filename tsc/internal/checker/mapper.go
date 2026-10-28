@@ -50,21 +50,41 @@ var (
 func (m *TypeMapper) Map(t *Type) *Type {
 	switch m.kind {
 	case TypeMapperKindSimple:
-		return castTypeMapper[SimpleTypeMapper](m, TypeMapperKindSimple).Map(t)
+		s := (*SimpleTypeMapper)(unsafe.Pointer(m))
+		if t == s.source {
+			return s.target
+		}
+		return t
 	case TypeMapperKindArray:
-		return castTypeMapper[ArrayTypeMapper](m, TypeMapperKindArray).Map(t)
+		a := (*ArrayTypeMapper)(unsafe.Pointer(m))
+		if h := a.hint; h < a.sourcesLen && *(**Type)(unsafe.Add(unsafe.Pointer(a.sourcesPtr), uintptr(h)*unsafe.Sizeof((*Type)(nil)))) == t {
+			a.hint = h + 1
+			return *(**Type)(unsafe.Add(unsafe.Pointer(a.targetsPtr), uintptr(h)*unsafe.Sizeof((*Type)(nil))))
+		}
+		return a.Map(t)
+	default:
+		return m.mapSlow(t)
+	}
+}
+
+func (m *TypeMapper) mapSlow(t *Type) *Type {
+	switch m.kind {
+	case TypeMapperKindSimple:
+		return (*SimpleTypeMapper)(unsafe.Pointer(m)).Map(t)
+	case TypeMapperKindArray:
+		return (*ArrayTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindArrayToSingle:
-		return castTypeMapper[ArrayToSingleTypeMapper](m, TypeMapperKindArrayToSingle).Map(t)
+		return (*ArrayToSingleTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindDeferred:
-		return castTypeMapper[DeferredTypeMapper](m, TypeMapperKindDeferred).Map(t)
+		return (*DeferredTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindFunction:
-		return castTypeMapper[FunctionTypeMapper](m, TypeMapperKindFunction).Map(t)
+		return (*FunctionTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindMerged:
-		return castTypeMapper[MergedTypeMapper](m, TypeMapperKindMerged).Map(t)
+		return (*MergedTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindComposite:
-		return castTypeMapper[CompositeTypeMapper](m, TypeMapperKindComposite).Map(t)
+		return (*CompositeTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindInference:
-		return castTypeMapper[InferenceTypeMapper](m, TypeMapperKindInference).Map(t)
+		return (*InferenceTypeMapper)(unsafe.Pointer(m)).Map(t)
 	default:
 		panic("Invalid type mapper kind")
 	}
@@ -210,6 +230,7 @@ type ArrayTypeMapper struct {
 	TypeMapperBase
 	sourcesLen uint16
 	targetsLen uint16
+	hint       uint16
 	sourcesPtr **Type
 	targetsPtr **Type
 }
@@ -255,8 +276,24 @@ func (m *ArrayTypeMapper) targets() []*Type {
 }
 
 func (m *ArrayTypeMapper) Map(t *Type) *Type {
-	for i, s := range unsafe.Slice(m.sourcesPtr, m.sourcesLen) {
-		if t == s {
+	n := int(m.sourcesLen)
+	if n == 0 {
+		return t
+	}
+	sources := unsafe.Slice(m.sourcesPtr, n)
+	h := int(m.hint)
+	if h >= n {
+		h = 0
+	}
+	for i := h; i < n; i++ {
+		if sources[i] == t {
+			m.hint = uint16(i + 1)
+			return unsafe.Slice(m.targetsPtr, m.targetsLen)[i]
+		}
+	}
+	for i := range h {
+		if sources[i] == t {
+			m.hint = uint16(i + 1)
 			return unsafe.Slice(m.targetsPtr, m.targetsLen)[i]
 		}
 	}
@@ -415,6 +452,9 @@ func newCompositeTypeMapper(c *Checker, m1 *TypeMapper, m2 *TypeMapper) *TypeMap
 func (m *CompositeTypeMapper) Map(t *Type) *Type {
 	t1 := m.m1.Map(t)
 	if t1 != t {
+		if t1.flags&(TypeFlagsInstantiable|TypeFlagsObject|TypeFlagsUnionOrIntersection) == 0 {
+			return t1
+		}
 		return m.c.instantiateType(t1, m.m2)
 	}
 	return m.m2.Map(t)
@@ -424,17 +464,19 @@ func (m *CompositeTypeMapper) Map(t *Type) *Type {
 
 type InferenceTypeMapper struct {
 	TypeMapperBase
+	fixing bool
+	hint   int
 	c      *Checker
 	n      *InferenceContext
-	fixing bool
 }
 
 func (c *Checker) initInferenceTypeMapper(m *InferenceTypeMapper, n *InferenceContext, fixing bool) *TypeMapper {
 	m.kind = TypeMapperKindInference
 	m.hasInference = true
+	m.fixing = fixing
+	m.hint = 0
 	m.c = c
 	m.n = n
-	m.fixing = fixing
 	return &m.TypeMapper
 }
 
@@ -469,13 +511,46 @@ func markMapperEscapedSlow(m *TypeMapper) {
 }
 
 func (m *InferenceTypeMapper) Map(t *Type) *Type {
-	for i, inference := range m.n.inferences {
+	inferences := m.n.inferences
+	n := len(inferences)
+	if n == 0 {
+		return t
+	}
+	if n == 1 {
+		inference := inferences[0]
 		if t == inference.typeParameter {
 			if m.fixing && !inference.isFixed {
-				// Before we commit to a particular inference (and thus lock out any further inferences),
-				// we infer from any intra-expression inference sites we have collected.
 				m.c.inferFromIntraExpressionSites(m.n)
-				clearCachedInferences(m.n.inferences)
+				clearCachedInferences(inferences)
+				inference.isFixed = true
+			}
+			return m.c.getInferredType(m.n, 0)
+		}
+		return t
+	}
+	h := m.hint
+	if h >= n {
+		h = 0
+	}
+	for i := h; i < n; i++ {
+		inference := inferences[i]
+		if t == inference.typeParameter {
+			m.hint = i + 1
+			if m.fixing && !inference.isFixed {
+				m.c.inferFromIntraExpressionSites(m.n)
+				clearCachedInferences(inferences)
+				inference.isFixed = true
+			}
+			return m.c.getInferredType(m.n, i)
+		}
+	}
+	for i := range h {
+		inference := inferences[i]
+		if t == inference.typeParameter {
+			m.hint = i + 1
+			if m.fixing && !inference.isFixed {
+				m.c.inferFromIntraExpressionSites(m.n)
+				clearCachedInferences(inferences)
 				inference.isFixed = true
 			}
 			return m.c.getInferredType(m.n, i)

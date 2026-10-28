@@ -1311,16 +1311,21 @@ func hashMemberName(s string) uint64 {
 	if n == 0 {
 		return 0
 	}
-	p := unsafe.StringData(s)
+	p := unsafe.Pointer(unsafe.StringData(s))
 	var h uint64
 	if n >= 8 {
-		h = *(*uint64)(unsafe.Pointer(p)) ^ (*(*uint64)(unsafe.Add(unsafe.Pointer(p), n-8)) * 0x9e3779b97f4a7c15)
+		h = *(*uint64)(p)
+		for off := 8; off+8 < n; off += 8 {
+			h = (h ^ *(*uint64)(unsafe.Add(p, off))) * 0x9e3779b97f4a7c15
+		}
+		h ^= *(*uint64)(unsafe.Add(p, n-8)) * 0xbf58476d1ce4e5b9
 	} else if n >= 4 {
-		h = uint64(*(*uint32)(unsafe.Pointer(p))) | (uint64(*(*uint32)(unsafe.Add(unsafe.Pointer(p), n-4))) << 32)
+		h = uint64(*(*uint32)(p)) | (uint64(*(*uint32)(unsafe.Add(p, n-4))) << 32)
 	} else {
-		h = uint64(*p) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n-1))) << 16)
+		h = uint64(*(*byte)(p)) | (uint64(*(*byte)(unsafe.Add(p, n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(p, n-1))) << 16)
 	}
-	return (h ^ uint64(n)) * 0xbf58476d1ce4e5b9
+	h = (h ^ uint64(n)) * 0x94d049bb133111eb
+	return h ^ (h >> 32)
 }
 
 func (c *Checker) newPropertyIndex(properties []*ast.Symbol, index *memberIndex) *memberIndex {

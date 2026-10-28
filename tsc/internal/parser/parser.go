@@ -143,6 +143,7 @@ func EnableLazyDts(enabled bool) {
 
 func init() {
 	ast.SetLazyParseHook(reparseLazyList)
+	ast.SetLazyLookupHook(lookupLazyBinaryMember)
 }
 
 func getParser() *Parser {
@@ -988,6 +989,88 @@ func reparseLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, allowNestedLa
 		p.lazyLists = nil
 	}
 	return nodes
+}
+
+func lookupLazyBinaryMember(lazy *ast.LazyNodeList, file *ast.SourceFile, name string) *ast.Node {
+	text := file.Text()[lazy.Pos():lazy.End()]
+	if len(text) < 8 || text[0] != '\n' {
+		return nil
+	}
+	i := 1
+	for i < len(text) && i < 16 && text[i] == ' ' {
+		i++
+	}
+	if i == 1 || i >= len(text) || text[i] != '\'' {
+		return nil
+	}
+	prefixLen := i + 1
+	prefix := text[:prefixLen]
+	kStart := prefixLen
+	kEnd := kStart
+	for kEnd < len(text) && kEnd < kStart+64 && (text[kEnd] == '0' || text[kEnd] == '1') {
+		kEnd++
+	}
+	keyLen := kEnd - kStart
+	if keyLen == 0 || len(name) != keyLen || kEnd+2 > len(text) || text[kEnd] != '\'' || text[kEnd+1] != ':' {
+		return nil
+	}
+	for j := range len(name) {
+		if name[j] != '0' && name[j] != '1' {
+			return nil
+		}
+	}
+	lo := 0
+	hi := len(text)
+	foundPos := -1
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		rel := strings.Index(text[mid:], prefix)
+		if rel < 0 || mid+rel >= hi {
+			if mid == lo {
+				break
+			}
+			hi = mid
+			continue
+		}
+		entryPos := mid + rel
+		candStart := entryPos + prefixLen
+		candEnd := candStart + keyLen
+		if candEnd+2 > len(text) || text[candEnd] != '\'' || text[candEnd+1] != ':' {
+			break
+		}
+		cand := text[candStart:candEnd]
+		if cand == name {
+			foundPos = entryPos
+			break
+		}
+		if cand < name {
+			lo = candEnd + 2
+		} else {
+			hi = entryPos
+		}
+	}
+	if foundPos < 0 {
+		return nil
+	}
+	p := getParser()
+	defer putParser(p)
+	p.initializeState(file.ParseOptions(), file.Text(), file.ScriptKind)
+	p.lazyDts = true
+	p.scanner.ResetTokenState(lazy.Pos() + foundPos)
+	p.nextToken()
+	p.contextFlags = lazy.ContextFlags
+	p.parsingContexts = ParsingContexts(lazy.ParsingContexts)
+	node := p.parseTypeMember()
+	if node != nil {
+		node.Parent = lazy.Owner
+	}
+	if len(p.lazyLists) > 0 {
+		for _, nested := range p.lazyLists {
+			nested.File = file
+		}
+		p.lazyLists = nil
+	}
+	return node
 }
 
 // Return a non-nil (but possibly empty) slice if parsing was successful, or nil if parseElement returned nil

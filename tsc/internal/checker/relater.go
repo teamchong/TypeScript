@@ -4177,6 +4177,17 @@ func (r *Relater) structuredTypeRelatedToWorker(source *Type, target *Type, repo
 		}
 	case target.flags&TypeFlagsIndex != 0:
 		targetType := target.AsIndexType().target
+		if r.c.isBinaryKeyedTypeLiteral(targetType) {
+			if source == target {
+				return TernaryTrue
+			}
+			if source.flags&TypeFlagsStringLiteral != 0 {
+				if targetType.symbol.LookupLazyMember(source.AsLiteralType().value.(string)) != nil {
+					return TernaryTrue
+				}
+			}
+			return TernaryFalse
+		}
 		// A keyof S is related to a keyof T if T is related to S.
 		if source.flags&TypeFlagsIndex != 0 {
 			result = r.isRelatedTo(targetType, source.AsIndexType().target, RecursionFlagsBoth, false /*reportErrors*/)
