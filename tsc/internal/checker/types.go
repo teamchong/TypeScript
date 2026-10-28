@@ -1184,7 +1184,6 @@ func (t *StructuredType) ConstructSignatures() []*Signature {
 	return slices.Clip(t.extra.signatures[t.extra.callSignatureCount:])
 }
 
-
 func (t *StructuredType) getSignatures() []*Signature {
 	if t.extra == nil {
 		return nil
@@ -1323,19 +1322,26 @@ func hashMemberName(s string) uint64 {
 		return 0
 	}
 	// SAFETY: StringData points to the immutable n-byte backing buffer of s (n >= 1).
-	p := unsafe.StringData(s)
+	p := unsafe.Pointer(unsafe.StringData(s))
 	var h uint64
 	if n >= 8 {
 		// SAFETY: n >= 8 guarantees bytes [0..8) and [n-8..n) are in bounds of s.
-		h = *(*uint64)(unsafe.Pointer(p)) ^ (*(*uint64)(unsafe.Add(unsafe.Pointer(p), n-8)) * 0x9e3779b97f4a7c15)
+		h = *(*uint64)(p)
+		for off := 8; off+8 < n; off += 8 {
+			// SAFETY: off+8 < n guarantees bytes [off..off+8) are in bounds of s.
+			h = (h ^ *(*uint64)(unsafe.Add(p, off))) * 0x9e3779b97f4a7c15
+		}
+		// SAFETY: n >= 8 guarantees bytes [n-8..n) are in bounds of s.
+		h ^= *(*uint64)(unsafe.Add(p, n-8)) * 0xbf58476d1ce4e5b9
 	} else if n >= 4 {
 		// SAFETY: n >= 4 guarantees bytes [0..4) and [n-4..n) are in bounds of s.
-		h = uint64(*(*uint32)(unsafe.Pointer(p))) | (uint64(*(*uint32)(unsafe.Add(unsafe.Pointer(p), n-4))) << 32)
+		h = uint64(*(*uint32)(p)) | (uint64(*(*uint32)(unsafe.Add(p, n-4))) << 32)
 	} else {
 		// SAFETY: n >= 1 guarantees indices 0, n>>1, and n-1 are in bounds of s.
-		h = uint64(*p) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(unsafe.Pointer(p), n-1))) << 16)
+		h = uint64(*(*byte)(p)) | (uint64(*(*byte)(unsafe.Add(p, n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(p, n-1))) << 16)
 	}
-	return (h ^ uint64(n)) * 0xbf58476d1ce4e5b9
+	h = (h ^ uint64(n)) * 0x94d049bb133111eb
+	return h ^ (h >> 32)
 }
 
 func (c *Checker) newPropertyIndex(properties []*ast.Symbol, index *memberIndex) *memberIndex {

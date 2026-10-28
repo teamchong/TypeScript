@@ -666,6 +666,7 @@ func TestStructuredMembersLookup(t *testing.T) {
 		assert.Equal(t, aliasedType.getMember(name), symbol)
 	}
 }
+
 func TestUnionIntersectionPropertyCacheSharing(t *testing.T) {
 	t.Parallel()
 	for _, intersection := range []bool{false, true} {

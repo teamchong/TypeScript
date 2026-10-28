@@ -1,7 +1,6 @@
 package ast
 
 import (
-	"hash/maphash"
 	"iter"
 	"slices"
 	"strings"
@@ -353,7 +352,33 @@ type SymbolMap struct {
 	index   []int32 // open addressing table of entry positions plus one (0 is empty), only past symbolTableLinearMax
 }
 
-var symbolTableSeed = maphash.MakeSeed()
+func hashSymbolName(s string) uint64 {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	// SAFETY: StringData points to the immutable n-byte backing buffer of s (n >= 1).
+	p := unsafe.Pointer(unsafe.StringData(s))
+	var h uint64
+	if n >= 8 {
+		// SAFETY: n >= 8 guarantees bytes [0..8) and [n-8..n) are in bounds of s.
+		h = *(*uint64)(p)
+		for off := 8; off+8 < n; off += 8 {
+			// SAFETY: off+8 < n guarantees bytes [off..off+8) are in bounds of s.
+			h = (h ^ *(*uint64)(unsafe.Add(p, off))) * 0x9e3779b97f4a7c15
+		}
+		// SAFETY: n >= 8 guarantees bytes [n-8..n) are in bounds of s.
+		h ^= *(*uint64)(unsafe.Add(p, n-8)) * 0xbf58476d1ce4e5b9
+	} else if n >= 4 {
+		// SAFETY: n >= 4 guarantees bytes [0..4) and [n-4..n) are in bounds of s.
+		h = uint64(*(*uint32)(p)) | (uint64(*(*uint32)(unsafe.Add(p, n-4))) << 32)
+	} else {
+		// SAFETY: n >= 1 guarantees indices 0, n>>1, and n-1 are in bounds of s.
+		h = uint64(*(*byte)(p)) | (uint64(*(*byte)(unsafe.Add(p, n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(p, n-1))) << 16)
+	}
+	h = (h ^ uint64(n)) * 0x94d049bb133111eb
+	return h ^ (h >> 32)
+}
 
 func NewSymbolTable() SymbolTable {
 	return NewSymbolTableWithCapacity(0)
@@ -395,7 +420,7 @@ func (m *SymbolMap) Find(key string) int {
 	}
 	if len(m.index) != 0 {
 		mask := uint64(len(m.index) - 1)
-		for slot := maphash.String(symbolTableSeed, key) & mask; ; slot = (slot + 1) & mask {
+		for slot := hashSymbolName(key) & mask; ; slot = (slot + 1) & mask {
 			p := m.index[slot]
 			if p == 0 {
 				return -1
@@ -445,21 +470,45 @@ func (m *SymbolMap) AddIfAbsent(key string, symbol *Symbol) bool {
 }
 
 func (m *SymbolMap) setOrAdd(key string, symbol *Symbol, replace bool) bool {
-	if i := m.Find(key); i >= 0 {
-		if replace {
-			m.entries[i] = makeEntry(key, symbol)
+	if m.index != nil {
+		mask := uint64(len(m.index) - 1)
+		slot := hashSymbolName(key) & mask
+		for {
+			p := m.index[slot]
+			if p == 0 {
+				break
+			}
+			if i := int(p - 1); m.KeyAt(i) == key {
+				if replace {
+					m.entries[i] = makeEntry(key, symbol)
+				}
+				return replace
+			}
+			slot = (slot + 1) & mask
 		}
-		return replace
+		i := int32(len(m.entries))
+		m.entries = append(m.entries, makeEntry(key, symbol))
+		if len(m.entries)*4 <= len(m.index)*3 {
+			m.index[slot] = i + 1
+		} else {
+			m.buildIndex()
+		}
+		return true
 	}
-	i := len(m.entries)
+	for i := range m.entries {
+		if m.KeyAt(i) == key {
+			if replace {
+				m.entries[i] = makeEntry(key, symbol)
+			}
+			return replace
+		}
+	}
 	if cap(m.entries) == 0 {
 		// Most tables hold one or two entries, so start with room for two rather than growing from one.
 		m.entries = make([]*Symbol, 0, 2)
 	}
 	m.entries = append(m.entries, makeEntry(key, symbol))
-	if len(m.index) != 0 && len(m.entries)*4 <= len(m.index)*3 {
-		m.insertIndex(key, i)
-	} else if len(m.entries) > symbolTableLinearMax {
+	if len(m.entries) > symbolTableLinearMax {
 		m.buildIndex()
 	}
 	return true
@@ -486,7 +535,7 @@ func indexSizeFor(n int) int {
 
 func (m *SymbolMap) insertIndex(key string, i int) {
 	mask := uint64(len(m.index) - 1)
-	slot := maphash.String(symbolTableSeed, key) & mask
+	slot := hashSymbolName(key) & mask
 	for m.index[slot] != 0 {
 		slot = (slot + 1) & mask
 	}
@@ -609,6 +658,7 @@ func (m *SymbolMap) HasNameProxies() bool {
 	}
 	return false
 }
+
 const InternalSymbolNamePrefix = "\xFE" // Invalid UTF8 sequence, will never occur as IdentifierName
 
 const (

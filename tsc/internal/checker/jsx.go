@@ -844,11 +844,11 @@ func (c *Checker) createJsxAttributesTypeFromAttributesProperty(openingLikeEleme
 			childrenPropSymbol.SetValueDeclaration(c.factory.NewPropertySignatureDeclaration(nil, c.factory.NewIdentifier(jsxChildrenPropertyName), nil /*postfixToken*/, nil /*type*/, nil /*initializer*/))
 			childrenPropSymbol.ValueDeclaration().Parent = attributeParent
 			childrenPropSymbol.ValueDeclaration().AsPropertySignatureDeclaration().Symbol = childrenPropSymbol
-		childPropMap := c.acquireSymbolTable()
-		childPropMap.Set(jsxChildrenPropertyName, childrenPropSymbol)
-		childType := c.newAnonymousType(attributesSymbol, childPropMap, nil, nil, nil)
-		c.releaseSymbolTableIfUnused(childType, childPropMap)
-		spread = c.getSpreadType(spread, childType, attributesSymbol, objectFlags|c.getPropagatingFlagsOfTypes(childTypes, TypeFlagsNone), false /*readonly*/)
+			childPropMap := c.acquireSymbolTable()
+			childPropMap.Set(jsxChildrenPropertyName, childrenPropSymbol)
+			childType := c.newAnonymousType(attributesSymbol, childPropMap, nil, nil, nil)
+			c.releaseSymbolTableIfUnused(childType, childPropMap)
+			spread = c.getSpreadType(spread, childType, attributesSymbol, objectFlags|c.getPropagatingFlagsOfTypes(childTypes, TypeFlagsNone), false /*readonly*/)
 		}
 	}
 	if hasSpreadAnyType {

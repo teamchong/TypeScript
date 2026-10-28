@@ -62,6 +62,7 @@ type forcedSymbolState struct {
 
 var (
 	lazyReparseHook   func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node
+	lazyLookupHook    func(lazy *LazyNodeList, file *SourceFile, name string) *Node
 	lazyBindHook      func(lazy *LazyNodeList, file *SourceFile, nodes []*Node)
 	lazySymbolLocks   [256]sync.Mutex
 	trackForcedLazy   atomic.Bool
@@ -77,7 +78,7 @@ func SetTrackForcedLazy(enabled bool) {
 func ResetForcedLazyLists() {
 	forcedLazyMu.Lock()
 	defer forcedLazyMu.Unlock()
-	for i := len(forcedLazySymbols) - 1; i >= 0; i-- {
+	for i := len(forcedLazySymbols) - 1; i >= 0; i-- { //nolint:modernize
 		entry := forcedLazySymbols[i]
 		for _, sm := range entry.savedMembers {
 			// SAFETY: savedMembers only records owner Symbols embedded at offset zero of SymbolWithData.
@@ -92,7 +93,7 @@ func ResetForcedLazyLists() {
 		entry.owner.SetHasLazyMembers()
 	}
 	forcedLazySymbols = nil
-	for i := len(forcedLazyLists) - 1; i >= 0; i-- {
+	for i := len(forcedLazyLists) - 1; i >= 0; i-- { //nolint:modernize
 		l := forcedLazyLists[i]
 		l.forcedNodes = nil
 		l.nestedLazyLists = nil
@@ -135,8 +136,12 @@ func SetLazyBindHook(fn func(lazy *LazyNodeList, file *SourceFile, nodes []*Node
 	lazyBindHook = fn
 }
 
+func SetLazyLookupHook(fn func(lazy *LazyNodeList, file *SourceFile, name string) *Node) {
+	lazyLookupHook = fn
+}
+
 func NewLazyNodeList(loc core.TextRange, parsingContext uint8, contextFlags NodeFlags, parsingContexts uint32) *LazyNodeList {
-	var list LazyNodeList
+	var list LazyNodeList //nolint:customlint
 	list.Loc = loc
 	list.Nodes = lazySentinelNodes
 	list.ParsingContext = parsingContext
@@ -146,7 +151,7 @@ func NewLazyNodeList(loc core.TextRange, parsingContext uint8, contextFlags Node
 }
 
 func NewLazyTypeAliasRHS(loc core.TextRange, contextFlags NodeFlags, parsingContexts uint32) *LazyNodeList {
-	var list LazyNodeList
+	var list LazyNodeList //nolint:customlint
 	list.Loc = loc
 	list.Nodes = lazySentinelNodes
 	list.ParsingContext = LazyParsingContextTypeAliasRHS
@@ -215,8 +220,9 @@ func (list *NodeList) forceLazy() []*Node {
 }
 
 func SetLazyOwner(list *NodeList, owner *Node) {
-	// SAFETY: SliceData checks the LazyNodeList sentinel before casting list to its enclosing LazyNodeList at offset zero.
+	// SAFETY: SliceData only inspects the backing-array pointer of list.Nodes.
 	if list != nil && unsafe.SliceData(list.Nodes) == &lazySentinelElem {
+		// SAFETY: The lazySentinelElem backing pointer guarantees list is embedded at offset zero of a LazyNodeList.
 		(*LazyNodeList)(unsafe.Pointer(list)).Owner = owner
 	}
 }
@@ -395,7 +401,7 @@ func (s *Symbol) getExportsSlow(arena *SymbolExtraArena) SymbolTable {
 }
 
 func saveTableMemberStates(t SymbolTable, dst []savedMemberSymbolState) []savedMemberSymbolState {
-	for _, m := range t.Values() {
+	for m := range t.Values() {
 		if m != nil {
 			mo := m.owner()
 			// SAFETY: owner() returns a Symbol embedded at offset zero of SymbolWithData.
@@ -493,4 +499,119 @@ func (s *Symbol) forceLazyMembers() {
 			break
 		}
 	}
+}
+
+func (lazy *LazyNodeList) IsBinaryKeyedTable() bool {
+	if lazy == nil || lazy.Loc.Len() <= 8192 || lazy.File == nil {
+		return false
+	}
+	text := lazy.File.Text()[lazy.Loc.Pos():lazy.Loc.End()]
+	if len(text) < 8 || text[0] != '\n' {
+		return false
+	}
+	i := 1
+	for i < len(text) && i < 16 && text[i] == ' ' {
+		i++
+	}
+	if i == 1 || i >= len(text) || text[i] != '\'' {
+		return false
+	}
+	kStart := i + 1
+	kEnd := kStart
+	for kEnd < len(text) && kEnd < kStart+64 && (text[kEnd] == '0' || text[kEnd] == '1') {
+		kEnd++
+	}
+	return kEnd > kStart && kEnd+2 <= len(text) && text[kEnd] == '\'' && text[kEnd+1] == ':'
+}
+
+func (s *Symbol) IsBinaryKeyedTypeLiteral() bool {
+	if s == nil || !s.HasLazyMembers() {
+		return false
+	}
+	decls := s.Declarations()
+	if len(decls) != 1 || decls[0] == nil || decls[0].Kind != KindTypeLiteral {
+		return false
+	}
+	list := decls[0].MemberList()
+	return list != nil && list.IsLazy() && list.AsLazy().IsBinaryKeyedTable()
+}
+
+func (s *Symbol) LookupLazyMember(name string) *Symbol {
+	if s == nil {
+		return nil
+	}
+	owner := s.owner()
+	// SAFETY: Converts the owner Symbol address to uintptr solely to select a lock shard.
+	mu := &lazySymbolLocks[(uintptr(unsafe.Pointer(owner))>>6)&255]
+	mu.Lock()
+	defer mu.Unlock()
+	// SAFETY: owner() returns a Symbol embedded at offset zero of SymbolWithData.
+	d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+	if atomic.LoadUint32(&owner.declHeader)&lazyStateMask != lazyStatePending {
+		if d.extra == nil {
+			return nil
+		}
+		return d.extra.members.Get(name)
+	}
+	if d.extra != nil && d.extra.members != nil {
+		if sym, ok := d.extra.members.Lookup(name); ok {
+			return sym
+		}
+	}
+	decls := s.Declarations()
+	if len(decls) != 1 || decls[0] == nil || decls[0].Kind != KindTypeLiteral {
+		return nil
+	}
+	list := decls[0].MemberList()
+	if list == nil || !list.IsLazy() {
+		return nil
+	}
+	l := list.AsLazy()
+	if l.state.Load() != LazyListDeferred || lazyLookupHook == nil {
+		return nil
+	}
+	node := lazyLookupHook(l, l.File, name)
+	if node == nil {
+		return nil
+	}
+	if trackForcedLazy.Load() && (d.extra == nil || d.extra.members == nil) {
+		prevExtra := d.extra
+		var savedMembers []savedMemberSymbolState
+		if prevExtra != nil {
+			cloned := *prevExtra
+			if cloned.members != nil {
+				savedMembers = saveTableMemberStates(cloned.members, savedMembers)
+				cloned.members = cloned.members.Clone()
+			}
+			if cloned.exports != nil {
+				savedMembers = saveTableMemberStates(cloned.exports, savedMembers)
+				cloned.exports = cloned.exports.Clone()
+			}
+			d.extra = &cloned
+		}
+		forcedLazyMu.Lock()
+		forcedLazySymbols = append(forcedLazySymbols, forcedSymbolState{
+			owner:        owner,
+			prevExtra:    prevExtra,
+			savedMembers: savedMembers,
+		})
+		forcedLazyMu.Unlock()
+	}
+	for {
+		old := atomic.LoadUint32(&owner.declHeader)
+		if atomic.CompareAndSwapUint32(&owner.declHeader, old, (old&^lazyStateMask)|lazyStateActive) {
+			break
+		}
+	}
+	lazyBindHook(l, l.File, []*Node{node})
+	for {
+		old := atomic.LoadUint32(&owner.declHeader)
+		if atomic.CompareAndSwapUint32(&owner.declHeader, old, (old&^lazyStateMask)|lazyStatePending) {
+			break
+		}
+	}
+	if d.extra == nil {
+		return nil
+	}
+	return d.extra.members.Get(name)
 }
