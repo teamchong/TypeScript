@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/microsoft/TypeScript/tsc/internal/ast"
@@ -95,9 +96,13 @@ type Parser struct {
 	jsdocTagCommentsPartsSpace []*ast.Node
 	reparseList                []*ast.Node
 
-	currentParent        *ast.Node
-	setParentFromContext ast.Visitor
-	reparsedClones       []*ast.Node
+	currentParent         *ast.Node
+	setParentFromContext  ast.Visitor
+	reparsedClones        []*ast.Node
+	freeNodeLists         [][]*ast.Node
+	lazyDts               bool
+	seenImportTypeLiteral string
+	lazyLists             []*ast.LazyNodeList
 }
 
 func newParser() *Parser {
@@ -122,13 +127,56 @@ var parserPool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	parserPool = sync.Pool{
+		New: func() any {
+			return newParser()
+		},
+	}
+}
+
+var lazyDtsEnabled atomic.Bool
+
+func EnableLazyDts(enabled bool) {
+	lazyDtsEnabled.Store(enabled)
+}
+
+func init() {
+	ast.SetLazyParseHook(reparseLazyList)
+	ast.SetLazyLookupHook(lookupLazyBinaryMember)
+}
+
 func getParser() *Parser {
 	return parserPool.Get().(*Parser)
 }
 
 func putParser(p *Parser) {
-	*p = Parser{scanner: p.scanner, setParentFromContext: p.setParentFromContext}
+	p.factory.ResetCounts()
+	*p = Parser{
+		scanner:              p.scanner,
+		factory:              p.factory,
+		nodeSliceArena:       p.nodeSliceArena,
+		stringSliceArena:     p.stringSliceArena,
+		setParentFromContext: p.setParentFromContext,
+		freeNodeLists:        p.freeNodeLists,
+	}
 	parserPool.Put(p)
+}
+
+func (p *Parser) allocNodeList() []*ast.Node {
+	if n := len(p.freeNodeLists); n > 0 {
+		list := p.freeNodeLists[n-1]
+		p.freeNodeLists = p.freeNodeLists[:n-1]
+		return list[:0]
+	}
+	return make([]*ast.Node, 0, 16)
+}
+
+func (p *Parser) freeNodeList(list []*ast.Node) {
+	if list != nil {
+		clear(list)
+		p.freeNodeLists = append(p.freeNodeLists, list[:0])
+	}
 }
 
 func ParseSourceFile(opts ast.SourceFileParseOptions, sourceText string, scriptKind core.ScriptKind) *ast.SourceFile {
@@ -431,6 +479,7 @@ func (p *Parser) parseSourceFileWorker() *ast.SourceFile {
 	isDeclarationFile := p.opts.FileName.IsDeclarationFile()
 	if isDeclarationFile {
 		p.contextFlags |= ast.NodeFlagsAmbient
+		p.lazyDts = lazyDtsEnabled.Load()
 	}
 	pos := p.nodePos()
 	statements := p.parseListIndex(PCSourceElements, (*Parser).parseToplevelStatement)
@@ -483,6 +532,10 @@ func (p *Parser) finishSourceFile(result *ast.SourceFile, isDeclarationFile bool
 	slices.SortFunc(p.reparsedClones, ast.CompareNodePositions)
 	result.ReparsedClones = slices.Clone(p.reparsedClones)
 	ast.SetExternalModuleIndicator(result, p.opts.ExternalModuleIndicatorOptions)
+	if len(p.lazyLists) > 0 {
+		result.LazyLists = slices.Clone(p.lazyLists)
+		p.lazyLists = nil
+	}
 }
 
 func (p *Parser) createJSDocCache() map[*ast.Node][]*ast.Node {
@@ -610,14 +663,23 @@ func (p *Parser) reparseTopLevelAwait(sourceFile *ast.SourceFile) *ast.Node {
 }
 
 func (p *Parser) parseListIndex(kind ParsingContext, parseElement func(p *Parser, index int) *ast.Node) []*ast.Node {
+	return p.parseListWorker(kind, nil, parseElement)
+}
+
+func (p *Parser) parseListWorker(kind ParsingContext, parseElement func(p *Parser) *ast.Node, parseElementIndex func(p *Parser, index int) *ast.Node) []*ast.Node {
 	saveParsingContexts := p.parsingContexts
 	p.parsingContexts |= 1 << kind
 	outerReparseList := p.reparseList
 	p.reparseList = nil
-	list := make([]*ast.Node, 0, 16)
+	list := p.allocNodeList()
 	for i := 0; !p.isListTerminator(kind); i++ {
 		if p.isListElement(kind, false /*inErrorRecovery*/) {
-			elt := parseElement(p, len(list))
+			var elt *ast.Node
+			if parseElement != nil {
+				elt = parseElement(p)
+			} else {
+				elt = parseElementIndex(p, len(list))
+			}
 			if len(p.reparseList) != 0 {
 				for _, e := range p.reparseList {
 					// Propagate @typedef type alias declarations outwards to a context that permits them.
@@ -638,13 +700,377 @@ func (p *Parser) parseListIndex(kind ParsingContext, parseElement func(p *Parser
 	}
 	p.reparseList = outerReparseList
 	p.parsingContexts = saveParsingContexts
-	return p.nodeSliceArena.Clone(list)
+	res := p.nodeSliceArena.Clone(list)
+	p.freeNodeList(list)
+	return res
 }
 
 func (p *Parser) parseList(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
 	pos := p.nodePos()
-	nodes := p.parseListIndex(kind, func(p *Parser, _ int) *ast.Node { return parseElement(p) })
+	nodes := p.parseListWorker(kind, parseElement, nil)
 	return p.newNodeList(core.NewTextRange(pos, p.nodePos()), nodes)
+}
+
+const lazyListMaxText = 1 << 28
+
+func (p *Parser) parseMemberList(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
+	if p.lazyDts && p.contextFlags&ast.NodeFlagsJSDoc == 0 && p.token != ast.KindCloseBraceToken {
+		return p.parseMemberListLazily(kind, parseElement)
+	}
+	return p.parseList(kind, parseElement)
+}
+
+func (p *Parser) parseMemberListLazily(kind ParsingContext, parseElement func(p *Parser) *ast.Node) *ast.NodeList {
+	if !p.hasParseError &&
+		!p.scanner.HasPrecedingJSDocWithSeeOrLink() &&
+		!p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+		if lastTokenEnd, ok := scanBalancedBraces(p.sourceText, p.scanner.TokenStart(), kind == PCClassMembers); ok {
+			startPos := p.nodePos()
+			contextFlags := p.contextFlags
+			parsingContexts := p.parsingContexts
+			beforeCommentDirectives := len(p.scanner.CommentDirectives())
+			markState := p.mark()
+			p.scanner.ResetTokenState(lastTokenEnd)
+			p.nextToken()
+			if p.token == ast.KindCloseBraceToken &&
+				!p.hasParseError &&
+				len(p.scanner.CommentDirectives()) == beforeCommentDirectives &&
+				!p.scanner.HasPrecedingJSDocWithSeeOrLink() &&
+				!p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+				loc := core.NewTextRange(startPos, p.nodePos())
+				lazy := ast.NewLazyNodeList(loc, uint8(kind), contextFlags, uint32(parsingContexts))
+				p.lazyLists = append(p.lazyLists, lazy)
+				return &lazy.NodeList
+			}
+			p.rewind(markState)
+		}
+	}
+	return p.parseList(kind, parseElement)
+}
+
+func scanBalancedBraces(text string, startPos int, isClass bool) (int, bool) {
+	maxEnd := min(len(text), startPos+lazyListMaxText)
+	i := startPos
+	depth := 0
+	parenDepth := 0
+	bracketDepth := 0
+	lastTokenEnd := startPos
+	for i < maxEnd {
+		c := text[i]
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			i++
+		case '}':
+			if depth == 0 {
+				if parenDepth != 0 || bracketDepth != 0 || lastTokenEnd == startPos {
+					return 0, false
+				}
+				return lastTokenEnd, true
+			}
+			depth--
+			i++
+			lastTokenEnd = i
+		case '{':
+			if isClass && depth == 0 && parenDepth == 0 && bracketDepth == 0 {
+				return 0, false
+			}
+			depth++
+			i++
+			lastTokenEnd = i
+		case '(':
+			parenDepth++
+			i++
+			lastTokenEnd = i
+		case ')':
+			if parenDepth == 0 {
+				return 0, false
+			}
+			parenDepth--
+			i++
+			lastTokenEnd = i
+		case '[':
+			bracketDepth++
+			i++
+			lastTokenEnd = i
+		case ']':
+			if bracketDepth == 0 {
+				return 0, false
+			}
+			bracketDepth--
+			i++
+			lastTokenEnd = i
+		case '"', '\'':
+			quote := c
+			i++
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '\n' || ch == '\r' {
+					return 0, false
+				}
+				i++
+				if ch == quote {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != quote {
+				return 0, false
+			}
+			lastTokenEnd = i
+		case '`':
+			i++
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '$' && i+1 < maxEnd && text[i+1] == '{' {
+					return 0, false
+				}
+				i++
+				if ch == '`' {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != '`' {
+				return 0, false
+			}
+			lastTokenEnd = i
+		case '/':
+			if i+1 >= maxEnd {
+				return 0, false
+			}
+			next := text[i+1]
+			if next == '/' {
+				i += 2
+				for i < maxEnd && text[i] != '\n' {
+					if text[i] == '@' || text[i] == '/' {
+						return 0, false
+					}
+					i++
+				}
+			} else if next == '*' {
+				i += 2
+				closed := false
+				for i+1 < maxEnd {
+					if text[i] == '@' {
+						return 0, false
+					}
+					if text[i] == '*' && text[i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					return 0, false
+				}
+			} else {
+				return 0, false
+			}
+		case '@', '#':
+			return 0, false
+		case '=':
+			if i+1 < maxEnd && text[i+1] == '>' {
+				i += 2
+				lastTokenEnd = i
+				continue
+			}
+			if isClass && depth == 0 {
+				return 0, false
+			}
+			i++
+			lastTokenEnd = i
+		default:
+			if c >= 0x80 {
+				return 0, false
+			}
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' {
+				wordStart := i
+				i++
+				for i < maxEnd {
+					ch := text[i]
+					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+						i++
+					} else if ch >= 0x80 {
+						return 0, false
+					} else {
+						break
+					}
+				}
+				word := text[wordStart:i]
+				switch len(word) {
+				case 4:
+					if word == "this" || word == "void" {
+						return 0, false
+					}
+				case 5:
+					if word == "super" || word == "infer" || word == "async" || word == "await" || word == "yield" || word == "class" {
+						return 0, false
+					}
+				case 6:
+					if word == "import" || word == "delete" {
+						return 0, false
+					}
+				case 8:
+					if word == "function" {
+						return 0, false
+					}
+				case 9:
+					if word == "satisfies" {
+						return 0, false
+					}
+				}
+				lastTokenEnd = i
+			} else if c >= '0' && c <= '9' {
+				i++
+				for i < maxEnd {
+					ch := text[i]
+					if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == '.' {
+						i++
+					} else {
+						break
+					}
+				}
+				lastTokenEnd = i
+			} else {
+				i++
+				lastTokenEnd = i
+			}
+		}
+	}
+	return 0, false
+}
+
+func reparseLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, allowNestedLazy bool) []*ast.Node {
+	p := getParser()
+	defer putParser(p)
+	p.initializeState(file.ParseOptions(), file.Text(), file.ScriptKind)
+	p.lazyDts = allowNestedLazy
+	p.scanner.ResetTokenState(lazy.Pos())
+	p.nextToken()
+	p.contextFlags = lazy.ContextFlags
+	p.parsingContexts = ParsingContexts(lazy.ParsingContexts)
+	var nodes []*ast.Node
+	if lazy.ParsingContext == ast.LazyParsingContextTypeAliasRHS {
+		var typeNode *ast.Node
+		if p.token == ast.KindIntrinsicKeyword && p.lookAhead((*Parser).nextIsNotDot) {
+			typeNode = p.parseKeywordTypeNode()
+		} else {
+			typeNode = p.parseType()
+		}
+		if typeNode != nil {
+			typeNode.Parent = lazy.Owner
+			nodes = []*ast.Node{typeNode}
+		}
+	} else {
+		var list *ast.NodeList
+		if ParsingContext(lazy.ParsingContext) == PCClassMembers {
+			list = p.parseList(PCClassMembers, (*Parser).parseClassElement)
+		} else {
+			list = p.parseList(PCTypeMembers, (*Parser).parseTypeMember)
+		}
+		owner := lazy.Owner
+		nodes = list.Nodes
+		for _, m := range nodes {
+			m.Parent = owner
+		}
+	}
+	if len(p.lazyLists) > 0 {
+		for _, nested := range p.lazyLists {
+			nested.File = file
+		}
+		lazy.SetNestedLazyLists(slices.Clone(p.lazyLists))
+		p.lazyLists = nil
+	}
+	return nodes
+}
+
+func lookupLazyBinaryMember(lazy *ast.LazyNodeList, file *ast.SourceFile, name string) *ast.Node {
+	text := file.Text()[lazy.Pos():lazy.End()]
+	if len(text) < 8 || text[0] != '\n' {
+		return nil
+	}
+	i := 1
+	for i < len(text) && i < 16 && text[i] == ' ' {
+		i++
+	}
+	if i == 1 || i >= len(text) || text[i] != '\'' {
+		return nil
+	}
+	prefixLen := i + 1
+	prefix := text[:prefixLen]
+	kStart := prefixLen
+	kEnd := kStart
+	for kEnd < len(text) && kEnd < kStart+64 && (text[kEnd] == '0' || text[kEnd] == '1') {
+		kEnd++
+	}
+	keyLen := kEnd - kStart
+	if keyLen == 0 || len(name) != keyLen || kEnd+2 > len(text) || text[kEnd] != '\'' || text[kEnd+1] != ':' {
+		return nil
+	}
+	for j := range len(name) {
+		if name[j] != '0' && name[j] != '1' {
+			return nil
+		}
+	}
+	lo := 0
+	hi := len(text)
+	foundPos := -1
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		rel := strings.Index(text[mid:], prefix)
+		if rel < 0 || mid+rel >= hi {
+			if mid == lo {
+				break
+			}
+			hi = mid
+			continue
+		}
+		entryPos := mid + rel
+		candStart := entryPos + prefixLen
+		candEnd := candStart + keyLen
+		if candEnd+2 > len(text) || text[candEnd] != '\'' || text[candEnd+1] != ':' {
+			break
+		}
+		cand := text[candStart:candEnd]
+		if cand == name {
+			foundPos = entryPos
+			break
+		}
+		if cand < name {
+			lo = candEnd + 2
+		} else {
+			hi = entryPos
+		}
+	}
+	if foundPos < 0 {
+		return nil
+	}
+	p := getParser()
+	defer putParser(p)
+	p.initializeState(file.ParseOptions(), file.Text(), file.ScriptKind)
+	p.lazyDts = true
+	p.scanner.ResetTokenState(lazy.Pos() + foundPos)
+	p.nextToken()
+	p.contextFlags = lazy.ContextFlags
+	p.parsingContexts = ParsingContexts(lazy.ParsingContexts)
+	node := p.parseTypeMember()
+	if node != nil {
+		node.Parent = lazy.Owner
+	}
+	if len(p.lazyLists) > 0 {
+		for _, nested := range p.lazyLists {
+			nested.File = file
+		}
+		p.lazyLists = nil
+	}
+	return node
 }
 
 // Return a non-nil (but possibly empty) slice if parsing was successful, or nil if parseElement returned nil
@@ -652,13 +1078,14 @@ func (p *Parser) parseDelimitedList(kind ParsingContext, parseElement func(p *Pa
 	pos := p.nodePos()
 	saveParsingContexts := p.parsingContexts
 	p.parsingContexts |= 1 << kind
-	list := make([]*ast.Node, 0, 16)
+	list := p.allocNodeList()
 	for {
 		if p.isListElement(kind, false /*inErrorRecovery*/) {
 			startPos := p.nodePos()
 			element := parseElement(p)
 			if element == nil {
 				p.parsingContexts = saveParsingContexts
+				p.freeNodeList(list)
 				// Return nil to indicate parseElement failed
 				return nil
 			}
@@ -702,7 +1129,9 @@ func (p *Parser) parseDelimitedList(kind ParsingContext, parseElement func(p *Pa
 		}
 	}
 	p.parsingContexts = saveParsingContexts
-	return p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+	res := p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+	p.freeNodeList(list)
+	return res
 }
 
 // Return a non-nil (but possibly empty) NodeList if parsing was successful, a missing NodeList if the opening
@@ -1761,7 +2190,7 @@ func (p *Parser) parseClassDeclarationOrExpression(pos int, jsdoc jsdocScannerIn
 	if p.parseExpected(ast.KindOpenBraceToken) {
 		// ClassTail[Yield,Await] : (Modified) See 14.5
 		//      ClassHeritage[?Yield,?Await]opt { ClassBody[?Yield,?Await]opt }
-		members = p.parseList(PCClassMembers, (*Parser).parseClassElement)
+		members = p.parseMemberList(PCClassMembers, (*Parser).parseClassElement)
 		p.parseExpected(ast.KindCloseBraceToken)
 	} else {
 		members = p.createMissingList()
@@ -1776,7 +2205,8 @@ func (p *Parser) parseClassDeclarationOrExpression(pos int, jsdoc jsdocScannerIn
 	} else {
 		result = p.factory.NewClassExpression(modifiers, name, typeParameters, heritageClauses, members)
 	}
-	p.finishNode(result, pos)
+	ast.SetLazyOwner(members, result)
+	result = p.finishNode(result, pos)
 	p.withJSDoc(result, jsdoc)
 	if result.Flags&ast.NodeFlagsJavaScriptFile != 0 {
 		p.checkJSSyntax(result)
@@ -2133,6 +2563,7 @@ func (p *Parser) parseInterfaceDeclaration(pos int, jsdoc jsdocScannerInfo, modi
 	heritageClauses := p.parseHeritageClauses(true /*isInterface*/)
 	members := p.parseObjectTypeMembers()
 	result := p.finishNode(p.factory.NewInterfaceDeclaration(modifiers, name, typeParameters, heritageClauses, members), pos)
+	ast.SetLazyOwner(members, result)
 	p.withJSDoc(result, jsdoc)
 	p.checkJSSyntax(result)
 	return result
@@ -2147,16 +2578,396 @@ func (p *Parser) parseTypeAliasDeclaration(pos int, jsdoc jsdocScannerInfo, modi
 	typeParameters := p.parseTypeParameters()
 	p.parseExpected(ast.KindEqualsToken)
 	var typeNode *ast.TypeNode
-	if p.token == ast.KindIntrinsicKeyword && p.lookAhead((*Parser).nextIsNotDot) {
-		typeNode = p.parseKeywordTypeNode()
-	} else {
-		typeNode = p.parseType()
+	if p.lazyDts && p.contextFlags&ast.NodeFlagsJSDoc == 0 && !p.hasParseError &&
+		!p.scanner.HasPrecedingJSDocWithSeeOrLink() && !p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+		typeNode = p.parseTypeAliasRHSLazily()
+	}
+	if typeNode == nil {
+		if p.token == ast.KindIntrinsicKeyword && p.lookAhead((*Parser).nextIsNotDot) {
+			typeNode = p.parseKeywordTypeNode()
+		} else {
+			typeNode = p.parseType()
+		}
 	}
 	p.parseSemicolon()
 	result := p.finishNode(p.factory.NewTypeAliasDeclaration(modifiers, name, typeParameters, typeNode), pos)
+	ast.SetLazyTypeOwner(typeNode, result)
 	p.withJSDoc(result, jsdoc)
 	p.checkJSSyntax(result)
 	return result
+}
+
+func (p *Parser) parseTypeAliasRHSLazily() *ast.TypeNode {
+	if lastTokenEnd, ok := scanLazyTypeAliasRHS(p.sourceText, p.scanner.TokenStart(), p.seenImportTypeLiteral); ok {
+		startPos := p.nodePos()
+		contextFlags := p.contextFlags
+		parsingContexts := p.parsingContexts
+		beforeCommentDirectives := len(p.scanner.CommentDirectives())
+		markState := p.mark()
+		p.scanner.ResetTokenState(lastTokenEnd)
+		p.nextToken()
+		if p.canParseSemicolon() &&
+			!p.hasParseError &&
+			len(p.scanner.CommentDirectives()) == beforeCommentDirectives &&
+			!p.scanner.HasPrecedingJSDocWithSeeOrLink() &&
+			!p.scanner.HasPrecedingJSDocWithDeprecatedTag() {
+			loc := core.NewTextRange(startPos, p.nodePos())
+			lazy := ast.NewLazyTypeAliasRHS(loc, contextFlags, uint32(parsingContexts))
+			p.lazyLists = append(p.lazyLists, lazy)
+			return &lazy.Placeholder
+		}
+		p.rewind(markState)
+	}
+	return nil
+}
+
+func scanLazyTypeAliasRHS(text string, startPos int, seenImportLiteral string) (int, bool) {
+	maxEnd := min(len(text), startPos+lazyListMaxText)
+	i := startPos
+	braceDepth := 0
+	parenDepth := 0
+	bracketDepth := 0
+	angleDepth := 0
+	lastTokenEnd := startPos
+	var lastSigChar byte
+	var lastWord string
+	for i < maxEnd {
+		c := text[i]
+		switch c {
+		case ' ', '\t', '\r':
+			i++
+		case '\n':
+			i++
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 && lastTokenEnd > startPos {
+				if lastSigChar != '=' && lastSigChar != '?' && lastSigChar != ':' &&
+					lastSigChar != '|' && lastSigChar != '&' && lastSigChar != ',' &&
+					lastWord != "extends" && lastWord != "keyof" && lastWord != "typeof" &&
+					lastWord != "infer" && lastWord != "readonly" && lastWord != "unique" &&
+					lastWord != "in" && lastWord != "out" && lastWord != "is" && lastWord != "asserts" {
+					if isStmtStartAfterNewline(text, i, maxEnd) {
+						return lastTokenEnd, true
+					}
+				}
+			}
+		case ';':
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				if lastTokenEnd == startPos {
+					return 0, false
+				}
+				return lastTokenEnd, true
+			}
+			i++
+			lastTokenEnd = i
+		case '{':
+			braceDepth++
+			i++
+			lastTokenEnd = i
+		case '}':
+			if braceDepth == 0 {
+				if parenDepth != 0 || bracketDepth != 0 || angleDepth != 0 || lastTokenEnd == startPos {
+					return 0, false
+				}
+				return lastTokenEnd, true
+			}
+			braceDepth--
+			i++
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = '}'
+				lastWord = ""
+			}
+		case '(':
+			parenDepth++
+			i++
+			lastTokenEnd = i
+		case ')':
+			if parenDepth == 0 {
+				return 0, false
+			}
+			parenDepth--
+			i++
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = ')'
+				lastWord = ""
+			}
+		case '[':
+			bracketDepth++
+			i++
+			lastTokenEnd = i
+		case ']':
+			if bracketDepth == 0 {
+				return 0, false
+			}
+			bracketDepth--
+			i++
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = ']'
+				lastWord = ""
+			}
+		case '<':
+			angleDepth++
+			i++
+			lastTokenEnd = i
+		case '>':
+			if angleDepth == 0 {
+				return 0, false
+			}
+			angleDepth--
+			i++
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = '>'
+				lastWord = ""
+			}
+		case '\'', '"':
+			quote := c
+			i++
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '\n' || ch == '\r' {
+					return 0, false
+				}
+				i++
+				if ch == quote {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != quote {
+				return 0, false
+			}
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = quote
+				lastWord = ""
+			}
+		case '`':
+			i++
+			tplBrace := 0
+			for i < maxEnd {
+				ch := text[i]
+				if ch == '\\' {
+					i += 2
+					continue
+				}
+				if ch == '$' && i+1 < maxEnd && text[i+1] == '{' {
+					tplBrace++
+					i += 2
+					continue
+				}
+				if tplBrace > 0 {
+					if ch == '{' {
+						tplBrace++
+					} else if ch == '}' {
+						tplBrace--
+					}
+					i++
+					continue
+				}
+				i++
+				if ch == '`' {
+					break
+				}
+			}
+			if i > maxEnd || text[i-1] != '`' || tplBrace != 0 {
+				return 0, false
+			}
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = '`'
+				lastWord = ""
+			}
+		case '/':
+			if i+1 >= maxEnd {
+				return 0, false
+			}
+			next := text[i+1]
+			if next == '/' {
+				i += 2
+				for i < maxEnd && text[i] != '\n' {
+					if text[i] == '@' || text[i] == '/' {
+						return 0, false
+					}
+					i++
+				}
+			} else if next == '*' {
+				i += 2
+				closed := false
+				for i+1 < maxEnd {
+					if text[i] == '@' {
+						return 0, false
+					}
+					if text[i] == '*' && text[i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					return 0, false
+				}
+			} else {
+				return 0, false
+			}
+		case '@', '#':
+			return 0, false
+		case '=':
+			if i+1 < maxEnd && text[i+1] == '>' {
+				i += 2
+				lastTokenEnd = i
+				if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+					lastSigChar = '='
+					lastWord = ""
+				}
+				continue
+			}
+			i++
+			lastTokenEnd = i
+			if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+				lastSigChar = '='
+				lastWord = ""
+			}
+		default:
+			if c >= 0x80 {
+				return 0, false
+			}
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' {
+				wordStart := i
+				i++
+				for i < maxEnd {
+					ch := text[i]
+					if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+						i++
+					} else if ch >= 0x80 {
+						return 0, false
+					} else {
+						break
+					}
+				}
+				word := text[wordStart:i]
+				switch word {
+				case "this", "void", "super", "delete", "async", "await", "yield", "class", "function", "satisfies":
+					return 0, false
+				case "import":
+					if seenImportLiteral == "" || !matchesSeenImportLiteral(text, i, maxEnd, seenImportLiteral) {
+						return 0, false
+					}
+				}
+				lastTokenEnd = i
+				if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+					lastSigChar = c
+					lastWord = word
+				}
+			} else {
+				i++
+				lastTokenEnd = i
+				if braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 {
+					lastSigChar = c
+					lastWord = ""
+				}
+			}
+		}
+	}
+	if i == len(text) && braceDepth == 0 && parenDepth == 0 && bracketDepth == 0 && angleDepth == 0 && lastTokenEnd > startPos {
+		return lastTokenEnd, true
+	}
+	return 0, false
+}
+
+func matchesSeenImportLiteral(text string, pos int, maxEnd int, seen string) bool {
+	// Check for `('seen')` or `("seen")` immediately following `import`
+	need := len(seen) + 4
+	if pos+need > maxEnd || text[pos] != '(' {
+		return false
+	}
+	q := text[pos+1]
+	if q != '\'' && q != '"' {
+		return false
+	}
+	return text[pos+2:pos+2+len(seen)] == seen && text[pos+2+len(seen)] == q && text[pos+3+len(seen)] == ')'
+}
+
+func isStmtStartAfterNewline(text string, pos int, maxEnd int) bool {
+	i := pos
+	for i < maxEnd {
+		c := text[i]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			i++
+			continue
+		}
+		if c == '/' && i+1 < maxEnd {
+			next := text[i+1]
+			if next == '/' {
+				if i+2 < maxEnd && (text[i+2] == '@' || text[i+2] == '/') {
+					return false
+				}
+				i += 2
+				for i < maxEnd && text[i] != '\n' {
+					if text[i] == '@' {
+						return false
+					}
+					i++
+				}
+				continue
+			}
+			if next == '*' {
+				i += 2
+				closed := false
+				for i+1 < maxEnd {
+					if text[i] == '@' {
+						return false
+					}
+					if text[i] == '*' && text[i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					return false
+				}
+				continue
+			}
+		}
+		break
+	}
+	if i >= len(text) {
+		return true
+	}
+	if i >= maxEnd {
+		return false
+	}
+	c := text[i]
+	if c == '}' || c == ';' {
+		return true
+	}
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+		start := i
+		i++
+		for i < maxEnd {
+			ch := text[i]
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '$' {
+				i++
+			} else {
+				break
+			}
+		}
+		if i < maxEnd && (text[i] == ' ' || text[i] == '\t' || text[i] == '{' || text[i] == '*') {
+			switch text[start:i] {
+			case "type", "export", "declare", "interface", "const", "let", "var",
+				"function", "class", "enum", "namespace", "module", "global", "import", "abstract":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *Parser) nextIsNotDot() bool {
@@ -2721,12 +3532,13 @@ func (p *Parser) parseUnionOrIntersectionType(operator ast.Kind, parseConstituen
 		typeNode = parseConstituentType(p)
 	}
 	if p.token == operator || hasLeadingOperator {
-		types := make([]*ast.Node, 1, 8)
-		types[0] = typeNode
+		types := append(p.allocNodeList(), typeNode)
 		for p.parseOptional(operator) {
 			types = append(types, p.parseFunctionOrConstructorTypeToError(isUnionType, parseConstituentType))
 		}
-		typeNode = p.createUnionOrIntersectionTypeNode(operator, p.newNodeList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(types)))
+		cloned := p.nodeSliceArena.Clone(types)
+		p.freeNodeList(types)
+		typeNode = p.createUnionOrIntersectionTypeNode(operator, p.newNodeList(core.NewTextRange(pos, p.nodePos()), cloned))
 		p.finishNode(typeNode, pos)
 	}
 	return typeNode
@@ -3131,6 +3943,9 @@ func (p *Parser) parseImportType() *ast.Node {
 		}
 	}
 	p.parseExpected(ast.KindCloseParenToken)
+	if attributes == nil && ast.IsLiteralTypeNode(typeNode) && ast.IsStringLiteral(typeNode.AsLiteralTypeNode().Literal) {
+		p.seenImportTypeLiteral = typeNode.AsLiteralTypeNode().Literal.Text()
+	}
 	var qualifier *ast.Node
 	if p.parseOptional(ast.KindDotToken) {
 		qualifier = p.parseEntityNameOfTypeReference()
@@ -3671,13 +4486,15 @@ func (p *Parser) parsePropertyOrMethodSignature(pos int, jsdoc jsdocScannerInfo,
 
 func (p *Parser) parseTypeLiteral() *ast.Node {
 	pos := p.nodePos()
-	result := p.finishNode(p.factory.NewTypeLiteralNode(p.parseObjectTypeMembers()), pos)
+	members := p.parseObjectTypeMembers()
+	result := p.finishNode(p.factory.NewTypeLiteralNode(members), pos)
+	ast.SetLazyOwner(members, result)
 	return result
 }
 
 func (p *Parser) parseObjectTypeMembers() *ast.NodeList {
 	if p.parseExpected(ast.KindOpenBraceToken) {
-		members := p.parseList(PCTypeMembers, (*Parser).parseTypeMember)
+		members := p.parseMemberList(PCTypeMembers, (*Parser).parseTypeMember)
 		p.parseExpected(ast.KindCloseBraceToken)
 		return members
 	}
@@ -3940,10 +4757,13 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 	// It is illegal to have both leadingDecorators and trailingDecorators, but we will report that as a grammar check in the checker.
 	// parse leading decorators
 	pos := p.nodePos()
-	list := make([]*ast.Node, 0, 16)
+	var list []*ast.Node
 	for {
 		if allowDecorators && p.token == ast.KindAtToken && !hasTrailingModifier {
 			decorator := p.parseDecorator()
+			if list == nil {
+				list = p.allocNodeList()
+			}
 			list = append(list, decorator)
 			if hasLeadingModifier {
 				hasTrailingDecorator = true
@@ -3956,6 +4776,9 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 			if modifier.Kind == ast.KindStaticKeyword {
 				hasStaticModifier = true
 			}
+			if list == nil {
+				list = p.allocNodeList()
+			}
 			list = append(list, modifier)
 			if hasTrailingDecorator {
 				hasTrailingModifier = true
@@ -3965,7 +4788,9 @@ func (p *Parser) parseModifiersEx(allowDecorators bool, permitConstAsModifier bo
 		}
 	}
 	if len(list) != 0 {
-		return p.newModifierList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+		res := p.newModifierList(core.NewTextRange(pos, p.nodePos()), p.nodeSliceArena.Clone(list))
+		p.freeNodeList(list)
+		return res
 	}
 	return nil
 }

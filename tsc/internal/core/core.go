@@ -33,10 +33,41 @@ func ApplyDebugStackLimit() {
 	rtdebug.SetMaxStack(n)
 }
 
+func SuspendGC() func() {
+	if os.Getenv("GOGC") != "" { //nolint:forbidigo
+		return nil
+	}
+	prev := rtdebug.SetGCPercent(-1)
+	if prev < 0 {
+		return nil
+	}
+	return func() {
+		rtdebug.SetGCPercent(prev)
+	}
+}
+
 func Filter[T any](slice []T, f func(T) bool) []T {
 	for i, value := range slice {
 		if !f(value) {
-			result := slices.Clone(slice[:i])
+			if i == 0 {
+				for i++; i < len(slice); i++ {
+					value = slice[i]
+					if f(value) {
+						result := make([]T, 1, len(slice)-i)
+						result[0] = value
+						for i++; i < len(slice); i++ {
+							value = slice[i]
+							if f(value) {
+								result = append(result, value)
+							}
+						}
+						return result
+					}
+				}
+				return slice[:0:0]
+			}
+			result := make([]T, i, len(slice)-1)
+			copy(result, slice[:i])
 			for i++; i < len(slice); i++ {
 				value = slice[i]
 				if f(value) {
@@ -64,7 +95,25 @@ func FilterSeq[T any](slice []T, f func(T) bool) iter.Seq[T] {
 func FilterIndex[T any](slice []T, f func(T, int, []T) bool) []T {
 	for i, value := range slice {
 		if !f(value, i, slice) {
-			result := slices.Clone(slice[:i])
+			if i == 0 {
+				for i++; i < len(slice); i++ {
+					value = slice[i]
+					if f(value, i, slice) {
+						result := make([]T, 1, len(slice)-i)
+						result[0] = value
+						for i++; i < len(slice); i++ {
+							value = slice[i]
+							if f(value, i, slice) {
+								result = append(result, value)
+							}
+						}
+						return result
+					}
+				}
+				return slice[:0:0]
+			}
+			result := make([]T, i, len(slice)-1)
+			copy(result, slice[:i])
 			for i++; i < len(slice); i++ {
 				value = slice[i]
 				if f(value, i, slice) {
@@ -309,7 +358,10 @@ func Concatenate[T any](s1 []T, s2 []T) []T {
 	if len(s1) == 0 {
 		return s2
 	}
-	return slices.Concat(s1, s2)
+	result := make([]T, len(s1)+len(s2))
+	copy(result, s1)
+	copy(result[len(s1):], s2)
+	return result
 }
 
 func Splice[T any](s1 []T, start int, deleteCount int, items ...T) []T {
@@ -646,6 +698,14 @@ var levenshteinBuffersPool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	levenshteinBuffersPool = sync.Pool{
+		New: func() any {
+			return &levenshteinBuffers{}
+		},
+	}
+}
+
 func levenshteinWithMax(buffers *levenshteinBuffers, s1 []rune, s2 []rune, maxValue float64) float64 {
 	bufferSize := len(s2) + 1
 	buffers.previous = slices.Grow(buffers.previous[:0], bufferSize)[:bufferSize]
@@ -825,7 +885,8 @@ func Deduplicate[T comparable](slice []T) []T {
 	if len(slice) > 1 {
 		for i, value := range slice {
 			if slices.Contains(slice[:i], value) {
-				result := slices.Clone(slice[:i])
+				result := make([]T, i, len(slice)-1)
+				copy(result, slice[:i])
 				for i++; i < len(slice); i++ {
 					value = slice[i]
 					if !slices.Contains(result, value) {

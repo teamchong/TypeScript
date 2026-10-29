@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -597,6 +598,9 @@ func (p *Program) extractUnresolvedImportsFromSourceFile(file *ast.SourceFile) [
 }
 
 func (p *Program) SingleThreaded() bool {
+	if runtime.GOARCH == "wasm" {
+		return true
+	}
 	return p.opts.SingleThreaded.DefaultIfUnknown(p.Options().SingleThreaded).IsTrue()
 }
 
@@ -1753,6 +1757,9 @@ func (p *Program) SymbolCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.SymbolCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredSymbolCount.Load()))
+	}
 	return int(val.Load())
 }
 
@@ -1761,6 +1768,9 @@ func (p *Program) TypeCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.TypeCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredTypeCount.Load()))
+	}
 	return int(val.Load())
 }
 
@@ -1769,7 +1779,17 @@ func (p *Program) InstantiationCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.TotalInstantiationCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredInstantiationCount.Load()))
+	}
 	return int(val.Load())
+}
+
+func (p *Program) RetiredCheckerCount() int {
+	if p.compilerCheckerPool == nil {
+		return 0
+	}
+	return int(p.compilerCheckerPool.retiredCheckerCount.Load())
 }
 
 func (p *Program) Program() *Program {

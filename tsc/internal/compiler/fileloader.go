@@ -59,7 +59,7 @@ type fileLoader struct {
 	contentMapperExtensions                        []string
 
 	filesParser *filesParser
-	rootTasks   []*parseTask
+	rootTasks   []parseTask
 
 	totalFileCount atomic.Int32
 	libFileCount   atomic.Int32
@@ -186,7 +186,7 @@ func processAllProgramFiles(
 			wg:       core.NewWorkGroup(singleThreaded),
 			maxDepth: maxNodeModuleJsDepth,
 		},
-		rootTasks:           make([]*parseTask, 0, len(rootFiles)+len(compilerOptions.Lib)),
+		rootTasks:           make([]parseTask, 0, len(rootFiles)+len(compilerOptions.Lib)+1),
 		supportedExtensions: supportedExtensions,
 		supportedExtensionsWithJsonIfResolveJsonModule: supportedExtensionsWithJsonIfResolveJsonModule,
 		contentMapperExtensions:                        opts.Config.ContentMapperExtensions(),
@@ -208,19 +208,19 @@ func processAllProgramFiles(
 		defer opts.Tracing.Push(tracing.PhaseProgram, "processRootFiles", map[string]any{"count": len(rootFiles)}, false)()
 	}
 	for index, rootFile := range rootFiles {
-		loader.addRootFileTask(rootFile, opts.Config.RootFileNameForDiagnostic(index), nil, &FileIncludeReason{kind: fileIncludeKindRootFile, index: index})
+		loader.addRootFileTask(rootFile, opts.Config.RootFileNameForDiagnostic(index), nil, FileIncludeReason{kind: fileIncludeKindRootFile, index: index})
 	}
 	if len(rootFiles) > 0 && compilerOptions.NoLib.IsFalseOrUnknown() {
 		if compilerOptions.Lib == nil {
 			name := tsoptions.GetDefaultLibFileName(compilerOptions)
 			libFile := loader.pathForLibFile(name)
-			loader.addRootTask(libFile.path, libFile, &FileIncludeReason{kind: fileIncludeKindLibFile, isDefaultLib: true})
+			loader.addRootTask(libFile.path, libFile, FileIncludeReason{kind: fileIncludeKindLibFile, isDefaultLib: true})
 
 		} else {
 			for index, lib := range compilerOptions.Lib {
 				if name, ok := tsoptions.GetLibFileName(lib); ok {
 					libFile := loader.pathForLibFile(name)
-					loader.addRootTask(libFile.path, libFile, &FileIncludeReason{kind: fileIncludeKindLibFile, index: index})
+					loader.addRootTask(libFile.path, libFile, FileIncludeReason{kind: fileIncludeKindLibFile, index: index})
 				}
 				// !!! error on unknown name
 			}
@@ -240,9 +240,9 @@ func (p *fileLoader) toPath(file tspath.RootedPath) tspath.PathKey {
 	return p.caseSensitivity.PathKey(file)
 }
 
-func (p *fileLoader) addRootTask(fileName tspath.RootedFilePath, libFile *LibFile, includeReason *FileIncludeReason) {
+func (p *fileLoader) addRootTask(fileName tspath.RootedFilePath, libFile *LibFile, includeReason FileIncludeReason) {
 	if p.opts.Config.CompilerOptions().AllowNonTsExtensions.IsTrue() || fileName.HasExtension() {
-		p.rootTasks = append(p.rootTasks, &parseTask{
+		p.rootTasks = append(p.rootTasks, parseTask{
 			normalizedFilePath: fileName,
 			path:               p.caseSensitivity.PathKey(tspath.RootedPath(fileName)),
 			libFile:            libFile,
@@ -251,36 +251,37 @@ func (p *fileLoader) addRootTask(fileName tspath.RootedFilePath, libFile *LibFil
 	}
 }
 
-func (p *fileLoader) addRootFileTask(fileName tspath.RootedFilePath, referenceText string, libFile *LibFile, includeReason *FileIncludeReason) {
+func (p *fileLoader) addRootFileTask(fileName tspath.RootedFilePath, referenceText string, libFile *LibFile, includeReason FileIncludeReason) {
 	resolvedFile, resolvedPath, diagnostic := p.getSourceFileFromReference(fileName, referenceText)
-	rootTask := &parseTask{
+	p.rootTasks = append(p.rootTasks, parseTask{
 		normalizedFilePath: resolvedFile,
 		path:               resolvedPath,
 		libFile:            libFile,
 		includeReason:      includeReason,
-	}
+	})
 	if diagnostic != nil {
+		rootTask := &p.rootTasks[len(p.rootTasks)-1]
 		rootTask.normalizedFilePath = fileName
 		rootTask.path = p.caseSensitivity.PathKey(tspath.RootedPath(fileName))
 		rootTask.failedLookup = true
 		rootTask.processingDiagnostics = []*processingDiagnostic{{
 			kind: processingDiagnosticKindExplainingFileInclude,
 			explanation: &includeExplainingDiagnostic{
-				diagnosticReason: includeReason,
+				diagnosticReason: &rootTask.includeReason,
 				message:          diagnostic.message,
 				args:             diagnostic.args,
 			},
 		}}
 	}
-	p.rootTasks = append(p.rootTasks, rootTask)
 }
 
 func (p *fileLoader) addAutomaticTypeDirectiveTasks() {
 	containingFileName := p.opts.Config.BaseDirectory().ResolveFile(module.InferredTypesContainingFile)
-	p.rootTasks = append(p.rootTasks, &parseTask{
+	p.rootTasks = append(p.rootTasks, parseTask{
 		normalizedFilePath:          containingFileName,
 		path:                        p.caseSensitivity.PathKey(tspath.RootedPath(containingFileName)),
 		isForAutomaticTypeDirective: true,
+		elideOnDepth:                false,
 	})
 }
 
@@ -311,11 +312,10 @@ func (p *fileLoader) resolveAutomaticTypeDirectives(containingFileName tspath.Ro
 					path:          resolved.ResolvedPath,
 					increaseDepth: resolved.IsExternalLibraryImport,
 					elideOnDepth:  false,
-					includeReason: &FileIncludeReason{
+					includeReason: FileIncludeReason{
 						kind:                   fileIncludeKindAutomaticTypeDirectiveFile,
 						automaticTypeDirective: &automaticTypeDirectiveFileData{name, resolved.PackageId},
 					},
-					packageId: resolved.PackageId,
 				})
 			} else {
 				pDiagnostics = append(pDiagnostics, &processingDiagnostic{
@@ -725,12 +725,12 @@ func (p *fileLoader) getSourceFileFromReference(
 	return "", "", &sourceFileFromReferenceDiagnostic{message: diagnostics.Could_not_resolve_the_path_0_with_the_extensions_Colon_1, args: []string{diagnosticFileName, "'" + strings.Join(core.Flatten(p.supportedExtensions), "', '") + "'"}}
 }
 
-func (p *fileLoader) resolveTripleslashPathReference(moduleName string, containingFile tspath.RootedFilePath, index int) (*resolvedRef, *processingDiagnostic) {
+func (p *fileLoader) resolveTripleslashPathReference(moduleName string, containingFile tspath.RootedFilePath, index int) (resolvedRef, *processingDiagnostic) {
 	normalizedFileName := containingFile.Directory().ResolveFile(moduleName)
 	containingPath := p.caseSensitivity.PathKey(tspath.RootedPath(containingFile))
-	includeReason := &FileIncludeReason{
+	includeReason := FileIncludeReason{
 		kind: fileIncludeKindReferenceFile,
-		referencedFile: &referencedFileData{
+		referencedFile: referencedFileData{
 			file:  containingPath,
 			index: index,
 		},
@@ -741,26 +741,26 @@ func (p *fileLoader) resolveTripleslashPathReference(moduleName string, containi
 		moduleName,
 	)
 	if diagnostic != nil {
-		return nil, &processingDiagnostic{
+		return resolvedRef{}, &processingDiagnostic{
 			kind: processingDiagnosticKindExplainingFileInclude,
 			explanation: &includeExplainingDiagnostic{
-				diagnosticReason: includeReason,
+				diagnosticReason: &includeReason,
 				message:          diagnostic.message,
 				args:             diagnostic.args,
 			},
 		}
 	}
 	if containingPath == resolvedPath {
-		return nil, &processingDiagnostic{
+		return resolvedRef{}, &processingDiagnostic{
 			kind: processingDiagnosticKindExplainingFileInclude,
 			explanation: &includeExplainingDiagnostic{
-				diagnosticReason: includeReason,
+				diagnosticReason: &includeReason,
 				message:          diagnostics.A_file_cannot_have_a_reference_to_itself,
 			},
 		}
 	}
 
-	return &resolvedRef{
+	return resolvedRef{
 		fileName:      resolvedFileName,
 		path:          resolvedPath,
 		includeReason: includeReason,
@@ -788,9 +788,9 @@ func (p *fileLoader) resolveTypeReferenceDirectives(t *parseTask) {
 			traceDone = p.tracing.Push(tracing.PhaseProgram, "processTypeReferenceDirective", map[string]any{"directive": ref.FileName, "hasResolved": resolved.IsResolved(), "refKind": int(fileIncludeKindTypeReferenceDirective), "refPath": string(t.path)}, false)
 		}
 		typeResolutionsInFile[module.ModeAwareCacheKey{Name: ref.FileName, Mode: resolutionMode}] = resolved
-		includeReason := &FileIncludeReason{
+		includeReason := FileIncludeReason{
 			kind: fileIncludeKindTypeReferenceDirective,
-			referencedFile: &referencedFileData{
+			referencedFile: referencedFileData{
 				file:  t.path,
 				index: index,
 			},
@@ -806,10 +806,10 @@ func (p *fileLoader) resolveTypeReferenceDirectives(t *parseTask) {
 				includeReason: includeReason,
 				packageId:     resolved.PackageId,
 			}, nil)
-		} else {
+		} else if ref.ResolutionMode == core.ResolutionModeNone {
 			t.processingDiagnostics = append(t.processingDiagnostics, &processingDiagnostic{
 				kind:   processingDiagnosticKindUnknownReference,
-				reason: includeReason,
+				reason: &includeReason,
 			})
 		}
 		if traceDone != nil {
@@ -939,9 +939,9 @@ func (p *fileLoader) resolveImportsAndModuleAugmentations(t *parseTask) {
 					path:          resolvedModule.ResolvedPath,
 					increaseDepth: resolvedModule.IsExternalLibraryImport,
 					elideOnDepth:  isJsFileFromNodeModules,
-					includeReason: &FileIncludeReason{
+					includeReason: FileIncludeReason{
 						kind: fileIncludeKindImport,
-						referencedFile: &referencedFileData{
+						referencedFile: referencedFileData{
 							file:      t.path,
 							index:     importIndex,
 							synthetic: core.IfElse(importIndex < 0, entry, nil),

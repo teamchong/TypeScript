@@ -98,7 +98,18 @@ func TestTypeCasts(t *testing.T) {
 		typ.flags = TypeFlagsNever
 		typ.objectFlags = ObjectFlagsReference
 		assert.Equal(t, test.cast(typ), any(test.data))
-		assert.Assert(t, didPanic(func() { typ.AsLiteralType() }) == (test.kind != typeKindLiteral))
+		for _, target := range tests {
+			switch target.kind {
+			case typeKindObject:
+				assert.Equal(t, target.cast(typ), any(test.data.AsObjectType()))
+			case typeKindTypeReference:
+				assert.Equal(t, target.cast(typ), any(test.data.AsTypeReference()))
+			case typeKindInterface:
+				assert.Equal(t, target.cast(typ), any(test.data.AsInterfaceType()))
+			default:
+				assert.Assert(t, didPanic(func() { target.cast(typ) }) == (test.kind != target.kind))
+			}
+		}
 	}
 }
 
@@ -142,6 +153,79 @@ func TestKeyBuilder(t *testing.T) {
 	}
 }
 
+func TestRelationKeys(t *testing.T) {
+	t.Parallel()
+	source := &Type{id: 1}
+	target := &Type{id: ^TypeId(0)}
+	var relation Relation
+	assert.Equal(t, relation.size(), 0)
+	for state := IntersectionStateNone; state <= IntersectionStateSource|IntersectionStateTarget; state++ {
+		key, constrained := getRelationKey(source, target, state, false, false)
+		assert.Assert(t, !constrained)
+		assert.Equal(t, relation.get(key), RelationComparisonResultNone)
+		relation.set(key, RelationComparisonResultSucceeded)
+		reverse, _ := getRelationKey(target, source, state, false, false)
+		assert.Assert(t, key != reverse)
+		assert.Equal(t, relation.get(reverse), RelationComparisonResultNone)
+		identity, _ := getRelationKey(target, source, state, true, false)
+		assert.Equal(t, key, identity)
+		relation.set(key, RelationComparisonResultFailed|RelationComparisonResultReportsUnreliable)
+		assert.Equal(t, relation.get(key), RelationComparisonResultFailed|RelationComparisonResultReportsUnreliable)
+	}
+	assert.Equal(t, relation.size(), 4)
+	for state := IntersectionStateNone; state <= IntersectionStateSource|IntersectionStateTarget; state++ {
+		key, _ := getRelationKey(source, target, state, false, false)
+		assert.Equal(t, relation.get(key), RelationComparisonResultFailed|RelationComparisonResultReportsUnreliable)
+	}
+}
+
+func TestRelationKeyNamespaces(t *testing.T) {
+	t.Parallel()
+	simple, _ := getRelationKey(&Type{id: 1}, &Type{id: 2}, IntersectionStateNone, false, false)
+	generic := relationKey{value: simple.value, generic: true}
+	var relation Relation
+	relation.set(simple, RelationComparisonResultSucceeded)
+	assert.Equal(t, relation.get(generic), RelationComparisonResultNone)
+	relation.set(generic, RelationComparisonResultFailed)
+	assert.Equal(t, relation.get(simple), RelationComparisonResultSucceeded)
+	assert.Equal(t, relation.get(generic), RelationComparisonResultFailed)
+	assert.Equal(t, relation.size(), 2)
+}
+
+func TestGenericRelationKeys(t *testing.T) {
+	t.Parallel()
+	c, types := newCompositeTestChecker()
+	c.noConstraintType = c.newIntrinsicType(TypeFlagsNever, "no constraint")
+	root := types[0]
+	newParameter := func(constraint *Type) *Type {
+		parameter := &TypeParameter{constraint: constraint}
+		return c.newType(TypeFlagsTypeParameter, ObjectFlagsNone, parameter.AsType(), typeKindTypeParameter)
+	}
+	newReference := func(argument *Type) *Type {
+		reference := &TypeReference{resolvedTypeArguments: []*Type{argument}}
+		reference.target = root
+		return c.newType(TypeFlagsObject, ObjectFlagsReference, reference.AsType(), typeKindTypeReference)
+	}
+	left := newReference(newParameter(c.noConstraintType))
+	right := newReference(newParameter(c.noConstraintType))
+	equivalentLeft := newReference(newParameter(c.noConstraintType))
+	equivalentRight := newReference(newParameter(c.noConstraintType))
+	key, constrained := getRelationKey(left, right, IntersectionStateNone, false, false)
+	assert.Assert(t, !constrained)
+	equivalent, _ := getRelationKey(equivalentLeft, equivalentRight, IntersectionStateNone, false, false)
+	assert.Equal(t, key, equivalent)
+	var relation Relation
+	relation.set(key, RelationComparisonResultSucceeded)
+	assert.Equal(t, relation.get(equivalent), RelationComparisonResultSucceeded)
+	constrainedLeft := newReference(newParameter(types[1]))
+	constrainedKey, constrained := getRelationKey(constrainedLeft, right, IntersectionStateNone, false, false)
+	assert.Assert(t, constrained)
+	assert.Assert(t, constrainedKey != key)
+	broadest, constrained := getRelationKey(constrainedLeft, right, IntersectionStateNone, false, true)
+	assert.Assert(t, !constrained)
+	assert.Equal(t, broadest, key)
+}
+
 func TestTypeListKeyAllocations(t *testing.T) { //nolint:paralleltest
 	if race.Enabled {
 		t.Skip("race instrumentation changes hashing allocations")
@@ -178,9 +262,7 @@ func BenchmarkTypeListKey(b *testing.B) {
 func newCompositeTestChecker() (*Checker, []*Type) {
 	c := &Checker{
 		strictNullChecks:      true,
-		unionTypes:            make(map[CacheHashKey]*Type),
 		unionOfUnionTypes:     make(map[UnionOfUnionKey]*Type),
-		intersectionTypes:     make(map[CacheHashKey]*Type),
 		subtypeReductionCache: make(map[CacheHashKey][]*Type),
 	}
 	c.compareSymbols = c.compareSymbolsWorker
@@ -448,10 +530,30 @@ func TestCompactTypeMapperLayout(t *testing.T) {
 	c, types := newCompositeTestChecker()
 	mapper := newSimpleTypeMapper(types[0], types[1])
 	assert.Assert(t, castTypeMapper[SimpleTypeMapper](mapper, TypeMapperKindSimple).source == types[0])
-	func() {
-		defer func() { assert.Assert(t, recover() != nil) }()
-		castTypeMapper[ArrayTypeMapper](mapper, TypeMapperKindArray)
-	}()
+	context := c.newInferenceContextWorker(nil, nil, InferenceFlagsNone, nil)
+	tests := []struct {
+		kind   TypeMapperKind
+		mapper *TypeMapper
+		cast   func(*TypeMapper) any
+	}{
+		{TypeMapperKindSimple, mapper, func(m *TypeMapper) any { return castTypeMapper[SimpleTypeMapper](m, TypeMapperKindSimple) }},
+		{TypeMapperKindArray, newArrayTypeMapper(nil, nil), func(m *TypeMapper) any { return castTypeMapper[ArrayTypeMapper](m, TypeMapperKindArray) }},
+		{TypeMapperKindArrayToSingle, newArrayToSingleTypeMapper(nil, nil), func(m *TypeMapper) any {
+			return castTypeMapper[ArrayToSingleTypeMapper](m, TypeMapperKindArrayToSingle)
+		}},
+		{TypeMapperKindDeferred, newDeferredTypeMapper(nil, nil), func(m *TypeMapper) any { return castTypeMapper[DeferredTypeMapper](m, TypeMapperKindDeferred) }},
+		{TypeMapperKindFunction, newFunctionTypeMapper(func(t *Type) *Type { return t }), func(m *TypeMapper) any { return castTypeMapper[FunctionTypeMapper](m, TypeMapperKindFunction) }},
+		{TypeMapperKindMerged, newMergedTypeMapper(mapper, mapper), func(m *TypeMapper) any { return castTypeMapper[MergedTypeMapper](m, TypeMapperKindMerged) }},
+		{TypeMapperKindComposite, newCompositeTypeMapper(c, mapper, mapper), func(m *TypeMapper) any { return castTypeMapper[CompositeTypeMapper](m, TypeMapperKindComposite) }},
+		{TypeMapperKindInference, context.mapper, func(m *TypeMapper) any { return castTypeMapper[InferenceTypeMapper](m, TypeMapperKindInference) }},
+	}
+	runtime.GC()
+	for _, test := range tests {
+		assert.Equal(t, test.mapper.kind, test.kind)
+		for _, target := range tests {
+			assert.Assert(t, didPanic(func() { target.cast(test.mapper) }) == (test.kind != target.kind))
+		}
+	}
 	runtime.GC()
 	assert.Equal(t, mapper.Map(types[0]), types[1])
 	runtime.KeepAlive(c)
@@ -514,9 +616,137 @@ func TestCompactValueSymbolLinksLayout(t *testing.T) {
 	assert.Equal(t, links.getContainingType(), types[2])
 }
 
+func TestStructuredMembersLookup(t *testing.T) {
+	t.Parallel()
+	c, _ := newCompositeTestChecker()
+	for _, count := range []int{0, 1, 8, 20, 300} {
+		members := ast.NewSymbolTableWithCapacity(count)
+		for i := range count {
+			name := strconv.Itoa(i)
+			members.Set(name, c.newSymbol(ast.SymbolFlagsProperty, name))
+		}
+		typ := c.newAnonymousType(nil, members, nil, nil, nil)
+		resolved := typ.AsStructuredType()
+		assert.Equal(t, len(resolved.Properties()), count)
+		for name, symbol := range members.All() {
+			assert.Equal(t, resolved.getMember(name), symbol)
+		}
+		assert.Assert(t, resolved.getMember("missing") == nil)
+		other := c.newAnonymousType(nil, resolved.getMembers(), nil, nil, nil)
+		for name, symbol := range members.All() {
+			assert.Equal(t, other.AsStructuredType().getMember(name), symbol)
+		}
+		members.Set("new", c.newSymbol(ast.SymbolFlagsProperty, "new"))
+		assert.Assert(t, resolved.getMember("new") == nil)
+		members.Set(ast.InternalSymbolNameCall, c.newSymbol(ast.SymbolFlagsSignature, ast.InternalSymbolNameCall))
+		withReserved := c.newAnonymousType(nil, members, nil, nil, nil).AsStructuredType()
+		assert.Equal(t, withReserved.getMember(ast.InternalSymbolNameCall), members.Get(ast.InternalSymbolNameCall))
+		for range 300 {
+			c.newMemberIndex(members, withReserved.Properties(), nil)
+		}
+		runtime.GC()
+		for name, symbol := range members.All() {
+			assert.Equal(t, withReserved.getMember(name), symbol)
+		}
+	}
+	renamed := c.newSymbol(ast.SymbolFlagsProperty, "original")
+	member := c.newAnonymousType(nil, ast.SymbolTableOf("different", renamed), nil, nil, nil).AsStructuredType()
+	assert.Equal(t, member.getMember("different"), renamed)
+	assert.Assert(t, member.getMember("original") == nil)
+	aliased := c.newSymbol(ast.SymbolFlagsProperty, "original")
+	aliasedMembers := ast.NewSymbolTable()
+	aliasedMembers.Set("original", aliased)
+	aliasedMembers.Set("different", aliased)
+	for i := range 10 {
+		name := "p" + strconv.Itoa(i)
+		aliasedMembers.Set(name, c.newSymbol(ast.SymbolFlagsProperty, name))
+	}
+	aliasedType := c.newAnonymousType(nil, aliasedMembers, nil, nil, nil).AsStructuredType()
+	for name, symbol := range aliasedMembers.All() {
+		assert.Equal(t, aliasedType.getMember(name), symbol)
+	}
+}
+
+func TestUnionIntersectionPropertyCacheSharing(t *testing.T) {
+	t.Parallel()
+	for _, intersection := range []bool{false, true} {
+		for _, augmentedFirst := range []bool{false, true} {
+			t.Run(strconv.FormatBool(intersection)+"/"+strconv.FormatBool(augmentedFirst), func(t *testing.T) {
+				t.Parallel()
+				c, _ := newCompositeTestChecker()
+				members := ast.NewSymbolTable()
+				for i := range 300 {
+					name := strconv.Itoa(i)
+					members.Set(name, c.newSymbol(ast.SymbolFlagsProperty, name))
+				}
+				members.Set("", c.newSymbol(ast.SymbolFlagsProperty, ""))
+				object := c.newAnonymousType(nil, members, nil, nil, nil)
+				var typ *Type
+				if intersection {
+					typ = c.newIntersectionType(ObjectFlagsNone, []*Type{object, object})
+				} else {
+					typ = c.newUnionType(ObjectFlagsNone, []*Type{object, object})
+				}
+				data := typ.AsUnionOrIntersectionType()
+				for name, symbol := range members.All() {
+					assert.Equal(t, c.getUnionOrIntersectionProperty(typ, name, !augmentedFirst), symbol)
+					assert.Equal(t, c.getUnionOrIntersectionProperty(typ, name, augmentedFirst), symbol)
+				}
+				assert.Equal(t, data.propertyCacheWithoutFunctionPropertyAugment.Len(), members.Len())
+				assert.Assert(t, data.propertyCache == nil)
+				runtime.GC()
+				for name, symbol := range members.All() {
+					assert.Equal(t, c.getUnionOrIntersectionProperty(typ, name, true), symbol)
+				}
+				runtime.KeepAlive(c)
+			})
+		}
+	}
+}
+
+func TestUnionIntersectionPropertyCacheModes(t *testing.T) {
+	t.Parallel()
+	for _, intersection := range []bool{false, true} {
+		t.Run(strconv.FormatBool(intersection), func(t *testing.T) {
+			t.Parallel()
+			c, _ := newCompositeTestChecker()
+			var typ *Type
+			if intersection {
+				typ = c.newIntersectionType(ObjectFlagsNone, nil)
+			} else {
+				typ = c.newUnionType(ObjectFlagsNone, nil)
+			}
+			data := typ.AsUnionOrIntersectionType()
+			assert.Assert(t, c.getUnionOrIntersectionProperty(typ, "missing", true) == nil)
+			assert.Assert(t, c.getUnionOrIntersectionProperty(typ, "missing", false) == nil)
+			assert.Assert(t, data.propertyCache == nil)
+			assert.Assert(t, data.propertyCacheWithoutFunctionPropertyAugment == nil)
+			data.propertyCacheWithoutFunctionPropertyAugment = ast.NewSymbolTable()
+			data.propertyCache = ast.NewSymbolTable()
+			for _, flags := range []ast.CheckFlags{ast.CheckFlagsReadPartial, ast.CheckFlagsWritePartial} {
+				name := strconv.Itoa(int(flags))
+				partial := c.newSymbolEx(ast.SymbolFlagsProperty, name, flags)
+				complete := c.newSymbol(ast.SymbolFlagsProperty, name)
+				data.propertyCacheWithoutFunctionPropertyAugment.Set(name, partial)
+				assert.Equal(t, c.getUnionOrIntersectionProperty(typ, name, true), partial)
+				assert.Assert(t, c.getUnionOrIntersectionProperty(typ, name, false) == nil)
+				assert.Equal(t, c.getPropertyOfUnionOrIntersectionType(typ, name, true) == nil, flags&ast.CheckFlagsReadPartial != 0)
+				data.propertyCache.Set(name, complete)
+				assert.Equal(t, c.getUnionOrIntersectionProperty(typ, name, false), complete)
+			}
+			nonAugmented := c.newSymbol(ast.SymbolFlagsProperty, "different")
+			augmented := c.newSymbol(ast.SymbolFlagsProperty, "different")
+			data.propertyCacheWithoutFunctionPropertyAugment.Set("different", nonAugmented)
+			data.propertyCache.Set("different", augmented)
+			assert.Equal(t, c.getUnionOrIntersectionProperty(typ, "different", true), nonAugmented)
+			assert.Equal(t, c.getUnionOrIntersectionProperty(typ, "different", false), augmented)
+		})
+	}
+}
+
 func TestCompactStructuredTypeLayout(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, unsafe.Sizeof(StructuredType{}), unsafe.Sizeof(ConstrainedType{})+5*unsafe.Sizeof(uintptr(0)))
+	assert.Equal(t, unsafe.Sizeof(StructuredType{}), unsafe.Sizeof(ConstrainedType{})+1*unsafe.Sizeof(uintptr(0)))
 }
 
 func TestStructuredTypeExtra(t *testing.T) {
@@ -566,7 +796,7 @@ func TestStructuredTypeExtra(t *testing.T) {
 
 func TestCompactTypeNodeLinksLayout(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, unsafe.Sizeof(TypeNodeLinks{}), 2*unsafe.Sizeof(uintptr(0)))
+	assert.Equal(t, unsafe.Sizeof(TypeNodeLinks{}), 3*unsafe.Sizeof(uintptr(0)))
 	c, types := newCompositeTestChecker()
 	var links TypeNodeLinks
 	links.resolvedType = types[0]
@@ -598,8 +828,8 @@ func TestCompactTypeNodeLinksLayout(t *testing.T) {
 
 func TestCompactSignatureLayout(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, unsafe.Sizeof(Signature{}), 16+8*unsafe.Sizeof(uintptr(0)))
-	assert.Equal(t, unsafe.Sizeof(signatureExtra{}), 7*unsafe.Sizeof(uintptr(0)))
+	assert.Equal(t, unsafe.Sizeof(Signature{}), 16+9*unsafe.Sizeof(uintptr(0)))
+	assert.Equal(t, unsafe.Sizeof(signatureExtra{}), 10*unsafe.Sizeof(uintptr(0)))
 }
 
 func TestSignatureExtra(t *testing.T) {

@@ -187,7 +187,7 @@ func (c *Checker) WasCanceled() bool {
 }
 
 func (c *Checker) GetSignaturesOfType(t *Type, kind SignatureKind) []*Signature {
-	return c.getSignaturesOfType(t, kind)
+	return c.resolveExportedSignatures(c.getSignaturesOfType(t, kind))
 }
 
 func (c *Checker) GetDeclaredTypeOfSymbol(symbol *ast.Symbol) *Type {
@@ -271,7 +271,7 @@ func (c *Checker) GetExpandedParameters(signature *Signature, skipUnionExpanding
 }
 
 func (c *Checker) GetResolvedSignature(node *ast.Node) *Signature {
-	return c.getResolvedSignature(node, nil, CheckModeNormal)
+	return c.resolveExportedSignature(c.getResolvedSignature(node, nil, CheckModeNormal))
 }
 
 // Return the type of the given property in the given type, or nil if no such property exists

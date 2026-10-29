@@ -10,9 +10,9 @@ import (
 // TypeMapper
 
 type TypeMapper struct {
-	kind TypeMapperKind
+	kind         TypeMapperKind
+	hasInference bool
 }
-
 type TypeMapperKind uint8
 
 const (
@@ -50,21 +50,41 @@ var (
 func (m *TypeMapper) Map(t *Type) *Type {
 	switch m.kind {
 	case TypeMapperKindSimple:
-		return castTypeMapper[SimpleTypeMapper](m, TypeMapperKindSimple).Map(t)
+		s := (*SimpleTypeMapper)(unsafe.Pointer(m))
+		if t == s.source {
+			return s.target
+		}
+		return t
 	case TypeMapperKindArray:
-		return castTypeMapper[ArrayTypeMapper](m, TypeMapperKindArray).Map(t)
+		a := (*ArrayTypeMapper)(unsafe.Pointer(m))
+		if h := a.hint; h < a.sourcesLen && *(**Type)(unsafe.Add(unsafe.Pointer(a.sourcesPtr), uintptr(h)*unsafe.Sizeof((*Type)(nil)))) == t {
+			a.hint = h + 1
+			return *(**Type)(unsafe.Add(unsafe.Pointer(a.targetsPtr), uintptr(h)*unsafe.Sizeof((*Type)(nil))))
+		}
+		return a.Map(t)
+	default:
+		return m.mapSlow(t)
+	}
+}
+
+func (m *TypeMapper) mapSlow(t *Type) *Type {
+	switch m.kind {
+	case TypeMapperKindSimple:
+		return (*SimpleTypeMapper)(unsafe.Pointer(m)).Map(t)
+	case TypeMapperKindArray:
+		return (*ArrayTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindArrayToSingle:
-		return castTypeMapper[ArrayToSingleTypeMapper](m, TypeMapperKindArrayToSingle).Map(t)
+		return (*ArrayToSingleTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindDeferred:
-		return castTypeMapper[DeferredTypeMapper](m, TypeMapperKindDeferred).Map(t)
+		return (*DeferredTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindFunction:
-		return castTypeMapper[FunctionTypeMapper](m, TypeMapperKindFunction).Map(t)
+		return (*FunctionTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindMerged:
-		return castTypeMapper[MergedTypeMapper](m, TypeMapperKindMerged).Map(t)
+		return (*MergedTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindComposite:
-		return castTypeMapper[CompositeTypeMapper](m, TypeMapperKindComposite).Map(t)
+		return (*CompositeTypeMapper)(unsafe.Pointer(m)).Map(t)
 	case TypeMapperKindInference:
-		return castTypeMapper[InferenceTypeMapper](m, TypeMapperKindInference).Map(t)
+		return (*InferenceTypeMapper)(unsafe.Pointer(m)).Map(t)
 	default:
 		panic("Invalid type mapper kind")
 	}
@@ -126,10 +146,22 @@ func mergeTypeMappers(m1 *TypeMapper, m2 *TypeMapper) *TypeMapper {
 }
 
 func prependTypeMapping(source *Type, target *Type, mapper *TypeMapper) *TypeMapper {
+	tp := getNonDistributedTypeParameter(source)
 	if mapper == nil {
-		return newSimpleTypeMapper(getNonDistributedTypeParameter(source), target)
+		return newSimpleTypeMapper(tp, target)
 	}
-	return newMergedTypeMapper(newSimpleTypeMapper(getNonDistributedTypeParameter(source), target), mapper)
+	if mapper.kind == TypeMapperKindSimple {
+		s := castTypeMapper[SimpleTypeMapper](mapper, TypeMapperKindSimple)
+		if s.source == tp {
+			if s.target == target && target != tp {
+				return mapper
+			}
+			if target.flags&TypeFlagsTypeParameter == 0 {
+				return newSimpleTypeMapper(tp, target)
+			}
+		}
+	}
+	return newMergedTypeMapper(newSimpleTypeMapper(tp, target), mapper)
 }
 
 func appendTypeMapping(mapper *TypeMapper, source *Type, target *Type) *TypeMapper {
@@ -167,6 +199,13 @@ type SimpleTypeMapper struct {
 }
 
 func newSimpleTypeMapper(source *Type, target *Type) *TypeMapper {
+	if source != nil && source.checker != nil {
+		m := source.checker.simpleMapperArena.New()
+		m.kind = TypeMapperKindSimple
+		m.source = source
+		m.target = target
+		return &m.TypeMapper
+	}
 	m := &SimpleTypeMapper{}
 	m.kind = TypeMapperKindSimple
 	m.source = source
@@ -189,29 +228,80 @@ func (m *SimpleTypeMapper) MapsThisOnly() bool {
 
 type ArrayTypeMapper struct {
 	TypeMapperBase
-	sources []*Type
-	targets []*Type
+	sourcesLen uint16
+	targetsLen uint16
+	hint       uint16
+	sourcesPtr **Type
+	targetsPtr **Type
 }
 
 func newArrayTypeMapper(sources []*Type, targets []*Type) *TypeMapper {
+	var sourcesPtr, targetsPtr **Type
+	if len(sources) > 0 {
+		sourcesPtr = unsafe.SliceData(sources)
+	}
+	if len(targets) > 0 {
+		targetsPtr = unsafe.SliceData(targets)
+	}
+	if len(sources) > 0 && sources[0] != nil && sources[0].checker != nil {
+		m := sources[0].checker.arrayMapperArena.New()
+		m.kind = TypeMapperKindArray
+		m.sourcesLen = uint16(len(sources))
+		m.targetsLen = uint16(len(targets))
+		m.sourcesPtr = sourcesPtr
+		m.targetsPtr = targetsPtr
+		return &m.TypeMapper
+	}
 	m := &ArrayTypeMapper{}
 	m.kind = TypeMapperKindArray
-	m.sources = sources
-	m.targets = targets
+	m.sourcesLen = uint16(len(sources))
+	m.targetsLen = uint16(len(targets))
+	m.sourcesPtr = sourcesPtr
+	m.targetsPtr = targetsPtr
 	return &m.TypeMapper
 }
 
+func (m *ArrayTypeMapper) sources() []*Type {
+	if m.sourcesLen == 0 {
+		return nil
+	}
+	return unsafe.Slice(m.sourcesPtr, m.sourcesLen)
+}
+
+func (m *ArrayTypeMapper) targets() []*Type {
+	if m.targetsLen == 0 {
+		return nil
+	}
+	return unsafe.Slice(m.targetsPtr, m.targetsLen)
+}
+
 func (m *ArrayTypeMapper) Map(t *Type) *Type {
-	for i, s := range m.sources {
-		if t == s {
-			return m.targets[i]
+	n := int(m.sourcesLen)
+	if n == 0 {
+		return t
+	}
+	sources := unsafe.Slice(m.sourcesPtr, n)
+	h := int(m.hint)
+	if h >= n {
+		h = 0
+	}
+	for i := h; i < n; i++ {
+		if sources[i] == t {
+			m.hint = uint16(i + 1)
+			return unsafe.Slice(m.targetsPtr, m.targetsLen)[i]
+		}
+	}
+	for i := range h {
+		if sources[i] == t {
+			m.hint = uint16(i + 1)
+			return unsafe.Slice(m.targetsPtr, m.targetsLen)[i]
 		}
 	}
 	return t
 }
 
 func (m *ArrayTypeMapper) MapsThisOnly() bool {
-	return len(m.sources) == 1 && isThisTypeParameter(m.sources[0])
+	return m.sourcesLen == 1 && isThisTypeParameter(*m.sourcesPtr)
 }
 
 // ArrayToSingleTypeMapper
@@ -297,8 +387,30 @@ type MergedTypeMapper struct {
 }
 
 func newMergedTypeMapper(m1 *TypeMapper, m2 *TypeMapper) *TypeMapper {
+	var c *Checker
+	if m1 != nil && m1.kind == TypeMapperKindSimple {
+		if s := castTypeMapper[SimpleTypeMapper](m1, TypeMapperKindSimple).source; s != nil {
+			c = s.checker
+		}
+	} else if m2 != nil && m2.kind == TypeMapperKindSimple {
+		if s := castTypeMapper[SimpleTypeMapper](m2, TypeMapperKindSimple).source; s != nil {
+			c = s.checker
+		}
+	} else if m1 != nil && m1.kind == TypeMapperKindComposite {
+		c = castTypeMapper[CompositeTypeMapper](m1, TypeMapperKindComposite).c
+	}
+	hasInference := m1 != nil && m1.hasInference || m2 != nil && m2.hasInference
+	if c != nil {
+		m := c.mergedMapperArena.New()
+		m.kind = TypeMapperKindMerged
+		m.hasInference = hasInference
+		m.m1 = m1
+		m.m2 = m2
+		return &m.TypeMapper
+	}
 	m := &MergedTypeMapper{}
 	m.kind = TypeMapperKindMerged
+	m.hasInference = hasInference
 	m.m1 = m1
 	m.m2 = m2
 	return &m.TypeMapper
@@ -318,8 +430,19 @@ type CompositeTypeMapper struct {
 }
 
 func newCompositeTypeMapper(c *Checker, m1 *TypeMapper, m2 *TypeMapper) *TypeMapper {
+	hasInference := m1 != nil && m1.hasInference || m2 != nil && m2.hasInference
+	if c != nil {
+		m := c.compositeMapperArena.New()
+		m.kind = TypeMapperKindComposite
+		m.hasInference = hasInference
+		m.c = c
+		m.m1 = m1
+		m.m2 = m2
+		return &m.TypeMapper
+	}
 	m := &CompositeTypeMapper{}
 	m.kind = TypeMapperKindComposite
+	m.hasInference = hasInference
 	m.c = c
 	m.m1 = m1
 	m.m2 = m2
@@ -329,6 +452,9 @@ func newCompositeTypeMapper(c *Checker, m1 *TypeMapper, m2 *TypeMapper) *TypeMap
 func (m *CompositeTypeMapper) Map(t *Type) *Type {
 	t1 := m.m1.Map(t)
 	if t1 != t {
+		if t1.flags&(TypeFlagsInstantiable|TypeFlagsObject|TypeFlagsUnionOrIntersection) == 0 {
+			return t1
+		}
 		return m.c.instantiateType(t1, m.m2)
 	}
 	return m.m2.Map(t)
@@ -338,27 +464,93 @@ func (m *CompositeTypeMapper) Map(t *Type) *Type {
 
 type InferenceTypeMapper struct {
 	TypeMapperBase
+	fixing bool
+	hint   int
 	c      *Checker
 	n      *InferenceContext
-	fixing bool
 }
 
 func (c *Checker) initInferenceTypeMapper(m *InferenceTypeMapper, n *InferenceContext, fixing bool) *TypeMapper {
 	m.kind = TypeMapperKindInference
+	m.hasInference = true
+	m.fixing = fixing
+	m.hint = 0
 	m.c = c
 	m.n = n
-	m.fixing = fixing
 	return &m.TypeMapper
 }
 
+func markMapperEscaped(m *TypeMapper) {
+	if m != nil && m.hasInference {
+		markMapperEscapedSlow(m)
+	}
+}
+
+func markMapperEscapedSlow(m *TypeMapper) {
+	m.hasInference = false
+	switch m.kind {
+	case TypeMapperKindInference:
+		castTypeMapper[InferenceTypeMapper](m, TypeMapperKindInference).n.escaped = true
+	case TypeMapperKindMerged:
+		merged := castTypeMapper[MergedTypeMapper](m, TypeMapperKindMerged)
+		if merged.m1 != nil && merged.m1.hasInference {
+			markMapperEscapedSlow(merged.m1)
+		}
+		if merged.m2 != nil && merged.m2.hasInference {
+			markMapperEscapedSlow(merged.m2)
+		}
+	case TypeMapperKindComposite:
+		comp := castTypeMapper[CompositeTypeMapper](m, TypeMapperKindComposite)
+		if comp.m1 != nil && comp.m1.hasInference {
+			markMapperEscapedSlow(comp.m1)
+		}
+		if comp.m2 != nil && comp.m2.hasInference {
+			markMapperEscapedSlow(comp.m2)
+		}
+	}
+}
+
 func (m *InferenceTypeMapper) Map(t *Type) *Type {
-	for i, inference := range m.n.inferences {
+	inferences := m.n.inferences
+	n := len(inferences)
+	if n == 0 {
+		return t
+	}
+	if n == 1 {
+		inference := inferences[0]
 		if t == inference.typeParameter {
 			if m.fixing && !inference.isFixed {
-				// Before we commit to a particular inference (and thus lock out any further inferences),
-				// we infer from any intra-expression inference sites we have collected.
 				m.c.inferFromIntraExpressionSites(m.n)
-				clearCachedInferences(m.n.inferences)
+				clearCachedInferences(inferences)
+				inference.isFixed = true
+			}
+			return m.c.getInferredType(m.n, 0)
+		}
+		return t
+	}
+	h := m.hint
+	if h >= n {
+		h = 0
+	}
+	for i := h; i < n; i++ {
+		inference := inferences[i]
+		if t == inference.typeParameter {
+			m.hint = i + 1
+			if m.fixing && !inference.isFixed {
+				m.c.inferFromIntraExpressionSites(m.n)
+				clearCachedInferences(inferences)
+				inference.isFixed = true
+			}
+			return m.c.getInferredType(m.n, i)
+		}
+	}
+	for i := range h {
+		inference := inferences[i]
+		if t == inference.typeParameter {
+			m.hint = i + 1
+			if m.fixing && !inference.isFixed {
+				m.c.inferFromIntraExpressionSites(m.n)
+				clearCachedInferences(inferences)
 				inference.isFixed = true
 			}
 			return m.c.getInferredType(m.n, i)

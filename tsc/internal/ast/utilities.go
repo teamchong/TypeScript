@@ -15,10 +15,10 @@ import (
 // Atomic ids
 
 var (
-	nextNodeId        atomic.Uint64
-	nextSymbolId      atomic.Uint64
-	nextNodeBlockId   atomic.Uint64
-	nextSymbolBlockId atomic.Uint64
+	nextNodeId        atomic.Uint32
+	nextSymbolId      atomic.Uint32
+	nextNodeBlockId   atomic.Uint32
+	nextSymbolBlockId atomic.Uint32
 )
 
 func GetNodeId(node *Node) NodeId {
@@ -45,24 +45,32 @@ func GetSymbolId(symbol *Symbol) SymbolId {
 	return SymbolId(id)
 }
 
+func PeekNodeId(node *Node) NodeId {
+	return NodeId(node.id.Load())
+}
+
+func PeekSymbolId(symbol *Symbol) SymbolId {
+	return SymbolId(symbol.id.Load())
+}
+
 const (
-	BlockIdOffset = 0x1_0000_0000_0000
-	BlockIdSize   = core.LinkPageSize
+	BlockIdOffset = 0x4000_0000
+	BlockIdSize   = 1024
 )
 
 type NodeIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
 	id := node.id.Load()
 	if id == 0 {
 		if a.nextId == a.lastId {
-			a.nextId = nextNodeBlockId.Add(BlockIdSize) - BlockIdSize
+			a.nextId = nextNodeBlockId.Add(BlockIdSize) + (BlockIdOffset - BlockIdSize)
 			a.lastId = a.nextId + BlockIdSize
 		}
-		id = a.nextId + BlockIdOffset
+		id = a.nextId
 		a.nextId++
 		if !node.id.CompareAndSwap(0, id) {
 			id = node.id.Load()
@@ -72,18 +80,18 @@ func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
 }
 
 type SymbolIdGenerator struct {
-	nextId uint64
-	lastId uint64
+	nextId uint32
+	lastId uint32
 }
 
 func (a *SymbolIdGenerator) GetSymbolId(symbol *Symbol) SymbolId {
 	id := symbol.id.Load()
 	if id == 0 {
 		if a.nextId == a.lastId {
-			a.nextId = nextSymbolBlockId.Add(BlockIdSize) - BlockIdSize
+			a.nextId = nextSymbolBlockId.Add(BlockIdSize) + (BlockIdOffset - BlockIdSize)
 			a.lastId = a.nextId + BlockIdSize
 		}
-		id = a.nextId + BlockIdOffset
+		id = a.nextId
 		a.nextId++
 		if !symbol.id.CompareAndSwap(0, id) {
 			id = symbol.id.Load()
@@ -100,15 +108,47 @@ func GetSymbolTable(data *SymbolTable) SymbolTable {
 }
 
 func GetMembers(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	return GetSymbolTable(&symbol.ensureExtra(arena).members)
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.members != nil {
+		return d.extra.members
+	}
+	return symbol.getMembersSlow(arena)
 }
 
 func GetExports(symbol *Symbol, arena *SymbolExtraArena) SymbolTable {
-	return GetSymbolTable(&symbol.ensureExtra(arena).exports)
+	owner := symbol.owner()
+	d := owner.data()
+	if owner.declHeader&lazyStateMask == 0 && d.extra != nil && d.extra.exports != nil {
+		return d.extra.exports
+	}
+	return symbol.getExportsSlow(arena)
 }
 
 func GetLocals(container *Node) SymbolTable {
-	return GetSymbolTable(&container.LocalsContainerData().Locals)
+	data := container.LocalsContainerData()
+	if data.Locals == nil {
+		var capHint int
+		switch container.Kind {
+		case KindSourceFile:
+			capHint = len(container.Statements())
+		case KindModuleDeclaration:
+			if body := container.Body(); body != nil && body.Kind == KindModuleBlock {
+				capHint = len(body.Statements())
+			}
+		case KindFunctionDeclaration, KindMethodDeclaration, KindMethodSignature, KindConstructor,
+			KindGetAccessor, KindSetAccessor, KindFunctionExpression, KindArrowFunction,
+			KindCallSignature, KindConstructSignature, KindFunctionType, KindConstructorType:
+			capHint = len(container.Parameters())
+			if tps := container.TypeParameters(); len(tps) > 0 {
+				capHint += len(tps)
+			}
+		case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
+			capHint = len(container.TypeParameters())
+		}
+		data.Locals = NewSymbolTableWithCapacity(capHint)
+	}
+	return data.Locals
 }
 
 // Determines if a node is missing (either `nil` or empty)
@@ -1406,15 +1446,15 @@ func IsVoidZero(node *Node) bool {
 }
 
 func IsExportsIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "exports"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "exports"
 }
 
 func IsModuleIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "module"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "module"
 }
 
 func IsThisIdentifier(node *Node) bool {
-	return IsIdentifier(node) && node.Text() == "this"
+	return node != nil && node.Kind == KindIdentifier && node.AsIdentifier().Text == "this"
 }
 
 func IsThisParameter(node *Node) bool {
@@ -2795,13 +2835,34 @@ func GetNodeAtPosition(file *SourceFile, position int, includeJSDoc bool) *Node 
 			}
 		}
 		if child == nil {
-			current.ForEachChild(func(node *Node) bool {
-				if nodeContainsPosition(node, position) {
-					child = node
-					return true
+			if current.Kind == KindSourceFile {
+				sf := current.AsSourceFile()
+				if stmts := sf.Statements.Nodes; len(stmts) > 16 {
+					lo, hi := 0, len(stmts)
+					for lo < hi {
+						mid := int(uint(lo+hi) >> 1)
+						if stmts[mid].End() <= position {
+							lo = mid + 1
+						} else {
+							hi = mid
+						}
+					}
+					if lo < len(stmts) && nodeContainsPosition(stmts[lo], position) {
+						child = stmts[lo]
+					} else if sf.EndOfFileToken != nil && nodeContainsPosition(sf.EndOfFileToken, position) {
+						child = sf.EndOfFileToken
+					}
 				}
-				return false
-			})
+			}
+			if child == nil {
+				current.ForEachChild(func(node *Node) bool {
+					if nodeContainsPosition(node, position) {
+						child = node
+						return true
+					}
+					return false
+				})
+			}
 		}
 		if child == nil || IsMetaProperty(child) {
 			return current
@@ -2814,30 +2875,26 @@ func nodeContainsPosition(node *Node, position int) bool {
 	return node.Kind >= KindFirstNode && node.Pos() <= position && (position < node.End() || position == node.End() && node.Kind == KindEndOfFile)
 }
 
-func findImportOrRequire(text string, start int) (index int, size int) {
-	index = max(start, 0)
-	n := len(text)
-	for index < n {
-		next := strings.IndexAny(text[index:], "ir")
-		if next < 0 {
-			break
-		}
-		index += next
-
-		var expected string
-		if text[index] == 'i' {
-			size = 6
-			expected = "import"
-		} else {
-			size = 7
-			expected = "require"
-		}
-		if index+size <= n && text[index:index+size] == expected {
-			return index, size
-		}
-		index++
+func findImportOrRequire(text string, start int, isJavaScriptFile bool) (index int, size int) {
+	start = max(start, 0)
+	if start >= len(text) {
+		return -1, 0
 	}
-
+	sub := text[start:]
+	imp := strings.Index(sub, "import")
+	if !isJavaScriptFile {
+		if imp < 0 {
+			return -1, 0
+		}
+		return start + imp, 6
+	}
+	req := strings.Index(sub, "require")
+	if imp >= 0 && (req < 0 || imp < req) {
+		return start + imp, 6
+	}
+	if req >= 0 {
+		return start + req, 7
+	}
 	return -1, 0
 }
 
@@ -2848,7 +2905,7 @@ func ForEachDynamicImportOrRequireCall(
 	cb func(node *Node, argument *Expression) bool,
 ) bool {
 	isJavaScriptFile := IsInJSFile(file.AsNode())
-	lastIndex, size := findImportOrRequire(file.Text(), 0)
+	lastIndex, size := findImportOrRequire(file.Text(), 0, isJavaScriptFile)
 	for lastIndex >= 0 {
 		node := GetNodeAtPosition(file, lastIndex, isJavaScriptFile && includeTypeSpaceImports)
 		if isJavaScriptFile && IsRequireCall(node, requireStringLiteralLikeArgument) {
@@ -2863,10 +2920,14 @@ func ForEachDynamicImportOrRequireCall(
 			if cb(node, node.AsImportTypeNode().Argument.AsLiteralTypeNode().Literal) {
 				return true
 			}
+		} else if node.Kind == KindTypeAliasDeclaration && node.AsTypeAliasDeclaration().Type.IsLazyTypeNode() && node.End() > lastIndex+size {
+			lastIndex = node.End()
+			lastIndex, size = findImportOrRequire(file.Text(), lastIndex, isJavaScriptFile)
+			continue
 		}
 		// skip past import/require
 		lastIndex += size
-		lastIndex, size = findImportOrRequire(file.Text(), lastIndex)
+		lastIndex, size = findImportOrRequire(file.Text(), lastIndex, isJavaScriptFile)
 	}
 	return false
 }

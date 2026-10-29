@@ -23,7 +23,7 @@ type ExportsOrImports struct {
 var _ json.UnmarshalerFrom = (*ExportsOrImports)(nil)
 
 func (e *ExportsOrImports) UnmarshalJSONFrom(dec *json.Decoder) error {
-	return e.JSONValue.unmarshalJSONValueFrom[ExportsOrImports](dec)
+	return unmarshalJSONValueFrom[ExportsOrImports](&e.JSONValue, dec)
 }
 
 func (e ExportsOrImports) AsObject() *collections.OrderedMap[string, ExportsOrImports] {

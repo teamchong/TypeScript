@@ -8,12 +8,22 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/jsnum"
 )
 
-type InferenceKey struct {
-	source        TypeId
-	target        TypeId
-	priority      InferencePriority
-	contravariant bool
-	bivariant     bool
+type inferInfoOutcome struct {
+	candidates       []*Type
+	contraCandidates []*Type
+	priority         InferencePriority
+	topLevel         bool
+}
+
+type inferMemoEntry struct {
+	infos   []inferInfoOutcome
+	cleared bool
+}
+
+type inferenceVisitedSlot struct {
+	key    uint64
+	status InferencePriority
+	epoch  uint32
 }
 
 type InferenceState struct {
@@ -24,34 +34,128 @@ type InferenceState struct {
 	inferencePriority InferencePriority
 	contravariant     bool
 	bivariant         bool
+	clearedInferences bool
 	expandingFlags    ExpandingFlags
 	propagationType   *Type
-	visited           map[InferenceKey]InferencePriority
-	sourceStack       []*Type
-	targetStack       []*Type
+	visited           []inferenceVisitedSlot
+	visitedCount      uint32
+	visitedEpoch      uint32
+	visitedInline     [16]inferenceVisitedSlot
+	sourceStack       []relaterStackEntry
+	targetStack       []relaterStackEntry
 	next              *InferenceState
 }
 
 func (c *Checker) getInferenceState() *InferenceState {
 	n := c.freeinferenceState
 	if n == nil {
-		n = &InferenceState{}
+		n = &InferenceState{visitedEpoch: 1}
+		n.visited = n.visitedInline[:]
+		return n
 	}
 	c.freeinferenceState = n.next
+	n.next = nil
 	return n
 }
 
 func (c *Checker) putInferenceState(n *InferenceState) {
-	clear(n.visited)
-	*n = InferenceState{
-		inferences:  n.inferences[:0],
-		visited:     n.visited,
-		sourceStack: n.sourceStack[:0],
-		targetStack: n.targetStack[:0],
-		next:        c.freeinferenceState,
+	epoch := n.visitedEpoch
+	if n.visitedCount != 0 {
+		epoch++
+		if epoch == 0 {
+			clear(n.visited)
+			epoch = 1
+		}
 	}
+	n.inferences = n.inferences[:0]
+	n.originalSource = nil
+	n.originalTarget = nil
+	n.priority = 0
+	n.inferencePriority = 0
+	n.contravariant = false
+	n.bivariant = false
+	n.clearedInferences = false
+	n.expandingFlags = 0
+	n.propagationType = nil
+	n.visitedCount = 0
+	n.visitedEpoch = epoch
+	n.sourceStack = n.sourceStack[:0]
+	n.targetStack = n.targetStack[:0]
+	n.next = c.freeinferenceState
 	c.freeinferenceState = n
 }
+
+func (n *InferenceState) lookupOrInsertVisited(key uint64) (InferencePriority, bool) {
+	slots := n.visited
+	epoch := n.visitedEpoch
+	mask := uint32(len(slots) - 1)
+	idx := uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+	for {
+		s := &slots[idx]
+		if s.epoch != epoch {
+			if (n.visitedCount+1)*4 >= uint32(len(slots))*3 {
+				n.growVisited()
+				slots = n.visited
+				epoch = n.visitedEpoch
+				mask = uint32(len(slots) - 1)
+				idx = uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+				for slots[idx].epoch == epoch {
+					idx = (idx + 1) & mask
+				}
+				s = &slots[idx]
+			}
+			s.key = key
+			s.status = InferencePriorityCircularity
+			s.epoch = epoch
+			n.visitedCount++
+			return 0, false
+		}
+		if s.key == key {
+			return s.status, true
+		}
+		idx = (idx + 1) & mask
+	}
+}
+
+func (n *InferenceState) updateVisited(key uint64, status InferencePriority) {
+	slots := n.visited
+	epoch := n.visitedEpoch
+	mask := uint32(len(slots) - 1)
+	idx := uint32((key*0x9e3779b97f4a7c15)>>32) & mask
+	for {
+		s := &slots[idx]
+		if s.epoch == epoch && s.key == key {
+			s.status = status
+			return
+		}
+		idx = (idx + 1) & mask
+	}
+}
+
+func (n *InferenceState) growVisited() {
+	oldSlots := n.visited
+	oldEpoch := n.visitedEpoch
+	newCap := len(oldSlots) * 2
+	newSlots := make([]inferenceVisitedSlot, newCap)
+	mask := uint32(newCap - 1)
+	for i := range oldSlots {
+		s := &oldSlots[i]
+		if s.epoch == oldEpoch {
+			idx := uint32((s.key*0x9e3779b97f4a7c15)>>32) & mask
+			for newSlots[idx].epoch != 0 {
+				idx = (idx + 1) & mask
+			}
+			newSlots[idx] = inferenceVisitedSlot{key: s.key, status: s.status, epoch: 1}
+		}
+	}
+	n.visited = newSlots
+	n.visitedEpoch = 1
+}
+
+const (
+	inferMemoMaxInfos = 8
+	inferMemoMinSteps = 16
+)
 
 func (c *Checker) inferTypes(inferences []*InferenceInfo, originalSource *Type, originalTarget *Type, priority InferencePriority, contravariant bool) {
 	n := c.getInferenceState()
@@ -61,11 +165,115 @@ func (c *Checker) inferTypes(inferences []*InferenceInfo, originalSource *Type, 
 	n.priority = priority
 	n.inferencePriority = InferencePriorityMaxValue
 	n.contravariant = contravariant
-	c.inferFromTypes(n, originalSource, originalTarget)
+	c.inferFromTypesMemo(n, originalSource, originalTarget)
 	c.putInferenceState(n)
 }
 
+func (c *Checker) inferFromTypesMemo(n *InferenceState, source *Type, target *Type) {
+	if !c.inferLongTargets[target] {
+		stepsBefore := c.inferMemoSteps
+		c.inferFromTypes(n, source, target)
+		if c.inferMemoSteps-stepsBefore >= inferMemoMinSteps {
+			if c.inferLongTargets == nil {
+				c.inferLongTargets = make(map[*Type]bool)
+			}
+			c.inferLongTargets[target] = true
+		}
+		return
+	}
+	inferences := n.inferences
+	if c.skipDirectInferenceNodes.Len() != 0 || len(inferences) > inferMemoMaxInfos {
+		c.inferFromTypes(n, source, target)
+		return
+	}
+	var b keyBuilder
+	b.writeUint32(uint32(source.id))
+	b.writeUint32(uint32(target.id))
+	b.writeUint32(uint32(n.priority))
+	b.writeByte(core.IfElse(n.contravariant, byte(1), byte(0)))
+	b.writeUint32(uint32(len(inferences)))
+	for _, info := range inferences {
+		var tpId uint32
+		if info.typeParameter != nil {
+			tpId = uint32(info.typeParameter.id)
+		}
+		b.writeUint32(tpId)
+		b.writeUint32(uint32(info.priority))
+		b.writeByte(core.IfElse(info.topLevel, byte(1), byte(0)) | core.IfElse(info.isFixed, byte(2), byte(0)))
+		b.writeUint32(uint32(info.impliedArity))
+		b.writeUint32(uint32(len(info.candidates)))
+		b.writeTypes(info.candidates)
+		b.writeUint32(uint32(len(info.contraCandidates)))
+		b.writeTypes(info.contraCandidates)
+	}
+	key := b.hash()
+	if entry := c.inferMemoEntries[key]; entry != nil {
+		for i, info := range inferences {
+			outcome := &entry.infos[i]
+			info.candidates = append(info.candidates[:0], outcome.candidates...)
+			info.contraCandidates = append(info.contraCandidates[:0], outcome.contraCandidates...)
+			info.priority = outcome.priority
+			info.topLevel = outcome.topLevel
+		}
+		if entry.cleared {
+			clearCachedInferences(inferences)
+		}
+		return
+	}
+	inInstantiation := len(c.activeMappers) != 0
+	resetsBefore := c.instantiationCountResets
+	cyclesBefore := c.resolutionCycleCount
+	var hasFailedResolution bool
+	for i := c.resolutionStart; i < len(c.typeResolutions); i++ {
+		if !c.typeResolutions[i].result {
+			hasFailedResolution = true
+			break
+		}
+	}
+	typeCount := c.TypeCount
+	symbolCount := c.SymbolCount
+	sigCount := c.SignatureCount
+	instCount := c.instantiationCount
+	totalInstCount := c.TotalInstantiationCount
+	diagCount := c.diagnosticCount
+	impureCount := c.unionImpureCount
+	stepsBefore := c.inferMemoSteps
+	c.inferFromTypes(n, source, target)
+	steps := c.inferMemoSteps - stepsBefore
+	if steps >= inferMemoMinSteps &&
+		!inInstantiation &&
+		!hasFailedResolution &&
+		c.instantiationCountResets == resetsBefore &&
+		c.resolutionCycleCount == cyclesBefore &&
+		c.TypeCount == typeCount &&
+		c.SymbolCount == symbolCount &&
+		c.SignatureCount == sigCount &&
+		c.instantiationCount == instCount &&
+		c.TotalInstantiationCount == totalInstCount &&
+		c.diagnosticCount == diagCount &&
+		c.unionImpureCount == impureCount &&
+		c.skipDirectInferenceNodes.Len() == 0 {
+		outcomes := make([]inferInfoOutcome, len(inferences))
+		for i, info := range inferences {
+			outcomes[i] = inferInfoOutcome{
+				candidates:       slices.Clone(info.candidates),
+				contraCandidates: slices.Clone(info.contraCandidates),
+				priority:         info.priority,
+				topLevel:         info.topLevel,
+			}
+		}
+		if c.inferMemoEntries == nil {
+			c.inferMemoEntries = make(map[CacheHashKey]*inferMemoEntry)
+		}
+		c.inferMemoEntries[key] = &inferMemoEntry{
+			infos:   outcomes,
+			cleared: n.clearedInferences,
+		}
+	}
+}
+
 func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) {
+	c.inferMemoSteps++
 	if !c.couldContainTypeVariables(target) || c.isNoInferType(target) {
 		return
 	}
@@ -95,19 +303,22 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 		return
 	}
 	if target.flags&TypeFlagsUnion != 0 {
+		var sourceBuf [1]*Type
 		var sourceTypes []*Type
 		if source.flags&TypeFlagsUnion != 0 {
 			sourceTypes = source.Types()
 		} else {
-			sourceTypes = []*Type{source}
+			sourceBuf[0] = source
+			sourceTypes = sourceBuf[:]
 		}
+		targetTypes := target.Types()
 		// First, infer between identically matching source and target constituents and remove the
 		// matching types.
-		tempSources, tempTargets := c.inferFromMatchingTypes(n, sourceTypes, target.Types(), (*Checker).isTypeOrBaseIdenticalTo, false /*sort*/)
+		sources, targets := c.inferFromMatchingTypes(n, sourceTypes, targetTypes, (*Checker).isTypeOrBaseIdenticalTo, false /*sort*/)
 		// Next, infer between closely matching source and target constituents and remove
 		// the matching types. Types closely match when they are instantiations of the same
 		// object type or instantiations of the same type alias.
-		sources, targets := c.inferFromMatchingTypes(n, tempSources, tempTargets, (*Checker).isTypeCloselyMatchedBy, true /*sort*/)
+		sources, targets = c.inferFromMatchingTypes(n, sources, targets, (*Checker).isTypeCloselyMatchedBy, true /*sort*/)
 		if len(targets) == 0 {
 			return
 		}
@@ -117,22 +328,24 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 			// However, simply making no inferences is undesirable because it could ultimately mean
 			// inferring a type parameter constraint. Instead, make a lower priority inference from
 			// the full source to whatever remains in the target. For example, when inferring from
-			// string to 'string | T', make a lower priority inference of string for T.
+			// `string` to `string | T`, make a lower priority inference of `string` for `T`.
 			c.inferWithPriority(n, source, target, InferencePriorityNakedTypeVariable)
 			return
 		}
 		source = c.getUnionType(sources)
 	} else if target.flags&TypeFlagsIntersection != 0 && !core.Every(target.Types(), c.isNonGenericObjectType) {
 		// We reduce intersection types unless they're simple combinations of object types. For example,
-		// when inferring from 'string[] & { extra: any }' to 'string[] & T' we want to remove string[] and
-		// infer { extra: any } for T. But when inferring to 'string[] & Iterable<T>' we want to keep the
-		// string[] on the source side and infer string for T.
+		// when inferring from `string[] & { extra: any }` to `string[] & T` we want to remove `string[]` and
+		// infer `{ extra: any }` for `T`. But when inferring to `string[] & Iterable<T>` we want to keep the
+		// `string[]` on the source side and infer `string` for `T`.
 		if source.flags&TypeFlagsUnion == 0 {
+			var sourceBuf [1]*Type
 			var sourceTypes []*Type
 			if source.flags&TypeFlagsIntersection != 0 {
 				sourceTypes = source.Types()
 			} else {
-				sourceTypes = []*Type{source}
+				sourceBuf[0] = source
+				sourceTypes = sourceBuf[:]
 			}
 			// Infer between identically matching source and target constituents and remove the matching types.
 			sources, targets := c.inferFromMatchingTypes(n, sourceTypes, target.Types(), (*Checker).isTypeIdenticalTo, false /*sort*/)
@@ -182,8 +395,10 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 					return
 				}
 				if n.priority < inference.priority {
-					inference.candidates = nil
-					inference.contraCandidates = nil
+					clear(inference.candidates)
+					inference.candidates = inference.candidates[:0]
+					clear(inference.contraCandidates)
+					inference.contraCandidates = inference.contraCandidates[:0]
 					inference.topLevel = true
 					inference.priority = n.priority
 				}
@@ -193,15 +408,18 @@ func (c *Checker) inferFromTypes(n *InferenceState, source *Type, target *Type) 
 					if n.contravariant && !n.bivariant {
 						if !slices.Contains(inference.contraCandidates, candidate) {
 							inference.contraCandidates = append(inference.contraCandidates, candidate)
+							n.clearedInferences = true
 							clearCachedInferences(n.inferences)
 						}
 					} else if !slices.Contains(inference.candidates, candidate) {
 						inference.candidates = append(inference.candidates, candidate)
+						n.clearedInferences = true
 						clearCachedInferences(n.inferences)
 					}
 				}
 				if n.priority&InferencePriorityReturnType == 0 && target.flags&TypeFlagsTypeParameter != 0 && inference.topLevel && !c.isTypeParameterAtTopLevel(n.originalTarget, target, 0) {
 					inference.topLevel = false
+					n.clearedInferences = true
 					clearCachedInferences(n.inferences)
 				}
 			}
@@ -344,26 +562,30 @@ func (c *Checker) inferFromContravariantTypesIfStrictFunctionTypes(n *InferenceS
 // such that we would go on inferring forever, even though we would never infer
 // between the same pair of types.
 func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, action func(c *Checker, n *InferenceState, source *Type, target *Type)) {
-	key := InferenceKey{source: source.id, target: target.id, priority: n.priority, contravariant: n.contravariant, bivariant: n.bivariant}
-	if status, ok := n.visited[key]; ok {
+	var flags uint64
+	if n.contravariant {
+		flags |= 1 << 11
+	}
+	if n.bivariant {
+		flags |= 1 << 12
+	}
+	flags |= uint64(n.priority) & 0x7ff
+	key := uint64(source.id) | (uint64(target.id) << 25) | (flags << 50)
+	if status, ok := n.lookupOrInsertVisited(key); ok {
 		n.inferencePriority = min(n.inferencePriority, status)
 		return
 	}
-	if n.visited == nil {
-		n.visited = make(map[InferenceKey]InferencePriority)
-	}
-	n.visited[key] = InferencePriorityCircularity
 	saveInferencePriority := n.inferencePriority
 	n.inferencePriority = InferencePriorityMaxValue
 	// We stop inferring and report a circularity if we encounter duplicate recursion identities on both
 	// the source side and the target side.
 	saveExpandingFlags := n.expandingFlags
-	n.sourceStack = append(n.sourceStack, source)
-	n.targetStack = append(n.targetStack, target)
-	if c.isDeeplyNestedType(source, n.sourceStack, 2) {
+	n.sourceStack = append(n.sourceStack, relaterStackEntry{t: source})
+	n.targetStack = append(n.targetStack, relaterStackEntry{t: target})
+	if n.expandingFlags&ExpandingFlagsSource == 0 && c.isDeeplyNestedOnStack(source, n.sourceStack, 2) {
 		n.expandingFlags |= ExpandingFlagsSource
 	}
-	if c.isDeeplyNestedType(target, n.targetStack, 2) {
+	if n.expandingFlags&ExpandingFlagsTarget == 0 && c.isDeeplyNestedOnStack(target, n.targetStack, 2) {
 		n.expandingFlags |= ExpandingFlagsTarget
 	}
 	if n.expandingFlags != ExpandingFlagsBoth {
@@ -374,13 +596,15 @@ func (c *Checker) invokeOnce(n *InferenceState, source *Type, target *Type, acti
 	n.targetStack = n.targetStack[:len(n.targetStack)-1]
 	n.sourceStack = n.sourceStack[:len(n.sourceStack)-1]
 	n.expandingFlags = saveExpandingFlags
-	n.visited[key] = n.inferencePriority
+	n.updateVisited(key, n.inferencePriority)
 	n.inferencePriority = min(n.inferencePriority, saveInferencePriority)
 }
 
 func (c *Checker) inferFromMatchingTypes(n *InferenceState, sources []*Type, targets []*Type, matches func(c *Checker, s *Type, t *Type) bool, sort bool) ([]*Type, []*Type) {
-	var matchedSources []*Type
-	var matchedTargets []*Type
+	var matchedSourcesBuf [8]*Type
+	var matchedTargetsBuf [8]*Type
+	matchedSources := matchedSourcesBuf[:0]
+	matchedTargets := matchedTargetsBuf[:0]
 	for _, t := range targets {
 		for _, s := range sources {
 			if matches(c, s, t) {
@@ -392,13 +616,16 @@ func (c *Checker) inferFromMatchingTypes(n *InferenceState, sources []*Type, tar
 			}
 		}
 	}
+	if len(matchedSources) == 0 {
+		return sources, targets
+	}
 	if sort {
 		// Sort target types by decreasing depth of generic instantiations. Intuitively, a successful
 		// inference from a type argument with deeper nesting is of higher quality because we've stripped
 		// away more layers of type instantiations that otherwise might skew the results. For example,
-		// when inferring from string[] | string[][] to T[] | T[][], the inference of string we make from
-		// relating string[][] to T[][] is of higher quality than the inference of string[] we make relating
-		// string[][] to T[].
+		// when inferring from `string[] | string[][]` to `T[] | T[][]`, the inference of `string` we make from
+		// relating `string[][]` to `T[][]` is of higher quality than the inference of `string[]` we make relating
+		// `string[][]` to `T[]`.
 		slices.SortFunc(matchedTargets, compareTypesAndDepth)
 		for _, t := range matchedTargets {
 			for _, s := range matchedSources {
@@ -408,13 +635,25 @@ func (c *Checker) inferFromMatchingTypes(n *InferenceState, sources []*Type, tar
 			}
 		}
 	}
-	if len(matchedSources) != 0 {
-		sources = core.Filter(sources, func(t *Type) bool { return !slices.Contains(matchedSources, t) })
+	var newSources []*Type
+	if len(sources) > len(matchedSources) {
+		newSources = make([]*Type, 0, len(sources)-len(matchedSources))
+		for _, s := range sources {
+			if !slices.Contains(matchedSources, s) {
+				newSources = append(newSources, s)
+			}
+		}
 	}
-	if len(matchedTargets) != 0 {
-		targets = core.Filter(targets, func(t *Type) bool { return !slices.Contains(matchedTargets, t) })
+	var newTargets []*Type
+	if len(targets) > len(matchedTargets) {
+		newTargets = make([]*Type, 0, len(targets)-len(matchedTargets))
+		for _, t := range targets {
+			if !slices.Contains(matchedTargets, t) {
+				newTargets = append(newTargets, t)
+			}
+		}
 	}
-	return sources, targets
+	return newSources, newTargets
 }
 
 // Compare two types first by depth and then by the regular type ordering.
@@ -461,12 +700,20 @@ func (c *Checker) inferToMultipleTypes(n *InferenceState, source *Type, targets 
 	if targetFlags&TypeFlagsUnion != 0 {
 		var nakedTypeVariable *Type
 		var sources []*Type
+		var sourcesBuf [1]*Type
 		if source.flags&TypeFlagsUnion != 0 {
 			sources = source.Types()
 		} else {
-			sources = []*Type{source}
+			sourcesBuf[0] = source
+			sources = sourcesBuf[:]
 		}
-		matched := make([]bool, len(sources))
+		var matchedBuf [64]bool
+		var matched []bool
+		if len(sources) <= len(matchedBuf) {
+			matched = matchedBuf[:len(sources)]
+		} else {
+			matched = make([]bool, len(sources))
+		}
 		inferenceCircularity := false
 		// First infer to types that are not naked type variables. For each source type we
 		// track whether inferences were made from that particular type to some target with
@@ -504,7 +751,8 @@ func (c *Checker) inferToMultipleTypes(n *InferenceState, source *Type, targets 
 		// types from which no inferences have been made so far and infer from that union to the
 		// naked type variable.
 		if typeVariableCount == 1 && !inferenceCircularity {
-			var unmatched []*Type
+			var unmatchedBuf [8]*Type
+			unmatched := unmatchedBuf[:0]
 			for i, s := range sources {
 				if !matched[i] {
 					unmatched = append(unmatched, s)
@@ -569,13 +817,18 @@ func (c *Checker) inferToConditionalType(n *InferenceState, source *Type, target
 		c.inferFromTypes(n, getNonDistributedTypeParameter(c.getTrueTypeFromConditionalType(source)), c.getTrueTypeFromConditionalType(target))
 		c.inferFromTypes(n, getNonDistributedTypeParameter(c.getFalseTypeFromConditionalType(source)), c.getFalseTypeFromConditionalType(target))
 	} else {
-		targetTypes := []*Type{c.getTrueTypeFromConditionalType(target), c.getFalseTypeFromConditionalType(target)}
-		c.inferToMultipleTypesWithPriority(n, source, targetTypes, target.flags, core.IfElse(n.contravariant, InferencePriorityContravariantConditional, 0))
+		var targetTypes [2]*Type
+		targetTypes[0] = c.getTrueTypeFromConditionalType(target)
+		targetTypes[1] = c.getFalseTypeFromConditionalType(target)
+		c.inferToMultipleTypesWithPriority(n, source, targetTypes[:], target.flags, core.IfElse(n.contravariant, InferencePriorityContravariantConditional, 0))
 	}
 }
 
 func (c *Checker) inferToTemplateLiteralType(n *InferenceState, source *Type, target *TemplateLiteralType) {
 	matches := c.inferTypesFromTemplateLiteralType(source, target, c.compareTypesAssignable)
+	if matches != nil {
+		defer c.releaseTemporaryTypeArguments(matches)
+	}
 	types := target.types
 	// When the target template literal contains only placeholders (meaning that inference is intended to extract
 	// single characters and remainder strings) and inference fails to produce matches, we want to infer 'never' for
@@ -837,26 +1090,48 @@ func (c *Checker) inferFromObjectTypes(n *InferenceState, source *Type, target *
 }
 
 func (c *Checker) inferFromProperties(n *InferenceState, source *Type, target *Type) {
-	properties := c.getPropertiesOfObjectType(target)
+	properties, lazyTarget := c.getPropertiesOfTypeLazily(target)
+	resolvedSource := c.isResolvedPlainObjectType(source)
 	for _, targetProp := range properties {
-		sourceProp := c.getPropertyOfType(source, targetProp.Name())
+		if lazyTarget == nil || lazyTarget.objectFlags&ObjectFlagsMapped == 0 {
+			if links := c.valueSymbolLinks.TryGet(targetProp); links != nil && links.resolvedType != nil && !c.couldContainTypeVariables(links.resolvedType) {
+				continue
+			}
+		}
+		var sourceProp *ast.Symbol
+		if resolvedSource {
+			sourceProp = c.getResolvedPropertyOfPlainObjectType(source, targetProp.Name())
+		} else {
+			sourceProp = c.getPropertyOfTypeWorker(source, targetProp.Name(), false /*skipObjectFunctionPropertyAugment*/, false /*includeTypeOnlyMembers*/, false /*instantiate*/)
+		}
 		if sourceProp != nil && !core.Some(sourceProp.Declarations(), c.isSkipDirectInferenceNode) {
-			c.inferFromTypes(n, c.removeMissingType(c.getTypeOfSymbol(sourceProp), sourceProp.Flags()&ast.SymbolFlagsOptional != 0), c.removeMissingType(c.getTypeOfSymbol(targetProp), targetProp.Flags()&ast.SymbolFlagsOptional != 0))
+			if lazyTarget != nil {
+				targetProp = c.getPropertyOfType(lazyTarget, targetProp.Name())
+			}
+			targetType := c.removeMissingType(c.getTypeOfSymbol(targetProp), targetProp.Flags()&ast.SymbolFlagsOptional != 0)
+			if c.couldContainTypeVariables(targetType) && !c.isNoInferType(targetType) {
+				if !resolvedSource {
+					sourceProp = c.getPropertyOfType(source, targetProp.Name())
+				}
+				c.inferFromTypes(n, c.removeMissingType(c.getTypeOfSymbol(sourceProp), sourceProp.Flags()&ast.SymbolFlagsOptional != 0), targetType)
+			}
 		}
 	}
 }
 
 func (c *Checker) inferFromSignatures(n *InferenceState, source *Type, target *Type, kind SignatureKind) {
-	sourceSignatures := c.getSignaturesOfType(source, kind)
-	sourceLen := len(sourceSignatures)
-	if sourceLen > 0 {
-		// We match source and target signatures from the bottom up, and if the source has fewer signatures
-		// than the target, we infer from the first source signature to the excess target signatures.
-		targetSignatures := c.getSignaturesOfType(target, kind)
-		targetLen := len(targetSignatures)
-		for i := range targetLen {
-			sourceIndex := max(sourceLen-targetLen+i, 0)
-			c.inferFromSignature(n, c.getBaseSignature(sourceSignatures[sourceIndex]), c.getErasedSignature(targetSignatures[i]))
+	targetSignatures := c.getSignaturesOfType(target, kind)
+	targetLen := len(targetSignatures)
+	if targetLen > 0 {
+		sourceSignatures := c.getSignaturesOfType(source, kind)
+		sourceLen := len(sourceSignatures)
+		if sourceLen > 0 {
+			// We match source and target signatures from the bottom up, and if the source has fewer signatures
+			// than the target, we infer from the first source signature to the excess target signatures.
+			for i := range targetLen {
+				sourceIndex := max(sourceLen-targetLen+i, 0)
+				c.inferFromSignature(n, c.getBaseSignature(sourceSignatures[sourceIndex]), c.getErasedSignature(targetSignatures[i]))
+			}
 		}
 	}
 }
@@ -889,26 +1164,28 @@ func (c *Checker) applyToParameterTypes(source *Signature, target *Signature, ca
 	if sourceRestType == nil {
 		paramCount = min(sourceCount, targetNonRestCount)
 	}
-	sourceThisType := c.getThisTypeOfSignature(source)
-	if sourceThisType != nil {
-		targetThisType := c.getThisTypeOfSignature(target)
-		if targetThisType != nil {
+	targetThisType := c.getThisTypeOfSignature(target)
+	if targetThisType != nil && c.couldContainTypeVariables(targetThisType) {
+		if sourceThisType := c.getThisTypeOfSignature(source); sourceThisType != nil {
 			callback(sourceThisType, targetThisType)
 		}
 	}
 	for i := range paramCount {
-		callback(c.getTypeAtPosition(source, i), c.getTypeAtPosition(target, i))
+		targetParamType := c.getTypeAtPosition(target, i)
+		if c.couldContainTypeVariables(targetParamType) {
+			callback(c.getTypeAtPosition(source, i), targetParamType)
+		}
 	}
-	if targetRestType != nil {
+	if targetRestType != nil && c.couldContainTypeVariables(targetRestType) {
 		callback(c.getRestTypeAtPosition(source, paramCount, c.isConstTypeVariable(targetRestType, 0) && !someType(targetRestType, c.isMutableArrayLikeType) /*readonly*/), targetRestType)
 	}
 }
 
 func (c *Checker) applyToReturnTypes(source *Signature, target *Signature, callback func(s *Type, t *Type)) {
 	targetTypePredicate := c.getTypePredicateOfSignature(target)
-	if targetTypePredicate != nil {
+	if targetTypePredicate != nil && targetTypePredicate.t != nil && c.couldContainTypeVariables(targetTypePredicate.t) {
 		sourceTypePredicate := c.getTypePredicateOfSignature(source)
-		if sourceTypePredicate != nil && c.typePredicateKindsMatch(sourceTypePredicate, targetTypePredicate) && sourceTypePredicate.t != nil && targetTypePredicate.t != nil {
+		if sourceTypePredicate != nil && c.typePredicateKindsMatch(sourceTypePredicate, targetTypePredicate) && sourceTypePredicate.t != nil {
 			callback(sourceTypePredicate.t, targetTypePredicate.t)
 			return
 		}
@@ -926,6 +1203,9 @@ func (c *Checker) inferFromIndexTypes(n *InferenceState, source *Type, target *T
 		priority = InferencePriorityHomomorphicMappedType
 	}
 	indexInfos := c.getIndexInfosOfType(target)
+	if len(indexInfos) == 0 {
+		return
+	}
 	if c.isObjectTypeWithInferableIndex(source) {
 		for _, targetInfo := range indexInfos {
 			var propTypes []*Type
@@ -1137,7 +1417,9 @@ func (c *Checker) resolveReverseMappedTypeMembers(t *Type) {
 		checkFlags := ast.CheckFlagsReverseMapped | core.IfElse(readonlyMask && c.isReadonlySymbol(prop), ast.CheckFlagsReadonly, 0)
 		inferredProp := c.newSymbolEx(ast.SymbolFlagsProperty|prop.Flags()&optionalMask, prop.Name(), checkFlags)
 		inferredProp.SetDeclarations(prop.Declarations())
-		c.valueSymbolLinks.Get(inferredProp).setNameType(c, c.valueSymbolLinks.Get(prop).getNameType())
+		if nameType := c.valueSymbolLinks.TryGet(prop).getNameType(); nameType != nil {
+			c.valueSymbolLinks.Get(inferredProp).setNameType(c, nameType)
+		}
 		links := c.ReverseMappedSymbolLinks.Get(inferredProp)
 		links.propertyType = c.getTypeOfSymbol(prop)
 		constraintTarget := r.constraintType.AsIndexType().target
@@ -1243,7 +1525,7 @@ func (c *Checker) isTypeCloselyMatchedBy(s *Type, t *Type) bool {
 
 // Create an object with properties named in the string literal type. Every property has type `any`.
 func (c *Checker) createEmptyObjectTypeFromStringLiteral(t *Type) *Type {
-	members := ast.NewSymbolTable()
+	members := c.acquireSymbolTable()
 	for _, t := range t.Distributed() {
 		if t.flags&TypeFlagsStringLiteral == 0 {
 			continue
@@ -1261,21 +1543,107 @@ func (c *Checker) createEmptyObjectTypeFromStringLiteral(t *Type) *Type {
 	if t.flags&TypeFlagsString != 0 {
 		indexInfos = []*IndexInfo{c.newIndexInfo(c.stringType, c.emptyObjectType, false /*isReadonly*/, nil, nil)}
 	}
-	return c.newAnonymousType(nil, members, nil, nil, indexInfos)
+	res := c.newAnonymousType(nil, members, nil, nil, indexInfos)
+	c.releaseSymbolTableIfUnused(res, members)
+	return res
 }
 
 func (c *Checker) newInferenceContext(typeParameters []*Type, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
+	return c.acquireInferenceContext(typeParameters, signature, flags, compareTypes)
+}
+
+func (c *Checker) acquireConditionalInferenceContext(typeParameters []*Type) *InferenceContext {
+	return c.acquireInferenceContext(typeParameters, nil, InferenceFlagsNone, c.compareTypesAssignable)
+}
+
+func (c *Checker) acquireInferenceContext(typeParameters []*Type, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
 	if compareTypes == nil {
 		compareTypes = c.compareTypesAssignable
 	}
-	return c.newInferenceContextWorker(core.Map(typeParameters, newInferenceInfo), signature, flags, compareTypes)
+	var n *InferenceContext
+	if l := len(c.freeInferenceContexts); l > 0 {
+		n = c.freeInferenceContexts[l-1]
+		c.freeInferenceContexts = c.freeInferenceContexts[:l-1]
+		n.signature = signature
+		n.flags = flags
+		n.compareTypes = compareTypes
+		n.returnMapper = nil
+		n.outerReturnMapper = nil
+		n.inferredTypeParameters = nil
+		n.intraExpressionInferenceSites = nil
+		n.escaped = false
+		n.mapper = c.initInferenceTypeMapper(&n.mapperStorage[0], n, true /*fixing*/)
+		n.nonFixingMapper = c.initInferenceTypeMapper(&n.mapperStorage[1], n, false /*fixing*/)
+	} else {
+		n = c.newInferenceContextWorker(nil, signature, flags, compareTypes)
+	}
+	inferences := n.inferences[:0]
+	for _, tp := range typeParameters {
+		var info *InferenceInfo
+		if l := len(c.freeInferenceInfos); l > 0 {
+			info = c.freeInferenceInfos[l-1]
+			c.freeInferenceInfos = c.freeInferenceInfos[:l-1]
+			info.typeParameter = tp
+			info.inferredType = nil
+			info.priority = InferencePriorityMaxValue
+			info.topLevel = true
+			info.isFixed = false
+			info.impliedArity = -1
+		} else {
+			info = newInferenceInfo(tp)
+		}
+		inferences = append(inferences, info)
+	}
+	n.inferences = inferences
+	return n
+}
+
+func (c *Checker) releaseConditionalInferenceContext(n *InferenceContext, fixingCombined *TypeMapper, nonFixingCombined *TypeMapper) {
+	if fixingCombined != nil && fixingCombined.kind == TypeMapperKindComposite {
+		c.compositeMapperArena.Pop(castTypeMapper[CompositeTypeMapper](fixingCombined, TypeMapperKindComposite))
+	}
+	if nonFixingCombined != nil && nonFixingCombined.kind == TypeMapperKindComposite {
+		c.compositeMapperArena.Pop(castTypeMapper[CompositeTypeMapper](nonFixingCombined, TypeMapperKindComposite))
+	}
+	for i, info := range n.inferences {
+		clear(info.candidates)
+		info.candidates = info.candidates[:0]
+		clear(info.contraCandidates)
+		info.contraCandidates = info.contraCandidates[:0]
+		info.typeParameter = nil
+		info.inferredType = nil
+		c.freeInferenceInfos = append(c.freeInferenceInfos, info)
+		n.inferences[i] = nil
+	}
+	n.inferences = n.inferences[:0]
+	n.signature = nil
+	n.returnMapper = nil
+	n.outerReturnMapper = nil
+	n.inferredTypeParameters = nil
+	n.intraExpressionInferenceSites = nil
+	c.freeInferenceContexts = append(c.freeInferenceContexts, n)
 }
 
 func (c *Checker) cloneInferenceContext(n *InferenceContext, extraFlags InferenceFlags) *InferenceContext {
 	if n == nil {
 		return nil
 	}
-	return c.newInferenceContextWorker(core.Map(n.inferences, cloneInferenceInfo), n.signature, n.flags|extraFlags, n.compareTypes)
+	infos := make([]InferenceInfo, len(n.inferences))
+	inferences := make([]*InferenceInfo, len(n.inferences))
+	for i, info := range n.inferences {
+		infos[i] = InferenceInfo{
+			typeParameter:    info.typeParameter,
+			candidates:       slices.Clone(info.candidates),
+			contraCandidates: slices.Clone(info.contraCandidates),
+			inferredType:     info.inferredType,
+			priority:         info.priority,
+			topLevel:         info.topLevel,
+			isFixed:          info.isFixed,
+			impliedArity:     info.impliedArity,
+		}
+		inferences[i] = &infos[i]
+	}
+	return c.newInferenceContextWorker(inferences, n.signature, n.flags|extraFlags, n.compareTypes)
 }
 
 func (c *Checker) cloneInferredPartOfContext(n *InferenceContext) *InferenceContext {
@@ -1283,7 +1651,22 @@ func (c *Checker) cloneInferredPartOfContext(n *InferenceContext) *InferenceCont
 	if len(inferences) == 0 {
 		return nil
 	}
-	return c.newInferenceContextWorker(core.Map(inferences, cloneInferenceInfo), n.signature, n.flags, n.compareTypes)
+	infos := make([]InferenceInfo, len(inferences))
+	cloned := make([]*InferenceInfo, len(inferences))
+	for i, info := range inferences {
+		infos[i] = InferenceInfo{
+			typeParameter:    info.typeParameter,
+			candidates:       slices.Clone(info.candidates),
+			contraCandidates: slices.Clone(info.contraCandidates),
+			inferredType:     info.inferredType,
+			priority:         info.priority,
+			topLevel:         info.topLevel,
+			isFixed:          info.isFixed,
+			impliedArity:     info.impliedArity,
+		}
+		cloned[i] = &infos[i]
+	}
+	return c.newInferenceContextWorker(cloned, n.signature, n.flags, n.compareTypes)
 }
 
 func (c *Checker) newInferenceContextWorker(inferences []*InferenceInfo, signature *Signature, flags InferenceFlags, compareTypes TypeComparer) *InferenceContext {
@@ -1641,7 +2024,9 @@ func (c *Checker) isSkipDirectInferenceNode(node *ast.Node) bool {
 }
 
 func newInferenceInfo(typeParameter *Type) *InferenceInfo {
-	return &InferenceInfo{typeParameter: typeParameter, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+	info := &InferenceInfo{typeParameter: typeParameter, priority: InferencePriorityMaxValue, topLevel: true, impliedArity: -1}
+	info.candidates = info.candidateStorage[:0]
+	return info
 }
 
 func cloneInferenceInfo(info *InferenceInfo) *InferenceInfo {

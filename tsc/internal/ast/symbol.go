@@ -1,36 +1,35 @@
 package ast
 
 import (
-	"hash/maphash"
 	"iter"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
 )
 
-// Symbol stores flags, checkFlags, and id uniquely for every symbol instance, but may share
-// symbolData with other symbols. This is done so that instantiated symbols in the checker can
-// all share the same underlying symbolData. Every Symbol needs its data field initialized either
-// through SymbolWithData.Initialize or by explicitly setting it with Symbol.SetSymbolData.
+// Symbol stores flags, checkFlags, id, and declaration header uniquely for every symbol instance.
+// Ordinary symbols are embedded at offset 0 of SymbolWithData and store their parent in parentOrData;
+// transient symbols created with SetSymbolData set checkFlagsSharedData and store their owner Symbol
+// in parentOrData.
 type Symbol struct {
-	flags      SymbolFlags
-	checkFlags CheckFlags // Non-zero only in transient symbols created by Checker
-	id         atomic.Uint64
-	data       *symbolData
+	flags        SymbolFlags
+	checkFlags   CheckFlags // Non-zero only in transient symbols created by Checker
+	id           atomic.Uint32
+	declHeader   uint32 // bits 0..14: declLen, bits 15..29: declCap, bits 30..31: lazyState
+	parentOrData *Symbol
 }
 
 // Every symbol references a symbolData structure that may be shared with other symbols.
 type symbolData struct {
 	name             string
-	declarations     []*Node
+	declPtr          unsafe.Pointer
 	valueDeclaration *Node
-	parent           *Symbol
 	extra            *symbolExtra
 }
-
 type symbolExtra struct {
 	members      SymbolTable
 	exports      SymbolTable
@@ -43,62 +42,214 @@ type SymbolExtraArena struct {
 	arena core.Arena[symbolExtra]
 }
 
-func (s *Symbol) Flags() SymbolFlags      { return s.flags }
-func (s *Symbol) CheckFlags() CheckFlags  { return s.checkFlags }
-func (s *Symbol) Name() string            { return s.data.name }
-func (s *Symbol) Declarations() []*Node   { return s.data.declarations }
-func (s *Symbol) ValueDeclaration() *Node { return s.data.valueDeclaration }
-func (s *Symbol) Parent() *Symbol         { return s.data.parent }
+const (
+	checkFlagsMerged                  CheckFlags = 1 << 27 // Symbol is a key in Checker.mergedSymbols
+	checkFlagsReferencedAny           CheckFlags = 1 << 28
+	checkFlagsReferencedVariable      CheckFlags = 1 << 29
+	checkFlagsReferencedTypeParameter CheckFlags = 1 << 30
+	checkFlagsSharedData              CheckFlags = 1 << 31
+	checkFlagsReferencedMask          CheckFlags = checkFlagsReferencedAny | checkFlagsReferencedVariable | checkFlagsReferencedTypeParameter
+	checkFlagsInternalMask            CheckFlags = checkFlagsMerged | checkFlagsReferencedMask | checkFlagsSharedData
+	declLenCapMask                    uint32     = 0x7fff
+	declCapShift                      uint32     = 15
+	lazyStateShift                    uint32     = 30
+	lazyStateMask                     uint32     = 3 << lazyStateShift
+	lazyStatePending                  uint32     = 1 << lazyStateShift
+	lazyStateActive                   uint32     = 2 << lazyStateShift
+)
 
-func (s *Symbol) Members() SymbolTable {
-	if s.data.extra == nil {
+func (s *Symbol) owner() *Symbol {
+	if s.checkFlags&checkFlagsSharedData != 0 {
+		return s.parentOrData
+	}
+	return s
+}
+
+func (s *Symbol) data() *symbolData {
+	if s.checkFlags&checkFlagsSharedData != 0 {
+		return &(*SymbolWithData)(unsafe.Pointer(s.parentOrData)).d
+	}
+	return &(*SymbolWithData)(unsafe.Pointer(s)).d
+}
+
+func (s *Symbol) Flags() SymbolFlags { return s.flags }
+func (s *Symbol) CheckFlags() CheckFlags {
+	return CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags))) &^ checkFlagsInternalMask
+}
+
+func (s *Symbol) AddReference(meaning SymbolFlags) {
+	if s == nil {
+		return
+	}
+	flags := uint32(checkFlagsReferencedAny)
+	if meaning&SymbolFlagsVariable != 0 {
+		flags |= uint32(checkFlagsReferencedVariable)
+	}
+	if meaning&SymbolFlagsTypeParameter != 0 {
+		flags |= uint32(checkFlagsReferencedTypeParameter)
+	}
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		if old&flags == flags || atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, old|flags) {
+			break
+		}
+	}
+}
+
+func (s *Symbol) ReferenceKinds() SymbolFlags {
+	if s == nil {
+		return 0
+	}
+	cf := CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags)))
+	if cf&checkFlagsReferencedMask == 0 {
+		return 0
+	}
+	res := SymbolFlagsAll &^ (SymbolFlagsVariable | SymbolFlagsTypeParameter)
+	if cf&checkFlagsReferencedVariable != 0 {
+		res |= SymbolFlagsVariable
+	}
+	if cf&checkFlagsReferencedTypeParameter != 0 {
+		res |= SymbolFlagsTypeParameter
+	}
+	return res
+}
+
+func (s *Symbol) IsMerged() bool {
+	return CheckFlags(atomic.LoadUint32((*uint32)(&s.checkFlags)))&checkFlagsMerged != 0
+}
+
+func (s *Symbol) MarkMerged() {
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		if CheckFlags(old)&checkFlagsMerged != 0 {
+			return
+		}
+		if atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, old|uint32(checkFlagsMerged)) {
+			return
+		}
+	}
+}
+func (s *Symbol) Name() string { return s.data().name }
+func (s *Symbol) Declarations() []*Node {
+	owner := s.owner()
+	hdr := owner.declHeader
+	declLen := hdr & declLenCapMask
+	if declLen == 0 {
 		return nil
 	}
-	return s.data.extra.members
+	d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+	declCap := (hdr >> declCapShift) & declLenCapMask
+	if declCap == 0 {
+		return unsafe.Slice((**Node)(unsafe.Pointer(&d.declPtr)), 1)
+	}
+	return unsafe.Slice((**Node)(d.declPtr), declCap)[:declLen]
+}
+
+func (s *Symbol) FirstDeclaration() *Node {
+	owner := s.owner()
+	hdr := owner.declHeader
+	if hdr&declLenCapMask == 0 {
+		return nil
+	}
+	d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+	if (hdr>>declCapShift)&declLenCapMask == 0 {
+		return *(**Node)(unsafe.Pointer(&d.declPtr))
+	}
+	return *(**Node)(d.declPtr)
+}
+func (s *Symbol) ValueDeclaration() *Node { return s.data().valueDeclaration }
+func (s *Symbol) Parent() *Symbol         { return s.owner().parentOrData }
+
+func (s *Symbol) Members() SymbolTable {
+	if s.declHeader < lazyStatePending {
+		if extra := (*SymbolWithData)(unsafe.Pointer(s)).d.extra; extra != nil {
+			return extra.members
+		}
+	}
+	return s.membersSlow()
 }
 
 func (s *Symbol) Exports() SymbolTable {
-	if s.data.extra == nil {
-		return nil
+	if s.declHeader < lazyStatePending {
+		if extra := (*SymbolWithData)(unsafe.Pointer(s)).d.extra; extra != nil {
+			return extra.exports
+		}
 	}
-	return s.data.extra.exports
+	return s.exportsSlow()
 }
 
 func (s *Symbol) ExportSymbol() *Symbol {
-	if s.data.extra == nil {
+	d := s.data()
+	if d.extra == nil {
 		return nil
 	}
-	return s.data.extra.exportSymbol
+	return d.extra.exportSymbol
 }
 
-func (s *Symbol) SetFlags(value SymbolFlags)      { s.flags = value }
-func (s *Symbol) SetCheckFlags(value CheckFlags)  { s.checkFlags = value }
-func (s *Symbol) SetName(value string)            { s.data.name = value }
-func (s *Symbol) SetDeclarations(value []*Node)   { s.data.declarations = value }
-func (s *Symbol) SetValueDeclaration(value *Node) { s.data.valueDeclaration = value }
-func (s *Symbol) SetParent(value *Symbol)         { s.data.parent = value }
+func (s *Symbol) SetFlags(value SymbolFlags) { s.flags = value }
+func (s *Symbol) SetCheckFlags(value CheckFlags) {
+	for {
+		old := atomic.LoadUint32((*uint32)(&s.checkFlags))
+		next := (old & uint32(checkFlagsInternalMask)) | (uint32(value) &^ uint32(checkFlagsInternalMask))
+		if atomic.CompareAndSwapUint32((*uint32)(&s.checkFlags), old, next) {
+			break
+		}
+	}
+}
+func (s *Symbol) SetName(value string) { s.data().name = value }
+func (s *Symbol) SetSingleDeclaration(node *Node) {
+	owner := s.owner()
+	d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+	if node != nil {
+		d.declPtr = unsafe.Add(unsafe.Pointer(&node.Flags), -int(unsafe.Offsetof(Node{}.Flags)))
+	} else {
+		d.declPtr = nil
+	}
+	owner.declHeader = (owner.declHeader & lazyStateMask) | 1
+}
+
+func (s *Symbol) SetDeclarations(value []*Node) {
+	owner := s.owner()
+	d := &(*SymbolWithData)(unsafe.Pointer(owner)).d
+	lazy := owner.declHeader & lazyStateMask
+	if len(value) == 0 {
+		d.declPtr = nil
+		owner.declHeader = lazy
+		return
+	}
+	d.declPtr = unsafe.Pointer(unsafe.SliceData(value))
+	declLen := uint32(len(value)) & declLenCapMask
+	declCap := uint32(max(cap(value), len(value))) & declLenCapMask
+	owner.declHeader = lazy | declLen | (declCap << declCapShift)
+}
+func (s *Symbol) SetValueDeclaration(value *Node) { s.data().valueDeclaration = value }
+func (s *Symbol) SetParent(value *Symbol)         { s.owner().parentOrData = value }
 
 func (s *Symbol) ensureExtra(arena *SymbolExtraArena) *symbolExtra {
-	if s.data.extra == nil {
-		s.data.extra = arena.arena.New()
+	d := s.data()
+	if d.extra == nil {
+		d.extra = arena.arena.New()
 	}
-	return s.data.extra
+	return d.extra
 }
 
 func (s *Symbol) SetMembers(value SymbolTable, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).members = value
 	}
 }
 
 func (s *Symbol) SetExports(value SymbolTable, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).exports = value
 	}
 }
 
 func (s *Symbol) SetExportSymbol(value *Symbol, arena *SymbolExtraArena) {
-	if value != nil || s.data.extra != nil {
+	d := s.data()
+	if value != nil || d.extra != nil {
 		s.ensureExtra(arena).exportSymbol = value
 	}
 }
@@ -111,7 +262,6 @@ type SymbolWithData struct {
 
 // Initializes a SymbolWithData instance and returns the embedded Symbol.
 func (sd *SymbolWithData) Initialize() *Symbol {
-	sd.s.data = &sd.d
 	return &sd.s
 }
 
@@ -120,9 +270,10 @@ func NewSymbol() *Symbol {
 }
 
 // Initializes a Symbol's data field with the data from another Symbol. This allows multiple
-// symbols to share the same underlying symbolData.
 func (s *Symbol) SetSymbolData(other *Symbol) {
-	s.data = other.data
+	s.parentOrData = other.owner()
+	s.checkFlags |= checkFlagsSharedData
+	s.declHeader = lazyStateMask
 }
 
 // GetSourceFileOfSymbol returns the owning file of a published binder symbol, or
@@ -187,7 +338,27 @@ type SymbolMap struct {
 	index   []int32 // open addressing table of entry positions plus one (0 is empty), only past symbolTableLinearMax
 }
 
-var symbolTableSeed = maphash.MakeSeed()
+func hashSymbolName(s string) uint64 {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	p := unsafe.Pointer(unsafe.StringData(s))
+	var h uint64
+	if n >= 8 {
+		h = *(*uint64)(p)
+		for off := 8; off+8 < n; off += 8 {
+			h = (h ^ *(*uint64)(unsafe.Add(p, off))) * 0x9e3779b97f4a7c15
+		}
+		h ^= *(*uint64)(unsafe.Add(p, n-8)) * 0xbf58476d1ce4e5b9
+	} else if n >= 4 {
+		h = uint64(*(*uint32)(p)) | (uint64(*(*uint32)(unsafe.Add(p, n-4))) << 32)
+	} else {
+		h = uint64(*(*byte)(p)) | (uint64(*(*byte)(unsafe.Add(p, n>>1))) << 8) | (uint64(*(*byte)(unsafe.Add(p, n-1))) << 16)
+	}
+	h = (h ^ uint64(n)) * 0x94d049bb133111eb
+	return h ^ (h >> 32)
+}
 
 func NewSymbolTable() SymbolTable {
 	return NewSymbolTableWithCapacity(0)
@@ -218,7 +389,7 @@ func (m *SymbolMap) keyAt(i int) string {
 func (m *SymbolMap) symbolAt(i int) *Symbol {
 	symbol := m.entries[i]
 	if symbol.flags == SymbolFlagsNameProxy {
-		symbol = symbol.data.parent
+		symbol = symbol.parentOrData
 	}
 	return symbol
 }
@@ -229,7 +400,7 @@ func (m *SymbolMap) find(key string) int {
 	}
 	if m.index != nil {
 		mask := uint64(len(m.index) - 1)
-		for slot := maphash.String(symbolTableSeed, key) & mask; ; slot = (slot + 1) & mask {
+		for slot := hashSymbolName(key) & mask; ; slot = (slot + 1) & mask {
 			p := m.index[slot]
 			if p == 0 {
 				return -1
@@ -273,23 +444,45 @@ func (m *SymbolMap) Set(key string, symbol *Symbol) {
 	if key != symbol.Name() {
 		proxy := NewSymbol()
 		proxy.flags = SymbolFlagsNameProxy
-		proxy.data.name = key
-		proxy.data.parent = symbol
+		proxy.data().name = key
+		proxy.parentOrData = symbol
 		symbol = proxy
 	}
-	if i := m.find(key); i >= 0 {
-		m.entries[i] = symbol
+	if m.index != nil {
+		mask := uint64(len(m.index) - 1)
+		slot := hashSymbolName(key) & mask
+		for {
+			p := m.index[slot]
+			if p == 0 {
+				break
+			}
+			if i := int(p - 1); m.keyAt(i) == key {
+				m.entries[i] = symbol
+				return
+			}
+			slot = (slot + 1) & mask
+		}
+		i := int32(len(m.entries))
+		m.entries = append(m.entries, symbol)
+		if len(m.entries)*4 <= len(m.index)*3 {
+			m.index[slot] = i + 1
+		} else {
+			m.buildIndex()
+		}
 		return
 	}
-	i := int32(len(m.entries))
+	for i := range m.entries {
+		if m.keyAt(i) == key {
+			m.entries[i] = symbol
+			return
+		}
+	}
 	if cap(m.entries) == 0 {
 		// Most tables hold one or two entries, so start with room for two rather than growing from one.
 		m.entries = make([]*Symbol, 0, 2)
 	}
 	m.entries = append(m.entries, symbol)
-	if m.index != nil && len(m.entries)*4 <= len(m.index)*3 {
-		m.insertIndex(key, i)
-	} else if len(m.entries) > symbolTableLinearMax {
+	if len(m.entries) > symbolTableLinearMax {
 		m.buildIndex()
 	}
 }
@@ -304,7 +497,7 @@ func indexSizeFor(n int) int {
 
 func (m *SymbolMap) insertIndex(key string, i int32) {
 	mask := uint64(len(m.index) - 1)
-	slot := maphash.String(symbolTableSeed, key) & mask
+	slot := hashSymbolName(key) & mask
 	for m.index[slot] != 0 {
 		slot = (slot + 1) & mask
 	}
@@ -357,8 +550,12 @@ func (m *SymbolMap) Keys() iter.Seq[string] {
 
 func (m *SymbolMap) Values() iter.Seq[*Symbol] {
 	return func(yield func(*Symbol) bool) {
-		for _, symbol := range m.All() {
-			if !yield(symbol) {
+		if m == nil {
+			return
+		}
+		entries := m.entries
+		for i := range entries {
+			if !yield(m.symbolAt(i)) {
 				return
 			}
 		}
@@ -373,6 +570,42 @@ func (m *SymbolMap) Clone() SymbolTable {
 	return clone
 }
 
+func (m *SymbolMap) Clear() {
+	if m == nil {
+		return
+	}
+	clear(m.entries)
+	m.entries = m.entries[:0]
+	m.index = nil
+}
+
+func (m *SymbolMap) CopyFrom(src SymbolTable) {
+	if src == nil || len(src.entries) == 0 {
+		return
+	}
+	if len(m.entries) == 0 {
+		m.entries = append(m.entries, src.entries...)
+		if src.index != nil {
+			m.index = slices.Clone(src.index)
+		}
+		return
+	}
+	for i := range src.entries {
+		m.Set(src.keyAt(i), src.symbolAt(i))
+	}
+}
+
+func (m *SymbolMap) HasNameProxies() bool {
+	if m == nil {
+		return false
+	}
+	for _, entry := range m.entries {
+		if entry.flags == SymbolFlagsNameProxy {
+			return true
+		}
+	}
+	return false
+}
 const InternalSymbolNamePrefix = "\xFE" // Invalid UTF8 sequence, will never occur as IdentifierName
 
 const (
