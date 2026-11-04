@@ -61,18 +61,45 @@ type forcedSymbolState struct {
 }
 
 var (
-	lazyReparseHook   func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node
-	lazyLookupHook    func(lazy *LazyNodeList, file *SourceFile, name string) *Node
-	lazyBindHook      func(lazy *LazyNodeList, file *SourceFile, nodes []*Node)
-	lazySymbolLocks   [256]sync.Mutex
-	trackForcedLazy   atomic.Bool
-	forcedLazyMu      sync.Mutex
-	forcedLazyLists   []*LazyNodeList
-	forcedLazySymbols []forcedSymbolState
+	lazyReparseHook        func(lazy *LazyNodeList, file *SourceFile, allowNestedLazy bool) []*Node
+	lazyLookupHook         func(lazy *LazyNodeList, file *SourceFile, name string) *Node
+	lazyBindHook           func(lazy *LazyNodeList, file *SourceFile, nodes []*Node)
+	lazySymbolLocks        [256]sync.Mutex
+	trackForcedLazy        atomic.Bool
+	forcedLazyMu           sync.Mutex
+	forcedLazyLists        []*LazyNodeList
+	forcedLazySymbols      []forcedSymbolState
+	wasmHeapWatermark      uintptr
+	watermarkNodeId        uint32
+	watermarkSymbolId      uint32
+	watermarkNodeBlockId   uint32
+	watermarkSymbolBlockId uint32
+	forcedNodeIds          []*Node
+	forcedSymbolIds        []*Symbol
 )
 
 func SetTrackForcedLazy(enabled bool) {
+	if enabled && wasmHeapWatermark == 0 {
+		// SAFETY: Converts a newly allocated heap address to uintptr to record the current bump-allocator watermark.
+		wasmHeapWatermark = uintptr(unsafe.Pointer(new(uint64)))
+		watermarkNodeId = nextNodeId.Load()
+		watermarkSymbolId = nextSymbolId.Load()
+		watermarkNodeBlockId = nextNodeBlockId.Load()
+		watermarkSymbolBlockId = nextSymbolBlockId.Load()
+	}
 	trackForcedLazy.Store(enabled)
+}
+
+func recordForcedNodeId(node *Node) {
+	forcedLazyMu.Lock()
+	forcedNodeIds = append(forcedNodeIds, node)
+	forcedLazyMu.Unlock()
+}
+
+func recordForcedSymbolId(symbol *Symbol) {
+	forcedLazyMu.Lock()
+	forcedSymbolIds = append(forcedSymbolIds, symbol)
+	forcedLazyMu.Unlock()
 }
 
 func ResetForcedLazyLists() {
@@ -104,6 +131,20 @@ func ResetForcedLazyLists() {
 		}
 	}
 	forcedLazyLists = nil
+	for _, n := range forcedNodeIds {
+		n.id.Store(0)
+	}
+	forcedNodeIds = nil
+	for _, s := range forcedSymbolIds {
+		s.id.Store(0)
+	}
+	forcedSymbolIds = nil
+	if wasmHeapWatermark != 0 {
+		nextNodeId.Store(watermarkNodeId)
+		nextSymbolId.Store(watermarkSymbolId)
+		nextNodeBlockId.Store(watermarkNodeBlockId)
+		nextSymbolBlockId.Store(watermarkSymbolBlockId)
+	}
 	for i := range subtreeFactsShards {
 		subtreeFactsShards[i].m = nil
 	}

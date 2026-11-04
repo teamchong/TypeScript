@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/debug"
@@ -26,7 +27,12 @@ func GetNodeId(node *Node) NodeId {
 	if id == 0 {
 		// Worst case, we burn a few ids if we have to CAS.
 		id = nextNodeId.Add(1)
-		if !node.id.CompareAndSwap(0, id) {
+		if node.id.CompareAndSwap(0, id) {
+			// SAFETY: Compares the Node pointer address against the bump-allocator watermark to track IDs assigned to cached static ASTs.
+			if uintptr(unsafe.Pointer(node)) < wasmHeapWatermark {
+				recordForcedNodeId(node)
+			}
+		} else {
 			id = node.id.Load()
 		}
 	}
@@ -38,7 +44,12 @@ func GetSymbolId(symbol *Symbol) SymbolId {
 	if id == 0 {
 		// Worst case, we burn a few ids if we have to CAS.
 		id = nextSymbolId.Add(1)
-		if !symbol.id.CompareAndSwap(0, id) {
+		if symbol.id.CompareAndSwap(0, id) {
+			// SAFETY: Compares the Symbol pointer address against the bump-allocator watermark to track IDs assigned to cached static ASTs.
+			if uintptr(unsafe.Pointer(symbol)) < wasmHeapWatermark {
+				recordForcedSymbolId(symbol)
+			}
+		} else {
 			id = symbol.id.Load()
 		}
 	}
@@ -72,7 +83,12 @@ func (a *NodeIdGenerator) GetNodeId(node *Node) NodeId {
 		}
 		id = a.nextId
 		a.nextId++
-		if !node.id.CompareAndSwap(0, id) {
+		if node.id.CompareAndSwap(0, id) {
+			// SAFETY: Compares the Node pointer address against the bump-allocator watermark to track IDs assigned to cached static ASTs.
+			if uintptr(unsafe.Pointer(node)) < wasmHeapWatermark {
+				recordForcedNodeId(node)
+			}
+		} else {
 			id = node.id.Load()
 		}
 	}
@@ -93,7 +109,12 @@ func (a *SymbolIdGenerator) GetSymbolId(symbol *Symbol) SymbolId {
 		}
 		id = a.nextId
 		a.nextId++
-		if !symbol.id.CompareAndSwap(0, id) {
+		if symbol.id.CompareAndSwap(0, id) {
+			// SAFETY: Compares the Symbol pointer address against the bump-allocator watermark to track IDs assigned to cached static ASTs.
+			if uintptr(unsafe.Pointer(symbol)) < wasmHeapWatermark {
+				recordForcedSymbolId(symbol)
+			}
+		} else {
 			id = symbol.id.Load()
 		}
 	}

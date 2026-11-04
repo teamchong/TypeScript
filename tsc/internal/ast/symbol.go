@@ -80,7 +80,8 @@ func (s *Symbol) CheckFlags() CheckFlags {
 }
 
 func (s *Symbol) AddReference(meaning SymbolFlags) {
-	if s == nil {
+	// SAFETY: Compares the Symbol pointer address against the bump-allocator watermark to check if it belongs to a cached static AST.
+	if s == nil || uintptr(unsafe.Pointer(s)) < wasmHeapWatermark {
 		return
 	}
 	flags := uint32(checkFlagsReferencedAny)
