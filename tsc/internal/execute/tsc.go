@@ -317,6 +317,11 @@ func performIncrementalCompilation(
 
 	tr := startTracingIfNeeded(sys, config, testing)
 
+	if testing == nil && config.CompilerOptions().MaxMemory == nil {
+		core.SuspendGC()
+	}
+	parser.EnableLazyDts(testing == nil && (config.CompilerOptions().SkipLibCheck.IsTrue() || config.CompilerOptions().NoCheck.IsTrue()))
+	defer parser.EnableLazyDts(false)
 	parseStart := sys.Now()
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		Config:  config,
@@ -349,7 +354,8 @@ func performIncrementalCompilation(
 		testing.OnProgram(incrementalProgram)
 	}
 	return tsc.CommandLineResult{
-		Status: result.Status,
+		Status:      result.Status,
+		Diagnostics: result.Diagnostics,
 	}
 }
 
@@ -378,12 +384,18 @@ func performCompilation(
 
 	tr := startTracingIfNeeded(sys, config, testing)
 
+	if testing == nil && config.CompilerOptions().MaxMemory == nil {
+		core.SuspendGC()
+	}
+	parser.EnableLazyDts(testing == nil && (config.CompilerOptions().SkipLibCheck.IsTrue() || config.CompilerOptions().NoCheck.IsTrue()))
+	defer parser.EnableLazyDts(false)
 	parseStart := sys.Now()
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		Config:  config,
 		Host:    host,
 		Tracing: tr,
 	})
+	compiler.FinishWasmProgramInit(program)
 	compileTimes.ParseTime = sys.Now().Sub(parseStart)
 	if contentMapperHost != nil {
 		compileTimes.ContentMapperTimes = contentMapperHost.Timings()
@@ -404,7 +416,8 @@ func performCompilation(
 	stopTracing(sys, tr)
 
 	return tsc.CommandLineResult{
-		Status: result.Status,
+		Status:      result.Status,
+		Diagnostics: result.Diagnostics,
 	}
 }
 

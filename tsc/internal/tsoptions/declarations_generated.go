@@ -235,6 +235,13 @@ var commonOptionsWithBuild = []*CommandLineOption{
 		minValue:                1,
 	},
 	{
+		Name:        "maxMemory",
+		Kind:        CommandLineOptionTypeNumber,
+		Category:    diagnostics.Command_line_Options,
+		Description: diagnostics.Set_the_memory_limit_in_MiB_for_recycling_checkers_during_no_emit_type_checking,
+		minValue:    1,
+	},
+	{
 		Name:                    "runExternalCode",
 		Kind:                    CommandLineOptionTypeBoolean,
 		Category:                diagnostics.Command_line_Options,
@@ -682,6 +689,13 @@ var optionsForCompiler = []*CommandLineOption{
 		Kind:                    CommandLineOptionTypeBoolean,
 		Category:                diagnostics.Modules,
 		Description:             diagnostics.Rewrite_ts_tsx_mts_and_cts_file_extensions_in_relative_import_paths_to_their_JavaScript_equivalent_in_output_files,
+		DefaultValueDescription: false,
+	},
+	{
+		Name:                    "disableDynamicImportExtensionRewriting",
+		Kind:                    CommandLineOptionTypeBoolean,
+		Category:                diagnostics.Modules,
+		Description:             diagnostics.Disable_runtime_rewriting_of_file_extensions_in_non_literal_import_and_require_calls_when_rewriteRelativeImportExtensions_is_enabled,
 		DefaultValueDescription: false,
 	},
 	{

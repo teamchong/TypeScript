@@ -831,9 +831,6 @@ func (c *Checker) checkGrammarIndexSignatureParameters(node *ast.IndexSignatureD
 	if !everyType(t, c.isValidIndexKeyType) {
 		return c.grammarErrorOnNode(parameter.Name(), diagnostics.An_index_signature_parameter_type_must_be_string_number_symbol_or_a_template_literal_type)
 	}
-	if node.Type == nil {
-		return c.grammarErrorOnNode(node.AsNode(), diagnostics.An_index_signature_must_have_a_type_annotation)
-	}
 	return false
 }
 
@@ -995,12 +992,29 @@ func (c *Checker) checkGrammarForInvalidExclamationToken(postfixToken *ast.Token
 	return postfixToken != nil && postfixToken.Kind == ast.KindExclamationToken && c.grammarErrorOnNode(postfixToken, message)
 }
 
-func (c *Checker) checkGrammarObjectLiteralExpression(node *ast.ObjectLiteralExpression, inDestructuring bool) bool {
-	seen := make(map[string]DeclarationMeaning)
+func (c *Checker) releaseObjectLiteralSeen(seen map[string]DeclarationMeaning) {
+	if seen != nil {
+		clear(seen)
+		c.freeObjectLiteralSeen = append(c.freeObjectLiteralSeen, seen)
+	}
+}
 
+func (c *Checker) checkGrammarObjectLiteralExpression(node *ast.ObjectLiteralExpression, inDestructuring bool) bool {
 	var properties []*ast.Node
 	if node.Properties != nil {
 		properties = node.Properties.Nodes
+	}
+	if len(properties) == 0 {
+		return false
+	}
+	var seen map[string]DeclarationMeaning
+	if !inDestructuring && len(properties) > 1 {
+		if n := len(c.freeObjectLiteralSeen); n > 0 {
+			seen = c.freeObjectLiteralSeen[n-1]
+			c.freeObjectLiteralSeen = c.freeObjectLiteralSeen[:n-1]
+		} else {
+			seen = make(map[string]DeclarationMeaning)
+		}
 	}
 	for _, prop := range properties {
 		if prop.Kind == ast.KindSpreadAssignment {
@@ -1105,7 +1119,7 @@ func (c *Checker) checkGrammarObjectLiteralExpression(node *ast.ObjectLiteralExp
 			panic(fmt.Sprintf("Unexpected node kind %q", prop.Kind))
 		}
 
-		if !inDestructuring {
+		if seen != nil {
 			effectiveName, ok := c.getEffectivePropertyNameForPropertyNameNode(name)
 			if !ok {
 				continue
@@ -1123,15 +1137,18 @@ func (c *Checker) checkGrammarObjectLiteralExpression(node *ast.ObjectLiteralExp
 					if existingKind != DeclarationMeaningGetOrSetAccessor && currentKind != existingKind {
 						seen[effectiveName] = currentKind | existingKind
 					} else {
+						c.releaseObjectLiteralSeen(seen)
 						return c.grammarErrorOnNode(name, diagnostics.An_object_literal_cannot_have_multiple_get_Slashset_accessors_with_the_same_name)
 					}
 				} else {
+					c.releaseObjectLiteralSeen(seen)
 					return c.grammarErrorOnNode(name, diagnostics.An_object_literal_cannot_have_property_and_accessor_with_the_same_name)
 				}
 			}
 		}
 	}
 
+	c.releaseObjectLiteralSeen(seen)
 	return false
 }
 

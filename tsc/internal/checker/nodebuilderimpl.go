@@ -1897,7 +1897,7 @@ func (b *NodeBuilderImpl) signatureToSignatureDeclarationHelper(signature *Signa
 	// If the expanded parameter list had a variadic in a non-trailing position, don't expand it
 	parameters := core.Map(core.IfElse(core.Some(expandedParams, func(p *ast.Symbol) bool {
 		return p != expandedParams[len(expandedParams)-1] && p.CheckFlags()&ast.CheckFlagsRestParameter != 0
-	}), signature.parameters, expandedParams), func(parameter *ast.Symbol) *ast.Node {
+	}), b.ch.getSignatureParameters(signature), expandedParams), func(parameter *ast.Symbol) *ast.Node {
 		return b.symbolToParameterDeclaration(parameter, kind == ast.KindConstructor)
 	})
 	var thisParameter *ast.Node
@@ -1996,9 +1996,10 @@ func (b *NodeBuilderImpl) signatureToSignatureDeclarationHelper(signature *Signa
 }
 
 func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool) [][]*ast.Symbol {
+	params := c.getSignatureParameters(sig)
 	if signatureHasRestParameter(sig) {
-		restIndex := len(sig.parameters) - 1
-		restSymbol := sig.parameters[restIndex]
+		restIndex := len(params) - 1
+		restSymbol := params[restIndex]
 		restType := c.getTypeOfSymbol(restSymbol)
 		getUniqAssociatedNamesFromTupleType := func(t *Type, restSymbol *ast.Symbol) []string {
 			names := core.MapIndex(t.Target().AsTupleType().elementInfos, func(info TupleElementInfo, i int) string {
@@ -2069,7 +2070,7 @@ func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool)
 				}
 				return symbol
 			})
-			return core.Concatenate(sig.parameters[0:restIndex], restParams)
+			return core.Concatenate(params[0:restIndex], restParams)
 		}
 
 		if isTupleType(restType) {
@@ -2080,12 +2081,12 @@ func (c *Checker) getExpandedParameters(sig *Signature, skipUnionExpanding bool)
 			})
 		}
 	}
-	return [][]*ast.Symbol{sig.parameters}
+	return [][]*ast.Symbol{params}
 }
 
 func (b *NodeBuilderImpl) tryGetThisParameterDeclaration(signature *Signature) *ast.Node {
 	if signature.ThisParameter() != nil {
-		return b.symbolToParameterDeclaration(signature.ThisParameter(), false)
+		return b.symbolToParameterDeclaration(b.ch.getSignatureThisParameter(signature), false)
 	}
 	if signature.declaration != nil && ast.IsInJSFile(signature.declaration) {
 		// !!! JSDoc Support

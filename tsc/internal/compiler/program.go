@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -400,12 +401,7 @@ func (p *Program) ReuseProgram(
 	if p.moduleResolutionError != nil || !p.canReplaceFileInProgram(oldFile, newFile) {
 		return nil, newFile, false
 	}
-	// Cloning does not recompute synthetic helper or JSX-runtime import bookkeeping. Fall back to a full
-	// build whenever either version requires those imports.
-	if p.importHelpersImportSpecifiers[oldFile.PathKey()] != nil || p.needsImportHelpersImportSpecifier(newFile) {
-		return nil, newFile, false
-	}
-	if p.jsxRuntimeImportSpecifiers[oldFile.PathKey()] != nil || p.jsxRuntimeImportSpecifier(newFile) != "" {
+	if !p.hasSameSyntheticImports(oldFile, newFile) {
 		return nil, newFile, false
 	}
 	if len(oldSupplementalFiles) != len(newSupplementalFiles) {
@@ -417,10 +413,7 @@ func (p *Program) ReuseProgram(
 			!p.canReplaceFileInProgram(oldSupplemental, newSupplemental) {
 			return nil, newFile, false
 		}
-		if p.importHelpersImportSpecifiers[oldSupplemental.PathKey()] != nil || p.needsImportHelpersImportSpecifier(newSupplemental) {
-			return nil, newFile, false
-		}
-		if p.jsxRuntimeImportSpecifiers[oldSupplemental.PathKey()] != nil || p.jsxRuntimeImportSpecifier(newSupplemental) != "" {
+		if !p.hasSameSyntheticImports(oldSupplemental, newSupplemental) {
 			return nil, newFile, false
 		}
 	}
@@ -452,6 +445,7 @@ func (p *Program) ReuseProgram(
 			result.filesByPath[newSupplemental.PathKey()] = newSupplemental
 		}
 	}
+	result.replaceSyntheticImports(newFile, newSupplementalFiles)
 	result.initCheckerPool(createCheckerPool)
 	return result, newFile, true
 }
@@ -478,6 +472,7 @@ func (p *Program) GetCheckerPool() CheckerPool {
 func (p *Program) canReplaceFileInProgram(file1 *ast.SourceFile, file2 *ast.SourceFile) bool {
 	return file2 != nil &&
 		file1.ParseOptions() == file2.ParseOptions() &&
+		file1.VirtualFileName() == file2.VirtualFileName() &&
 		file1.ScriptKind == file2.ScriptKind &&
 		ast.IsExternalOrCommonJSModule(file1) == ast.IsExternalOrCommonJSModule(file2) &&
 		file1.UsesUriStyleNodeCoreModules == file2.UsesUriStyleNodeCoreModules &&
@@ -492,6 +487,48 @@ func (p *Program) canReplaceFileInProgram(file1 *ast.SourceFile, file2 *ast.Sour
 		slices.EqualFunc(file1.TypeReferenceDirectives, file2.TypeReferenceDirectives, equalFileReferences) &&
 		slices.EqualFunc(file1.LibReferenceDirectives, file2.LibReferenceDirectives, equalFileReferences) &&
 		equalCheckJSDirectives(file1.CheckJsDirective, file2.CheckJsDirective)
+}
+
+// hasSameSyntheticImports reports whether newFile needs the same synthetic tslib and JSX runtime imports
+// that oldFile was loaded with. Their resolutions don't depend on file contents, so a program can be reused
+// across the edit when they match.
+func (p *Program) hasSameSyntheticImports(oldFile *ast.SourceFile, newFile *ast.SourceFile) bool {
+	if (p.importHelpersImportSpecifiers[oldFile.PathKey()] != nil) != p.needsImportHelpersImportSpecifier(newFile) {
+		return false
+	}
+	var oldJSXRuntimeImport string
+	if jsxImport := p.jsxRuntimeImportSpecifiers[oldFile.PathKey()]; jsxImport != nil {
+		oldJSXRuntimeImport = jsxImport.moduleReference
+	}
+	return oldJSXRuntimeImport == p.jsxRuntimeImportSpecifier(newFile)
+}
+
+// replaceSyntheticImports recreates the synthetic imports of replaced files, as the existing ones are
+// parented to the old versions of those files.
+func (p *Program) replaceSyntheticImports(newFile *ast.SourceFile, newSupplementalFiles []*ast.SourceFile) {
+	var factory ast.NodeFactory
+	clonedImportHelpers := false
+	clonedJSXRuntime := false
+	for _, file := range core.Concatenate([]*ast.SourceFile{newFile}, newSupplementalFiles) {
+		path := file.PathKey()
+		if p.importHelpersImportSpecifiers[path] != nil {
+			if !clonedImportHelpers {
+				p.importHelpersImportSpecifiers = maps.Clone(p.importHelpersImportSpecifiers)
+				clonedImportHelpers = true
+			}
+			p.importHelpersImportSpecifiers[path] = newSyntheticImport(&factory, externalHelpersModuleNameText, file)
+		}
+		if jsxImport := p.jsxRuntimeImportSpecifiers[path]; jsxImport != nil {
+			if !clonedJSXRuntime {
+				p.jsxRuntimeImportSpecifiers = maps.Clone(p.jsxRuntimeImportSpecifiers)
+				clonedJSXRuntime = true
+			}
+			p.jsxRuntimeImportSpecifiers[path] = &jsxRuntimeImportSpecifier{
+				moduleReference: jsxImport.moduleReference,
+				specifier:       newSyntheticImport(&factory, jsxImport.moduleReference, file),
+			}
+		}
+	}
 }
 
 func (p *Program) needsImportHelpersImportSpecifier(file *ast.SourceFile) bool {
@@ -597,11 +634,14 @@ func (p *Program) extractUnresolvedImportsFromSourceFile(file *ast.SourceFile) [
 }
 
 func (p *Program) SingleThreaded() bool {
+	if runtime.GOARCH == "wasm" {
+		return true
+	}
 	return p.opts.SingleThreaded.DefaultIfUnknown(p.Options().SingleThreaded).IsTrue()
 }
 
 func (p *Program) BindSourceFiles() {
-	wg := core.NewWorkGroup(p.SingleThreaded())
+	wg := core.NewWorkGroup(core.WorkGroupConcurrency(p.SingleThreaded()))
 	for _, file := range p.files {
 		if !file.IsBound() {
 			wg.Queue(func() {
@@ -709,7 +749,7 @@ func (p *Program) collectDiagnostics(ctx context.Context, sourceFile *ast.Source
 
 func (p *Program) collectDiagnosticsFromFiles(ctx context.Context, sourceFiles []*ast.SourceFile, concurrent bool, collect func(context.Context, *ast.SourceFile) []*ast.Diagnostic) [][]*ast.Diagnostic {
 	diagnostics := make([][]*ast.Diagnostic, len(sourceFiles))
-	wg := core.NewWorkGroup(!concurrent || p.SingleThreaded())
+	wg := core.NewWorkGroup(core.WorkGroupConcurrency(!concurrent || p.SingleThreaded()))
 	for i, file := range sourceFiles {
 		wg.Queue(func() {
 			diagnostics[i] = collect(ctx, file)
@@ -756,7 +796,7 @@ func (p *Program) collectCheckerDiagnosticsFromFiles(ctx context.Context, source
 			diagnostics[fileIndex] = collect(ctx, c, file)
 		})
 	} else {
-		wg := core.NewWorkGroup(p.SingleThreaded())
+		wg := core.NewWorkGroup(core.WorkGroupConcurrency(p.SingleThreaded()))
 		for i, file := range sourceFiles {
 			if p.SkipTypeChecking(file, false) {
 				continue
@@ -1753,6 +1793,9 @@ func (p *Program) SymbolCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.SymbolCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredSymbolCount.Load()))
+	}
 	return int(val.Load())
 }
 
@@ -1761,6 +1804,9 @@ func (p *Program) TypeCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.TypeCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredTypeCount.Load()))
+	}
 	return int(val.Load())
 }
 
@@ -1769,7 +1815,17 @@ func (p *Program) InstantiationCount() int {
 	p.ForEachCheckerParallel(func(_ int, c *checker.Checker) {
 		val.Add(c.TotalInstantiationCount)
 	})
+	if p.compilerCheckerPool != nil {
+		val.Add(uint32(p.compilerCheckerPool.retiredInstantiationCount.Load()))
+	}
 	return int(val.Load())
+}
+
+func (p *Program) RetiredCheckerCount() int {
+	if p.compilerCheckerPool == nil {
+		return 0
+	}
+	return int(p.compilerCheckerPool.retiredCheckerCount.Load())
 }
 
 func (p *Program) Program() *Program {
@@ -1926,7 +1982,7 @@ func (p *Program) Emit(ctx context.Context, options EmitOptions) *EmitResult {
 			return printer.NewTextWriter(newLine, 0)
 		},
 	}
-	wg := core.NewWorkGroup(p.SingleThreaded())
+	wg := core.NewWorkGroup(core.WorkGroupConcurrency(p.SingleThreaded()))
 	var emitters []*emitter
 	forceDtsEmit := options.EmitOnly == EmitOnlyBuilderSignature || options.ForceEmit && options.EmitOnly == EmitOnlyDts
 	forceJsEmit := options.ForceEmit && options.EmitOnly == EmitOnlyJs

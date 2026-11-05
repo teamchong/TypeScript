@@ -86,10 +86,10 @@ func (v JSONValue) AsString() string {
 var _ json.UnmarshalerFrom = (*JSONValue)(nil)
 
 func (v *JSONValue) UnmarshalJSONFrom(dec *json.Decoder) error {
-	return v.unmarshalJSONValueFrom[JSONValue](dec)
+	return unmarshalJSONValueFrom[JSONValue](v, dec)
 }
 
-func (v *JSONValue) unmarshalJSONValueFrom[T any](dec *json.Decoder) error {
+func unmarshalJSONValueFrom[T any](v *JSONValue, dec *json.Decoder) error {
 	switch dec.PeekKind() {
 	case 'n': // json.Null.Kind()
 		if _, err := dec.ReadToken(); err != nil {

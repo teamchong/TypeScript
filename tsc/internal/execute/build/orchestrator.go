@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -260,7 +261,7 @@ func (o *Orchestrator) GenerateGraphReusingOldTasks() {
 func (o *Orchestrator) GenerateGraph(oldTasks *collections.SyncMap[tspath.PathKey, *BuildTask]) {
 	projects := o.opts.Command.ResolvedProjectPaths()
 	// Parse all config files in parallel
-	wg := core.NewWorkGroup(o.opts.Command.CompilerOptions.SingleThreaded.IsTrue())
+	wg := core.NewWorkGroup(core.WorkGroupConcurrency(o.opts.Command.CompilerOptions.SingleThreaded.IsTrue()))
 	o.createBuildTasks(oldTasks, projects, wg)
 	wg.RunAndWait()
 
@@ -889,18 +890,27 @@ func (o *Orchestrator) buildOrCleanOrder(order []*BuildTask) *OrchestratorResult
 			scheduleOrder = o.computeScheduleOrder(order)
 		}
 		// Builders pick up selected projects in dependency-depth order; reporting preserves the selected build order.
-		reported := make(chan struct{})
-		go func() {
-			defer close(reported)
+		if o.opts.Command.CompilerOptions.SingleThreaded.IsTrue() || runtime.GOARCH == "wasm" {
+			o.rangeTasks(scheduleOrder, func(path tspath.PathKey, task *BuildTask) {
+				o.buildOrCleanProject(task, path)
+			})
 			for _, task := range order {
-				<-task.built
 				task.report(o, task.path, buildResult)
 			}
-		}()
-		o.rangeTasks(scheduleOrder, func(path tspath.PathKey, task *BuildTask) {
-			o.buildOrCleanProject(task, path)
-		})
-		<-reported
+		} else {
+			reported := make(chan struct{})
+			go func() {
+				defer close(reported)
+				for _, task := range order {
+					<-task.built
+					task.report(o, task.path, buildResult)
+				}
+			}()
+			o.rangeTasks(scheduleOrder, func(path tspath.PathKey, task *BuildTask) {
+				o.buildOrCleanProject(task, path)
+			})
+			<-reported
+		}
 	} else {
 		// Circularity errors prevent any project from being built
 		buildResult.Result.Status = tsc.ExitStatusProjectReferenceCycle_OutputsSkipped
@@ -920,7 +930,7 @@ func (o *Orchestrator) rangeTask(f func(path tspath.PathKey, task *BuildTask)) {
 
 func (o *Orchestrator) rangeTasks(order []*BuildTask, f func(path tspath.PathKey, task *BuildTask)) {
 	numRoutines := 4
-	if o.opts.Command.CompilerOptions.SingleThreaded.IsTrue() {
+	if o.opts.Command.CompilerOptions.SingleThreaded.IsTrue() || runtime.GOARCH == "wasm" {
 		numRoutines = 1
 	} else if builders := o.opts.Command.BuildOptions.Builders; builders != nil {
 		numRoutines = *builders
@@ -944,7 +954,7 @@ func (o *Orchestrator) rangeTasks(order []*BuildTask, f func(path tspath.PathKey
 	if numRoutines == 1 {
 		runTask()
 	} else {
-		wg := core.NewWorkGroup(false)
+		wg := core.NewWorkGroup(0)
 		for range numRoutines {
 			wg.Queue(runTask)
 		}

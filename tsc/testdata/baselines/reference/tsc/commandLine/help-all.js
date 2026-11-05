@@ -38,6 +38,9 @@ Print names of files that are part of the compilation and then stop processing.
 [94m--locale[39m
 Set the language of the messaging from TypeScript. This does not affect emit.
 
+[94m--maxMemory[39m
+Set the memory limit in MiB for recycling checkers during no-emit type checking.
+
 [94m--pprofDir[39m
 Generate pprof CPU/memory profiles to the given directory.
 
@@ -84,6 +87,11 @@ Specify the base directory to resolve non-relative module names.
 
 [94m--customConditions[39m
 Conditions to set in addition to the resolver-specific defaults when resolving imports.
+
+[94m--disableDynamicImportExtensionRewriting[39m
+Disable runtime rewriting of file extensions in non-literal 'import()' and 'require()' calls when 'rewriteRelativeImportExtensions' is enabled.
+type: boolean
+default: false
 
 [94m--module, -m[39m
 Specify what module code is generated.

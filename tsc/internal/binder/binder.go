@@ -72,6 +72,7 @@ type Binder struct {
 	inAssignmentPattern     bool
 	seenParseError          bool
 	symbolCount             int
+	isLazy                  bool
 	notConstEnumOnlyModules collections.Set[*ast.Symbol]
 	symbolWithDataArena     core.Arena[ast.SymbolWithData]
 	symbolExtraArena        ast.SymbolExtraArena
@@ -79,6 +80,8 @@ type Binder struct {
 	flowListArena           core.Arena[ast.FlowList]
 	singleDeclarationsArena core.Arena[*ast.Node]
 	expandoAssignments      []ExpandoAssignmentInfo
+
+	seenCommonJSModuleIndicator bool
 }
 
 type ActiveLabel struct {
@@ -100,6 +103,10 @@ func BindSourceFile(file *ast.SourceFile) {
 	}
 }
 
+func init() {
+	ast.SetLazyBindHook(bindLazyList)
+}
+
 var binderPool = sync.Pool{
 	New: func() any {
 		b := &Binder{}
@@ -108,12 +115,29 @@ var binderPool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	binderPool = sync.Pool{
+		New: func() any {
+			b := &Binder{}
+			b.bindFunc = b.bind
+			return b
+		},
+	}
+}
+
 func getBinder() *Binder {
 	return binderPool.Get().(*Binder)
 }
 
 func putBinder(b *Binder) {
-	*b = Binder{bindFunc: b.bindFunc}
+	*b = Binder{
+		bindFunc:                b.bindFunc,
+		symbolWithDataArena:     b.symbolWithDataArena,
+		symbolExtraArena:        b.symbolExtraArena,
+		flowNodeArena:           b.flowNodeArena,
+		flowListArena:           b.flowListArena,
+		singleDeclarationsArena: b.singleDeclarationsArena,
+	}
 	binderPool.Put(b)
 }
 
@@ -126,6 +150,9 @@ func bindSourceFile(file *ast.SourceFile) {
 		b.bind(file.AsNode())
 		b.bindDeferredExpandoAssignments()
 		file.SymbolCount = b.symbolCount
+		for _, lazy := range file.LazyLists {
+			lazy.MarkUnbound(file)
+		}
 	})
 }
 
@@ -550,14 +577,14 @@ func (b *Binder) addAntecedent(label *ast.FlowLabel, antecedent *ast.FlowNode) {
 	}
 	// If antecedent isn't already on the Antecedents list, add it to the end of the list
 	var last *ast.FlowList
-	for list := label.Antecedents; list != nil; list = list.Next {
+	for list := label.Antecedents(); list != nil; list = list.Next {
 		if list.Flow == antecedent {
 			return
 		}
 		last = list
 	}
 	if last == nil {
-		label.Antecedents = b.newFlowList(antecedent, nil)
+		label.SetAntecedents(b.newFlowList(antecedent, nil))
 	} else {
 		last.Next = b.newFlowList(antecedent, nil)
 	}
@@ -565,11 +592,12 @@ func (b *Binder) addAntecedent(label *ast.FlowLabel, antecedent *ast.FlowNode) {
 }
 
 func (b *Binder) finishFlowLabel(label *ast.FlowLabel) *ast.FlowNode {
-	if label.Antecedents == nil {
+	antecedents := label.Antecedents()
+	if antecedents == nil {
 		return b.unreachableFlow
 	}
-	if label.Antecedents.Next == nil {
-		return label.Antecedents.Flow
+	if antecedents.Next == nil {
+		return antecedents.Flow
 	}
 	return label
 }
@@ -758,7 +786,7 @@ func (b *Binder) bindPropertyWorker(node *ast.Node) {
 
 func (b *Binder) bindSourceFileIfExternalModule() {
 	b.setExportContextFlag(b.file.AsNode())
-	if ast.IsExternalOrCommonJSModule(b.file) {
+	if b.isExternalOrCommonJSModule() {
 		b.bindSourceFileAsExternalModule()
 	} else if ast.IsJsonSourceFile(b.file) {
 		b.bindSourceFileAsExternalModule()
@@ -927,17 +955,21 @@ func (b *Binder) bindFunctionExpression(node *ast.Node) {
 func (b *Binder) bindCallExpression(node *ast.Node) {
 	// We're only inspecting call expressions to detect CommonJS modules, so we can skip
 	// this check if we've already seen the module indicator
-	if b.file.CommonJSModuleIndicator == nil && ast.IsRequireCall(node, false /*requireStringLiteralLikeArgument*/) {
+	if !b.seenCommonJSModuleIndicator && ast.IsRequireCall(node, false /*requireStringLiteralLikeArgument*/) {
 		b.setCommonJSModuleIndicator(node)
 	}
 }
 
+// setCommonJSModuleIndicator reports whether node's file is a CommonJS module, which the
+// parser has already determined. The file symbol is created at the first CommonJS construct
+// in the walk, rather than up front, to preserve symbol creation order.
 func (b *Binder) setCommonJSModuleIndicator(node *ast.Node) bool {
-	if b.file.ExternalModuleIndicator != nil && b.file.ExternalModuleIndicator != b.file.AsNode() {
+	if b.file.CommonJSModuleIndicator == nil {
+		debug.Assert(b.file.ExternalModuleIndicator != nil && b.file.ExternalModuleIndicator != b.file.AsNode(), "parser missed a CommonJS module indicator")
 		return false
 	}
-	if b.file.CommonJSModuleIndicator == nil {
-		b.file.CommonJSModuleIndicator = node
+	if !b.seenCommonJSModuleIndicator {
+		b.seenCommonJSModuleIndicator = true
 		if b.file.ExternalModuleIndicator == nil {
 			b.bindSourceFileAsExternalModule()
 		}
@@ -945,8 +977,17 @@ func (b *Binder) setCommonJSModuleIndicator(node *ast.Node) bool {
 	return true
 }
 
+// isExternalOrCommonJSModule is like ast.IsExternalOrCommonJSModule, but a CommonJS file only
+// counts as a module once the walk has reached its first CommonJS construct.
+func (b *Binder) isExternalOrCommonJSModule() bool {
+	return b.file.ExternalModuleIndicator != nil || b.seenCommonJSModuleIndicator
+}
+
 func (b *Binder) bindClassLikeDeclaration(node *ast.Node) {
 	name := node.Name()
+	if node.Flags&ast.NodeFlagsAmbient == 0 {
+		b.checkStrictModeEvalOrArguments(node, name)
+	}
 	switch node.Kind {
 	case ast.KindClassDeclaration:
 		b.bindBlockScopedDeclaration(node, ast.SymbolFlagsClass, ast.SymbolFlagsClassExcludes)
@@ -1248,7 +1289,7 @@ func (b *Binder) bindBlockScopedDeclaration(node *ast.Node, symbolFlags ast.Symb
 	case ast.KindModuleDeclaration:
 		b.declareModuleMember(node, symbolFlags, symbolExcludes)
 	case ast.KindSourceFile:
-		if ast.IsExternalOrCommonJSModule(b.container.AsSourceFile()) {
+		if b.isExternalOrCommonJSModule() {
 			b.declareModuleMember(node, symbolFlags, symbolExcludes)
 			break
 		}
@@ -1464,7 +1505,7 @@ func (b *Binder) checkStrictModeEvalOrArguments(contextNode *ast.Node, name *ast
 
 func (b *Binder) getStrictModeEvalOrArgumentsMessage(node *ast.Node) *diagnostics.Message {
 	// Provide specialized messages to help the user understand why we think they're in strict mode
-	if ast.GetContainingClass(node) != nil {
+	if ast.IsClassLike(node) || ast.GetContainingClass(node) != nil {
 		return diagnostics.Code_contained_in_a_class_is_evaluated_in_JavaScript_s_strict_mode_which_does_not_allow_this_use_of_0_For_more_information_see_https_Colon_Slash_Slashdeveloper_mozilla_org_Slashen_US_Slashdocs_SlashWeb_SlashJavaScript_SlashReference_SlashStrict_mode
 	}
 	if b.file.ExternalModuleIndicator != nil {
@@ -1612,12 +1653,13 @@ func (b *Binder) bindContainer(node *ast.Node, containerFlags ContainerFlags) {
 				b.bindBlockScopedDeclaration(statement, ast.SymbolFlagsTypeAlias, ast.SymbolFlagsTypeAliasExcludes)
 			}
 		}
-		if b.file.CommonJSModuleIndicator != nil {
+		debug.Assert(b.seenCommonJSModuleIndicator == (b.file.CommonJSModuleIndicator != nil), "binder missed a CommonJS module indicator")
+		if b.seenCommonJSModuleIndicator {
 			b.declareCommonJSVariable("module")
 			b.declareCommonJSVariable("exports")
 		}
 	}
-	if ast.IsSourceFile(node) && ast.IsExternalOrCommonJSModule(node.AsSourceFile()) || ast.IsAmbientModule(node) {
+	if ast.IsSourceFile(node) && b.isExternalOrCommonJSModule() || ast.IsAmbientModule(node) {
 		b.bindCommonJSTypeExports(node.Symbol())
 	}
 	b.container = saveContainer
@@ -1736,6 +1778,12 @@ func (b *Binder) bindChildren(node *ast.Node) {
 	case ast.KindObjectLiteralExpression, ast.KindArrayLiteralExpression, ast.KindPropertyAssignment, ast.KindSpreadElement:
 		b.inAssignmentPattern = saveInAssignmentPattern
 		b.bindEachChild(node)
+	case ast.KindInterfaceDeclaration, ast.KindClassDeclaration, ast.KindClassExpression, ast.KindTypeLiteral:
+		b.bindEachChild(node)
+		b.bindLazyMemberList(node)
+	case ast.KindTypeAliasDeclaration:
+		b.bindEachChild(node)
+		b.bindLazyTypeAlias(node)
 	default:
 		b.bindEachChild(node)
 	}
@@ -1750,6 +1798,97 @@ func (b *Binder) bindEach(nodes []*ast.Node) {
 	for _, node := range nodes {
 		b.bind(node)
 	}
+}
+
+func (b *Binder) bindLazyMemberList(node *ast.Node) {
+	list := node.MemberList()
+	if !list.IsLazy() {
+		return
+	}
+	lazy := list.AsLazy()
+	if lazy.State() != ast.LazyListPending {
+		return
+	}
+	symbol := node.Symbol()
+	plain := symbol != nil &&
+		b.currentFlow != b.unreachableFlow &&
+		b.currentBreakTarget == nil &&
+		b.currentContinueTarget == nil &&
+		b.currentReturnTarget == nil &&
+		b.currentTrueTarget == nil &&
+		b.currentFalseTarget == nil &&
+		b.currentExceptionTarget == nil &&
+		b.preSwitchCaseFlow == nil &&
+		b.activeLabelList == nil &&
+		!b.inAssignmentPattern
+	if !plain {
+		nodes := lazy.ParseNow(b.file)
+		b.bindEach(nodes)
+		for _, nested := range lazy.NestedLazyLists() {
+			nested.MarkUnbound(b.file)
+		}
+		lazy.SetNestedLazyLists(nil)
+		return
+	}
+	lazy.Defer(b.file, &ast.LazyBindContext{
+		Container:           b.container,
+		ThisContainer:       b.thisContainer,
+		BlockScopeContainer: b.blockScopeContainer,
+		CurrentFlow:         b.currentFlow,
+		UnreachableFlow:     b.unreachableFlow,
+	})
+	symbol.SetHasLazyMembers()
+}
+
+func (b *Binder) bindLazyTypeAlias(node *ast.Node) {
+	typeNode := node.AsTypeAliasDeclaration().Type
+	if !typeNode.IsLazyTypeNode() {
+		return
+	}
+	lazy := typeNode.AsLazyTypeNode()
+	plain := b.currentFlow != b.unreachableFlow &&
+		b.currentBreakTarget == nil &&
+		b.currentContinueTarget == nil &&
+		b.currentReturnTarget == nil &&
+		b.currentTrueTarget == nil &&
+		b.currentFalseTarget == nil &&
+		b.currentExceptionTarget == nil &&
+		b.preSwitchCaseFlow == nil &&
+		b.activeLabelList == nil &&
+		!b.inAssignmentPattern
+	if !plain {
+		nodes := lazy.ParseNow(b.file)
+		b.bindEach(nodes)
+		for _, nested := range lazy.NestedLazyLists() {
+			nested.MarkUnbound(b.file)
+		}
+		lazy.SetNestedLazyLists(nil)
+		return
+	}
+	lazy.Defer(b.file, &ast.LazyBindContext{
+		Container:           b.container,
+		ThisContainer:       b.thisContainer,
+		BlockScopeContainer: b.blockScopeContainer,
+		CurrentFlow:         b.currentFlow,
+		UnreachableFlow:     b.unreachableFlow,
+	})
+}
+
+func bindLazyList(lazy *ast.LazyNodeList, file *ast.SourceFile, nodes []*ast.Node) {
+	ctx := lazy.BindCtx
+	if ctx == nil {
+		return
+	}
+	b := getBinder()
+	defer putBinder(b)
+	b.file = file
+	b.isLazy = true
+	b.container = ctx.Container
+	b.thisContainer = ctx.ThisContainer
+	b.blockScopeContainer = ctx.BlockScopeContainer
+	b.currentFlow = ctx.CurrentFlow
+	b.unreachableFlow = ctx.UnreachableFlow
+	b.bindEach(nodes)
 }
 
 func (b *Binder) bindNodeList(nodeList *ast.NodeList) {
@@ -2062,7 +2201,7 @@ func (b *Binder) bindTryStatement(node *ast.Node) {
 		// set of antecedents for the pre-finally label. As control flow analysis passes by a ReduceLabel
 		// node, the pre-finally label is temporarily switched to the reduced antecedent set.
 		finallyLabel := b.createBranchLabel()
-		finallyLabel.Antecedents = b.combineFlowLists(normalExitLabel.Antecedents, b.combineFlowLists(exceptionLabel.Antecedents, returnLabel.Antecedents))
+		finallyLabel.SetAntecedents(b.combineFlowLists(normalExitLabel.Antecedents(), b.combineFlowLists(exceptionLabel.Antecedents(), returnLabel.Antecedents())))
 		b.currentFlow = finallyLabel
 		b.bind(stmt.FinallyBlock)
 		if b.currentFlow.Flags&ast.FlowFlagsUnreachable != 0 {
@@ -2071,19 +2210,19 @@ func (b *Binder) bindTryStatement(node *ast.Node) {
 		} else {
 			// If we have an IIFE return target and return statements in the try or catch blocks, add a control
 			// flow that goes back through the finally block and back through only the return statements.
-			if b.currentReturnTarget != nil && returnLabel.Antecedents != nil {
-				b.addAntecedent(b.currentReturnTarget, b.createReduceLabel(finallyLabel, returnLabel.Antecedents, b.currentFlow))
+			if b.currentReturnTarget != nil && returnLabel.Antecedents() != nil {
+				b.addAntecedent(b.currentReturnTarget, b.createReduceLabel(finallyLabel, returnLabel.Antecedents(), b.currentFlow))
 			}
 			// If we have an outer exception target (i.e. a containing try-finally or try-catch-finally), add a
 			// control flow that goes back through the finally block and back through each possible exception source.
-			if b.currentExceptionTarget != nil && exceptionLabel.Antecedents != nil {
-				b.addAntecedent(b.currentExceptionTarget, b.createReduceLabel(finallyLabel, exceptionLabel.Antecedents, b.currentFlow))
+			if b.currentExceptionTarget != nil && exceptionLabel.Antecedents() != nil {
+				b.addAntecedent(b.currentExceptionTarget, b.createReduceLabel(finallyLabel, exceptionLabel.Antecedents(), b.currentFlow))
 			}
 			// If the end of the finally block is reachable, but the end of the try and catch blocks are not,
 			// convert the current flow to unreachable. For example, 'try { return 1; } finally { ... }' should
 			// result in an unreachable current control flow.
-			if normalExitLabel.Antecedents != nil {
-				b.currentFlow = b.createReduceLabel(finallyLabel, normalExitLabel.Antecedents, b.currentFlow)
+			if normalExitLabel.Antecedents() != nil {
+				b.currentFlow = b.createReduceLabel(finallyLabel, normalExitLabel.Antecedents(), b.currentFlow)
 			} else {
 				b.currentFlow = b.unreachableFlow
 			}
@@ -2140,17 +2279,17 @@ func (b *Binder) bindCaseBlock(node *ast.Node) {
 		b.bind(clause)
 		fallthroughFlow = b.currentFlow
 		if b.currentFlow.Flags&ast.FlowFlagsUnreachable == 0 && i != len(clauses)-1 {
-			clause.AsCaseOrDefaultClause().FallthroughFlowNode = b.currentFlow
+			clause.CaseOrDefaultClauseData().FallthroughFlowNode = b.currentFlow
 		}
 	}
 }
 
 func (b *Binder) bindCaseOrDefaultClause(node *ast.Node) {
-	clause := node.AsCaseOrDefaultClause()
-	if clause.Expression != nil {
+	clause := node.CaseOrDefaultClauseData()
+	if node.Kind == ast.KindCaseClause {
 		saveCurrentFlow := b.currentFlow
 		b.currentFlow = b.preSwitchCaseFlow
-		b.bind(clause.Expression)
+		b.bind(node.Expression())
 		b.currentFlow = saveCurrentFlow
 	}
 	b.bindEach(clause.Statements.Nodes)
@@ -2543,7 +2682,7 @@ func (b *Binder) addDeclarationToSymbol(symbol *ast.Symbol, node *ast.Node, symb
 	symbol.SetFlags(symbol.Flags() | symbolFlags)
 	node.DeclarationData().Symbol = symbol
 	if symbol.Declarations() == nil {
-		symbol.SetDeclarations(b.newSingleDeclaration(node))
+		symbol.SetSingleDeclaration(node)
 	} else {
 		symbol.SetDeclarations(core.AppendIfUnique(symbol.Declarations(), node))
 	}
@@ -2742,7 +2881,9 @@ func (b *Binder) createDiagnosticForNode(node *ast.Node, message *diagnostics.Me
 }
 
 func (b *Binder) addDiagnostic(diagnostic *ast.Diagnostic) {
-	b.file.SetBindDiagnostics(append(b.file.BindDiagnostics(), diagnostic))
+	if !b.isLazy {
+		b.file.SetBindDiagnostics(append(b.file.BindDiagnostics(), diagnostic))
+	}
 }
 
 func isSignedNumericLiteral(node *ast.Node) bool {

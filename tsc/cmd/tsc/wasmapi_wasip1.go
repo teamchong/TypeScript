@@ -1,4 +1,4 @@
-//go:build wasip1
+//go:build wasip1 && !tinygo
 
 package main
 

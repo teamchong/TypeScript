@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -17,16 +18,31 @@ type WorkGroup interface {
 	RunAndWait()
 }
 
-func NewWorkGroup(singleThreaded bool) WorkGroup {
-	if singleThreaded {
+// A concurrency of 1 runs the functions on the goroutine that calls RunAndWait; 0 means no limit.
+func NewWorkGroup(concurrency int) WorkGroup {
+	if runtime.GOARCH == "wasm" {
 		return &singleThreadedWorkGroup{}
 	}
-	return &parallelWorkGroup{}
+	switch concurrency {
+	case 0:
+		return &parallelWorkGroup{semaphore: UnlimitedSemaphore{}}
+	case 1:
+		return &singleThreadedWorkGroup{}
+	}
+	return &parallelWorkGroup{semaphore: NewLimitedSemaphore(concurrency)}
+}
+
+func WorkGroupConcurrency(singleThreaded bool) int {
+	if singleThreaded {
+		return 1
+	}
+	return 0
 }
 
 type parallelWorkGroup struct {
-	done atomic.Bool
-	wg   sync.WaitGroup
+	done      atomic.Bool
+	wg        sync.WaitGroup
+	semaphore Semaphore
 }
 
 var _ WorkGroup = (*parallelWorkGroup)(nil)
@@ -35,8 +51,14 @@ func (w *parallelWorkGroup) Queue(fn func()) {
 	if w.done.Load() {
 		panic("Queue called after RunAndWait returned")
 	}
+	if runtime.GOARCH == "wasm" {
+		fn()
+		return
+	}
 
 	w.wg.Go(func() {
+		// Running functions call Queue, so waiting for a slot there would deadlock at the limit.
+		defer w.semaphore.Acquire()()
 		fn()
 	})
 }
@@ -106,6 +128,10 @@ func NewThrottleGroup(ctx context.Context, semaphore chan struct{}) *ThrottleGro
 // Go runs the given function in a new goroutine, but first acquires a slot from the semaphore.
 // The semaphore slot is released when the function completes.
 func (tg *ThrottleGroup) Go(fn func() error) {
+	if runtime.GOARCH == "wasm" {
+		_ = fn()
+		return
+	}
 	tg.group.Go(func() error {
 		// Acquire semaphore slot - this will block until a slot is available
 		tg.semaphore <- struct{}{}

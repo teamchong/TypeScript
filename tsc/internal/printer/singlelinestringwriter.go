@@ -16,6 +16,14 @@ var singleLineStringWriterPool sync.Pool = sync.Pool{
 	},
 }
 
+func ResetWasmPools() {
+	singleLineStringWriterPool = sync.Pool{
+		New: func() any {
+			return &singleLineStringWriter{}
+		},
+	}
+}
+
 var _ EmitTextWriter = &singleLineStringWriter{}
 
 func GetSingleLineStringWriter() (EmitTextWriter, func()) {

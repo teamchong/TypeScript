@@ -20,11 +20,18 @@ var (
 
 type NodeFactory struct {
 	hooks                              NodeFactoryHooks
+	arrayLiteralExpressionArena        core.Arena[ArrayLiteralExpression]
 	arrayTypeNodeArena                 core.Arena[ArrayTypeNode]
+	arrowFunctionArena                 core.Arena[ArrowFunction]
+	asExpressionArena                  core.Arena[AsExpression]
+	awaitExpressionArena               core.Arena[AwaitExpression]
 	binaryExpressionArena              core.Arena[BinaryExpression]
+	bindingElementArena                core.Arena[BindingElement]
+	bindingPatternArena                core.Arena[BindingPattern]
 	blockArena                         core.Arena[Block]
 	callExpressionArena                core.Arena[CallExpression]
 	conditionalExpressionArena         core.Arena[ConditionalExpression]
+	conditionalTypeNodeArena           core.Arena[ConditionalTypeNode]
 	constructSignatureDeclarationArena core.Arena[ConstructSignatureDeclaration]
 	elementAccessExpressionArena       core.Arena[ElementAccessExpression]
 	expressionStatementArena           core.Arena[ExpressionStatement]
@@ -34,8 +41,12 @@ type NodeFactory struct {
 	heritageClauseArena                core.Arena[HeritageClause]
 	identifierArena                    core.Arena[Identifier]
 	ifStatementArena                   core.Arena[IfStatement]
+	importClauseArena                  core.Arena[ImportClause]
+	importDeclarationArena             core.Arena[ImportDeclaration]
 	importSpecifierArena               core.Arena[ImportSpecifier]
+	importTypeNodeArena                core.Arena[ImportTypeNode]
 	indexedAccessTypeNodeArena         core.Arena[IndexedAccessTypeNode]
+	inferTypeNodeArena                 core.Arena[InferTypeNode]
 	interfaceDeclarationArena          core.Arena[InterfaceDeclaration]
 	intersectionTypeNodeArena          core.Arena[IntersectionTypeNode]
 	jsdocArena                         core.Arena[JSDoc]
@@ -45,24 +56,41 @@ type NodeFactory struct {
 	keywordExpressionArena             core.Arena[KeywordExpression]
 	keywordTypeNodeArena               core.Arena[KeywordTypeNode]
 	literalTypeNodeArena               core.Arena[LiteralTypeNode]
+	methodDeclarationArena             core.Arena[MethodDeclaration]
 	methodSignatureDeclarationArena    core.Arena[MethodSignatureDeclaration]
 	modifierListArena                  core.Arena[ModifierList]
+	namedImportsArena                  core.Arena[NamedImports]
 	nodeListArena                      core.Arena[NodeList]
 	numericLiteralArena                core.Arena[NumericLiteral]
+	objectLiteralExpressionArena       core.Arena[ObjectLiteralExpression]
 	parameterDeclarationArena          core.Arena[ParameterDeclaration]
 	parenthesizedExpressionArena       core.Arena[ParenthesizedExpression]
 	parenthesizedTypeNodeArena         core.Arena[ParenthesizedTypeNode]
 	prefixUnaryExpressionArena         core.Arena[PrefixUnaryExpression]
 	propertyAccessExpressionArena      core.Arena[PropertyAccessExpression]
 	propertyAssignmentArena            core.Arena[PropertyAssignment]
+	propertyDeclarationArena           core.Arena[PropertyDeclaration]
 	propertySignatureDeclarationArena  core.Arena[PropertySignatureDeclaration]
+	restTypeNodeArena                  core.Arena[RestTypeNode]
 	returnStatementArena               core.Arena[ReturnStatement]
+	shorthandPropertyAssignmentArena   core.Arena[ShorthandPropertyAssignment]
 	stringLiteralArena                 core.Arena[StringLiteral]
+	templateExpressionArena            core.Arena[TemplateExpression]
+	templateHeadArena                  core.Arena[TemplateHead]
+	templateLiteralTypeNodeArena       core.Arena[TemplateLiteralTypeNode]
+	templateLiteralTypeSpanArena       core.Arena[TemplateLiteralTypeSpan]
+	templateMiddleArena                core.Arena[TemplateMiddle]
+	templateSpanArena                  core.Arena[TemplateSpan]
+	templateTailArena                  core.Arena[TemplateTail]
+	thisTypeNodeArena                  core.Arena[ThisTypeNode]
 	tokenArena                         core.Arena[Token]
+	tupleTypeNodeArena                 core.Arena[TupleTypeNode]
 	typeAliasDeclarationArena          core.Arena[TypeAliasDeclaration]
 	typeLiteralNodeArena               core.Arena[TypeLiteralNode]
+	typeOfExpressionArena              core.Arena[TypeOfExpression]
 	typeOperatorNodeArena              core.Arena[TypeOperatorNode]
 	typeParameterDeclarationArena      core.Arena[TypeParameterDeclaration]
+	typeQueryNodeArena                 core.Arena[TypeQueryNode]
 	typeReferenceNodeArena             core.Arena[TypeReferenceNode]
 	unionTypeNodeArena                 core.Arena[UnionTypeNode]
 	variableDeclarationArena           core.Arena[VariableDeclaration]
@@ -146,9 +174,7 @@ type FlowNodeBase struct {
 	FlowNode *FlowNode
 }
 
-type CompositeBase struct {
-	facts atomic.Uint32
-}
+type CompositeBase struct{}
 
 type TypeSyntaxBase struct{}
 
@@ -172,10 +198,10 @@ type FunctionLikeWithBodyBase struct {
 }
 
 type ClassLikeBase struct {
+	CompositeBase
 	ExportableBase
 	ModifiersBase
 	LocalsContainerBase
-	CompositeBase
 	name            *IdentifierNode     // Optional
 	TypeParameters  *TypeParameterList  // Optional
 	HeritageClauses *HeritageClauseList // Optional
@@ -214,12 +240,12 @@ type AccessorDeclarationBase struct {
 	TypeElementBase
 	ClassElementBase
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 }
 
 type FunctionOrConstructorTypeNodeBase struct {
@@ -238,6 +264,11 @@ type JSDocTagBase struct {
 	NodeBase
 	TagName *IdentifierNode
 	Comment *NodeList // Optional
+}
+
+type CaseOrDefaultClauseBase struct {
+	Statements          *StatementList
+	FallthroughFlowNode *FlowNode
 }
 
 type JSDocCommentBase struct {
@@ -268,7 +299,8 @@ type (
 	WithStatementNode                 = Node
 	SwitchStatementNode               = Node
 	CaseBlockNode                     = Node
-	CaseOrDefaultClauseNode           = Node
+	CaseClauseNode                    = Node
+	DefaultClauseNode                 = Node
 	ThrowStatementNode                = Node
 	TryStatementNode                  = Node
 	CatchClauseNode                   = Node
@@ -541,6 +573,7 @@ type (
 	JsxAttributeName               = Node // Identifier | JsxNamespacedName
 	JsxAttributeValue              = Node // StringLiteral | JsxExpression | JsxElement | JsxSelfClosingElement | JsxFragment
 	JsxTagNameExpression           = Node // Identifier | ThisExpression | JsxTagNamePropertyAccess | JsxNamespacedName
+	CaseOrDefaultClause            = Node // CaseClause | DefaultClause
 	ClassLikeDeclaration           = Node // ClassDeclaration | ClassExpression
 	AccessorDeclaration            = Node // GetAccessorDeclaration | SetAccessorDeclaration
 	LiteralLikeNode                = Node // StringLiteral | NumericLiteral | BigIntLiteral | RegularExpressionLiteral | TemplateLiteralLikeNode | JsxText
@@ -622,13 +655,13 @@ func (f *NodeFactory) NewToken(kind TokenSyntaxKind) *Node {
 		data := &NoSubstitutionTemplateLiteral{}
 		return f.newNode(kind, data.AsNode())
 	case KindTemplateHead:
-		data := &TemplateHead{}
+		data := f.templateHeadArena.New()
 		return f.newNode(kind, data.AsNode())
 	case KindTemplateMiddle:
-		data := &TemplateMiddle{}
+		data := f.templateMiddleArena.New()
 		return f.newNode(kind, data.AsNode())
 	case KindTemplateTail:
-		data := &TemplateTail{}
+		data := f.templateTailArena.New()
 		return f.newNode(kind, data.AsNode())
 	case KindIdentifier:
 		data := f.identifierArena.New()
@@ -714,9 +747,9 @@ func IsPrivateIdentifier(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type QualifiedName struct {
+	CompositeBase
 	NodeBase
 	FlowNodeBase
-	CompositeBase
 	Left  *EntityName
 	Right *MemberName
 }
@@ -761,8 +794,8 @@ func IsQualifiedName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ComputedPropertyName struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Expression *Expression
 }
 
@@ -804,8 +837,8 @@ func IsComputedPropertyName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type Decorator struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Expression *LeftHandSideExpression
 }
 
@@ -864,8 +897,8 @@ func IsEmptyStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type IfStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression    *Expression
 	ThenStatement *Statement
 	ElseStatement *Statement // Optional
@@ -913,8 +946,8 @@ func IsIfStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type DoStatement struct {
-	IterationStatementBase
 	CompositeBase
+	IterationStatementBase
 	Expression *Expression
 }
 
@@ -958,8 +991,8 @@ func IsDoStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type WhileStatement struct {
-	IterationStatementBase
 	CompositeBase
+	IterationStatementBase
 	Expression *Expression
 }
 
@@ -1003,9 +1036,9 @@ func IsWhileStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ForStatement struct {
+	CompositeBase
 	IterationStatementBase
 	LocalsContainerBase
-	CompositeBase
 	Initializer *ForInitializer // Optional
 	Condition   *Expression     // Optional
 	Incrementor *Expression     // Optional
@@ -1058,9 +1091,9 @@ func IsForStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ForInOrOfStatement struct {
+	CompositeBase
 	StatementBase
 	LocalsContainerBase
-	CompositeBase
 	AwaitModifier *AwaitKeyword // Optional
 	Initializer   *ForInitializer
 	Expression    *Expression
@@ -1192,8 +1225,8 @@ func IsContinueStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ReturnStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression // Optional
 }
 
@@ -1231,8 +1264,8 @@ func IsReturnStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type WithStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 	Statement  *Statement
 }
@@ -1277,8 +1310,8 @@ func IsWithStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type SwitchStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 	CaseBlock  *CaseBlockNode
 }
@@ -1323,9 +1356,9 @@ func IsSwitchStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CaseBlock struct {
+	CompositeBase
 	NodeBase
 	LocalsContainerBase
-	CompositeBase
 	Clauses *CaseClausesList
 }
 
@@ -1363,55 +1396,88 @@ func IsCaseBlock(node *Node) bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// CaseOrDefaultClause
+// CaseClause
 // ──────────────────────────────────────────────────────────────────────
 
-type CaseOrDefaultClause struct {
-	NodeBase
+type CaseClause struct {
 	CompositeBase
-	Expression          *Expression
-	Statements          *StatementList
-	FallthroughFlowNode *FlowNode
+	NodeBase
+	CaseOrDefaultClauseBase
+	Expression *Expression
 }
 
-func (f *NodeFactory) NewCaseOrDefaultClause(kind Kind, expression *Expression, statements *StatementList) *Node {
-	switch kind {
-	case KindCaseClause, KindDefaultClause:
-	default:
-		panic("Invalid node kind for CaseOrDefaultClause")
-	}
-	data := &CaseOrDefaultClause{}
+func (f *NodeFactory) NewCaseClause(expression *Expression, statements *StatementList) *Node {
+	data := &CaseClause{}
 	data.Expression = expression
 	data.Statements = statements
-	return f.newNode(kind, data.AsNode())
+	return f.newNode(KindCaseClause, data.AsNode())
 }
 
-func (f *NodeFactory) UpdateCaseOrDefaultClause(node *CaseOrDefaultClause, expression *Expression, statements *StatementList) *Node {
+func (f *NodeFactory) UpdateCaseClause(node *CaseClause, expression *Expression, statements *StatementList) *Node {
 	if expression != node.Expression || statements != node.Statements {
-		return updateNode(f.NewCaseOrDefaultClause(node.Kind, expression, statements), node.AsNode(), f.hooks)
+		return updateNode(f.NewCaseClause(expression, statements), node.AsNode(), f.hooks)
 	}
 	return node.AsNode()
 }
 
-func (node *CaseOrDefaultClause) ForEachChild(v Visitor) bool {
+func (node *CaseClause) ForEachChild(v Visitor) bool {
 	return visit(v, node.Expression) || visitNodeList(v, node.Statements)
 }
 
-func (node *CaseOrDefaultClause) VisitEachChild(v *NodeVisitor) *Node {
-	return v.Factory.UpdateCaseOrDefaultClause(node, v.visitNode(node.Expression), v.visitNodes(node.Statements))
+func (node *CaseClause) VisitEachChild(v *NodeVisitor) *Node {
+	return v.Factory.UpdateCaseClause(node, v.visitNode(node.Expression), v.visitNodes(node.Statements))
 }
 
-func (node *CaseOrDefaultClause) Clone(f NodeFactoryCoercible) *Node {
-	return cloneNode(f.AsNodeFactory().NewCaseOrDefaultClause(node.Kind, node.Expression, node.Statements), node.AsNode(), f.AsNodeFactory().hooks)
+func (node *CaseClause) Clone(f NodeFactoryCoercible) *Node {
+	return cloneNode(f.AsNodeFactory().NewCaseClause(node.Expression, node.Statements), node.AsNode(), f.AsNodeFactory().hooks)
 }
 
-func (node *CaseOrDefaultClause) computeSubtreeFacts() SubtreeFacts {
+func (node *CaseClause) computeSubtreeFacts() SubtreeFacts {
 	return propagateSubtreeFacts(node.Expression) |
 		propagateNodeListSubtreeFacts(node.Statements, propagateSubtreeFacts)
 }
 
 func IsCaseClause(node *Node) bool {
 	return node.Kind == KindCaseClause
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// DefaultClause
+// ──────────────────────────────────────────────────────────────────────
+
+type DefaultClause struct {
+	CompositeBase
+	NodeBase
+	CaseOrDefaultClauseBase
+}
+
+func (f *NodeFactory) NewDefaultClause(statements *StatementList) *Node {
+	data := &DefaultClause{}
+	data.Statements = statements
+	return f.newNode(KindDefaultClause, data.AsNode())
+}
+
+func (f *NodeFactory) UpdateDefaultClause(node *DefaultClause, statements *StatementList) *Node {
+	if statements != node.Statements {
+		return updateNode(f.NewDefaultClause(statements), node.AsNode(), f.hooks)
+	}
+	return node.AsNode()
+}
+
+func (node *DefaultClause) ForEachChild(v Visitor) bool {
+	return visitNodeList(v, node.Statements)
+}
+
+func (node *DefaultClause) VisitEachChild(v *NodeVisitor) *Node {
+	return v.Factory.UpdateDefaultClause(node, v.visitNodes(node.Statements))
+}
+
+func (node *DefaultClause) Clone(f NodeFactoryCoercible) *Node {
+	return cloneNode(f.AsNodeFactory().NewDefaultClause(node.Statements), node.AsNode(), f.AsNodeFactory().hooks)
+}
+
+func (node *DefaultClause) computeSubtreeFacts() SubtreeFacts {
+	return propagateNodeListSubtreeFacts(node.Statements, propagateSubtreeFacts)
 }
 
 func IsDefaultClause(node *Node) bool {
@@ -1423,8 +1489,8 @@ func IsDefaultClause(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ThrowStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Expression *Expression
 }
 
@@ -1466,8 +1532,8 @@ func IsThrowStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TryStatement struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	TryBlock     *BlockNode
 	CatchClause  *CatchClauseNode // Optional
 	FinallyBlock *BlockNode       // Optional
@@ -1515,9 +1581,9 @@ func IsTryStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CatchClause struct {
+	CompositeBase
 	NodeBase
 	LocalsContainerBase
-	CompositeBase
 	VariableDeclaration *VariableDeclarationNode // Optional
 	Block               *BlockNode
 }
@@ -1665,9 +1731,9 @@ func IsExpressionStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type Block struct {
+	CompositeBase
 	StatementBase
 	LocalsContainerBase
-	CompositeBase
 	Statements *StatementList
 	MultiLine  bool
 }
@@ -1711,9 +1777,9 @@ func IsBlock(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableStatement struct {
+	CompositeBase
 	StatementBase
 	ModifiersBase
-	CompositeBase
 	DeclarationList *VariableDeclarationListNode
 }
 
@@ -1752,10 +1818,10 @@ func IsVariableStatement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableDeclaration struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	name             *BindingName
 	ExclamationToken *ExclamationToken // Optional
 	Type             *TypeNode         // Optional
@@ -1806,8 +1872,8 @@ func IsVariableDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type VariableDeclarationList struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Declarations *VariableDeclarationNodeList
 }
 
@@ -1847,8 +1913,8 @@ func IsVariableDeclarationList(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BindingPattern struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *BindingElementList
 }
 
@@ -1858,7 +1924,7 @@ func (f *NodeFactory) NewBindingPattern(kind Kind, elements *BindingElementList)
 	default:
 		panic("Invalid node kind for BindingPattern")
 	}
-	data := &BindingPattern{}
+	data := f.bindingPatternArena.New()
 	data.Elements = elements
 	return f.newNode(kind, data.AsNode())
 }
@@ -1895,10 +1961,10 @@ func IsArrayBindingPattern(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ParameterDeclaration struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	DotDotDotToken *DotDotDotToken // Optional
 	name           *BindingName
 	QuestionToken  *QuestionToken // Optional
@@ -1954,11 +2020,11 @@ func IsParameterDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BindingElement struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
 	FlowNodeBase
-	CompositeBase
 	DotDotDotToken *DotDotDotToken // Optional
 	PropertyName   *PropertyName   // Optional
 	name           *BindingName    // Optional
@@ -1966,7 +2032,7 @@ type BindingElement struct {
 }
 
 func (f *NodeFactory) NewBindingElement(dotDotDotToken *DotDotDotToken, propertyName *PropertyName, name *BindingName, initializer *Expression) *Node {
-	data := &BindingElement{}
+	data := f.bindingElementArena.New()
 	data.DotDotDotToken = dotDotDotToken
 	data.PropertyName = propertyName
 	data.name = name
@@ -2048,12 +2114,12 @@ func IsMissingDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type FunctionDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
-	CompositeBase
 	name           *IdentifierNode // Optional
 	ReturnFlowNode *FlowNode
 }
@@ -2212,8 +2278,8 @@ func IsClassExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type HeritageClause struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Token Kind
 	Types *HeritageClauseElementList
 }
@@ -2392,10 +2458,10 @@ func IsJSTypeAliasDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type EnumMember struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Initializer *Expression // Optional
 }
 
@@ -2438,11 +2504,11 @@ func IsEnumMember(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type EnumDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
-	CompositeBase
 	name    *IdentifierNode
 	Members *EnumMemberList
 }
@@ -2487,8 +2553,8 @@ func IsEnumDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ModuleBlock struct {
-	StatementBase
 	CompositeBase
+	StatementBase
 	Statements *StatementList
 }
 
@@ -2574,9 +2640,9 @@ func IsNotEmittedTypeElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportDeclaration struct {
+	CompositeBase
 	StatementBase
 	ModifiersBase
-	CompositeBase
 	DeclarationBase
 	ImportClause    *ImportClauseNode // Optional
 	ModuleSpecifier *Expression
@@ -2584,7 +2650,7 @@ type ImportDeclaration struct {
 }
 
 func (f *NodeFactory) NewImportDeclaration(modifiers *ModifierList, importClause *ImportClauseNode, moduleSpecifier *Expression, attributes *ImportAttributesNode) *Node {
-	data := &ImportDeclaration{}
+	data := f.importDeclarationArena.New()
 	data.modifiers = modifiers
 	data.ImportClause = importClause
 	data.ModuleSpecifier = moduleSpecifier
@@ -2593,7 +2659,7 @@ func (f *NodeFactory) NewImportDeclaration(modifiers *ModifierList, importClause
 }
 
 func (f *NodeFactory) NewJSImportDeclaration(modifiers *ModifierList, importClause *ImportClauseNode, moduleSpecifier *Expression, attributes *ImportAttributesNode) *Node {
-	data := &ImportDeclaration{}
+	data := f.importDeclarationArena.New()
 	data.modifiers = modifiers
 	data.ImportClause = importClause
 	data.ModuleSpecifier = moduleSpecifier
@@ -2747,13 +2813,13 @@ func IsNamespaceImport(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NamedImports struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *ImportSpecifierList
 }
 
 func (f *NodeFactory) NewNamedImports(elements *ImportSpecifierList) *Node {
-	data := &NamedImports{}
+	data := f.namedImportsArena.New()
 	data.Elements = elements
 	return f.newNode(KindNamedImports, data.AsNode())
 }
@@ -2790,12 +2856,12 @@ func IsNamedImports(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportAssignment struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	IsExportEquals bool
-	Type           *TypeNode
+	Type           *TypeNode // Optional
 	Expression     *Expression
 }
 
@@ -2929,8 +2995,8 @@ func IsNamespaceExport(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NamedExports struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Elements *ExportSpecifierList
 }
 
@@ -2972,10 +3038,10 @@ func IsNamedExports(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportSpecifier struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	IsTypeOnly   bool
 	PropertyName *ModuleExportName // Optional
 	name         *ModuleExportName
@@ -3108,11 +3174,11 @@ func IsConstructSignatureDeclaration(node *Node) bool {
 
 type ConstructorDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
-	CompositeBase
 	ReturnFlowNode *FlowNode
 }
 
@@ -3369,16 +3435,16 @@ func IsMethodSignatureDeclaration(node *Node) bool {
 type MethodDeclaration struct {
 	ClassElementBase
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 }
 
 func (f *NodeFactory) NewMethodDeclaration(modifiers *ModifierList, asteriskToken *AsteriskToken, name *PropertyName, postfixToken *TokenNode, typeParameters *TypeParameterList, parameters *ParameterList, typeNode *TypeNode, fullSignature *TypeNode, body *FunctionBody) *Node {
-	data := &MethodDeclaration{}
+	data := f.methodDeclarationArena.New()
 	data.modifiers = modifiers
 	data.AsteriskToken = asteriskToken
 	data.name = name
@@ -3436,8 +3502,8 @@ type PropertySignatureDeclaration struct {
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	Type        *TypeNode
-	Initializer *Expression
+	Type        *TypeNode   // Optional
+	Initializer *Expression // Optional
 }
 
 func (f *NodeFactory) NewPropertySignatureDeclaration(modifiers *ModifierList, name *PropertyName, postfixToken *TokenNode, typeNode *TypeNode, initializer *Expression) *Node {
@@ -3487,16 +3553,16 @@ func IsPropertySignatureDeclaration(node *Node) bool {
 
 type PropertyDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
 	Type        *TypeNode   // Optional
 	Initializer *Expression // Optional
 }
 
 func (f *NodeFactory) NewPropertyDeclaration(modifiers *ModifierList, name *PropertyName, postfixToken *TokenNode, typeNode *TypeNode, initializer *Expression) *Node {
-	data := &PropertyDeclaration{}
+	data := f.propertyDeclarationArena.New()
 	data.modifiers = modifiers
 	data.name = name
 	data.PostfixToken = postfixToken
@@ -3565,11 +3631,11 @@ func IsSemicolonClassElement(node *Node) bool {
 
 type ClassStaticBlockDeclaration struct {
 	ClassElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ModifiersBase
 	LocalsContainerBase
-	CompositeBase
 	Body           *BlockNode
 	ReturnFlowNode *FlowNode
 }
@@ -3783,10 +3849,10 @@ func IsNoSubstitutionTemplateLiteral(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type BinaryExpression struct {
+	CompositeBase
 	ExpressionBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	Left          *Expression
 	Type          *TypeNode // Optional
 	OperatorToken *BinaryOperatorToken
@@ -3963,17 +4029,20 @@ func IsYieldExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ArrowFunction struct {
+	CompositeBase
 	ExpressionBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 	EqualsGreaterThanToken *EqualsGreaterThanToken
 }
 
 func (f *NodeFactory) NewArrowFunction(modifiers *ModifierList, typeParameters *TypeParameterList, parameters *ParameterList, typeNode *TypeNode, fullSignature *TypeNode, equalsGreaterThanToken *EqualsGreaterThanToken, body *ConciseBody) *Node {
-	data := &ArrowFunction{}
+	if equalsGreaterThanToken == nil {
+		equalsGreaterThanToken = f.NewToken(KindEqualsGreaterThanToken)
+	}
+	data := f.arrowFunctionArena.New()
 	data.modifiers = modifiers
 	data.TypeParameters = typeParameters
 	data.Parameters = parameters
@@ -4018,12 +4087,12 @@ func IsArrowFunction(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type FunctionExpression struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
 	ModifiersBase
 	FunctionLikeWithBodyBase
 	FlowNodeBase
-	CompositeBase
 	name           *IdentifierNode // Optional
 	ReturnFlowNode *FlowNode
 }
@@ -4086,7 +4155,7 @@ type AsExpression struct {
 }
 
 func (f *NodeFactory) NewAsExpression(expression *Expression, typeNode *TypeNode) *Node {
-	data := &AsExpression{}
+	data := f.asExpressionArena.New()
 	data.Expression = expression
 	data.Type = typeNode
 	return f.newNode(KindAsExpression, data.AsNode())
@@ -4160,8 +4229,8 @@ func IsSatisfiesExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ConditionalExpression struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	Condition     *Expression
 	QuestionToken *QuestionToken
 	WhenTrue      *Expression
@@ -4219,9 +4288,9 @@ func IsConditionalExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type PropertyAccessExpression struct {
+	CompositeBase
 	MemberExpressionBase
 	FlowNodeBase
-	CompositeBase
 	Expression       *Expression
 	QuestionDotToken *QuestionDotToken // Optional
 	name             *MemberName
@@ -4269,9 +4338,9 @@ func IsPropertyAccessExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ElementAccessExpression struct {
+	CompositeBase
 	MemberExpressionBase
 	FlowNodeBase
-	CompositeBase
 	Expression         *Expression
 	QuestionDotToken   *QuestionDotToken // Optional
 	ArgumentExpression *Expression
@@ -4321,9 +4390,9 @@ func IsElementAccessExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type CallExpression struct {
+	CompositeBase
 	LeftHandSideExpressionBase
 	DeclarationBase
-	CompositeBase
 	Expression       *Expression
 	QuestionDotToken *QuestionDotToken // Optional
 	TypeArguments    *TypeList         // Optional
@@ -4372,8 +4441,8 @@ func IsCallExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type NewExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Expression    *Expression
 	TypeArguments *TypeList    // Optional
 	Arguments     *ElementList // Optional
@@ -4415,9 +4484,9 @@ func IsNewExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type MetaProperty struct {
+	CompositeBase
 	PrimaryExpressionBase
 	FlowNodeBase
-	CompositeBase
 	KeywordToken Kind
 	name         *IdentifierNode
 }
@@ -4539,14 +4608,14 @@ func IsSpreadElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TemplateExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Head          *TemplateHeadNode
 	TemplateSpans *TemplateSpanList
 }
 
 func (f *NodeFactory) NewTemplateExpression(head *TemplateHeadNode, templateSpans *TemplateSpanList) *Node {
-	data := &TemplateExpression{}
+	data := f.templateExpressionArena.New()
 	data.Head = head
 	data.TemplateSpans = templateSpans
 	return f.newNode(KindTemplateExpression, data.AsNode())
@@ -4591,7 +4660,7 @@ type TemplateSpan struct {
 }
 
 func (f *NodeFactory) NewTemplateSpan(expression *Expression, literal *TemplateMiddleOrTail) *Node {
-	data := &TemplateSpan{}
+	data := f.templateSpanArena.New()
 	data.Expression = expression
 	data.Literal = literal
 	return f.newNode(KindTemplateSpan, data.AsNode())
@@ -4630,11 +4699,11 @@ func IsTemplateSpan(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type TaggedTemplateExpression struct {
-	MemberExpressionBase
 	CompositeBase
+	MemberExpressionBase
 	Tag              *Expression
-	QuestionDotToken *QuestionDotToken
-	TypeArguments    *TypeList // Optional
+	QuestionDotToken *QuestionDotToken // Optional
+	TypeArguments    *TypeList         // Optional
 	Template         *TemplateLiteral
 }
 
@@ -4722,14 +4791,14 @@ func IsParenthesizedExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ArrayLiteralExpression struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	Elements  *ElementList
 	MultiLine bool
 }
 
 func (f *NodeFactory) NewArrayLiteralExpression(elements *ElementList, multiLine bool) *Node {
-	data := &ArrayLiteralExpression{}
+	data := f.arrayLiteralExpressionArena.New()
 	data.Elements = elements
 	data.MultiLine = multiLine
 	return f.newNode(KindArrayLiteralExpression, data.AsNode())
@@ -4767,15 +4836,15 @@ func IsArrayLiteralExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ObjectLiteralExpression struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
-	CompositeBase
 	Properties *NodeList
 	MultiLine  bool
 }
 
 func (f *NodeFactory) NewObjectLiteralExpression(properties *NodeList, multiLine bool) *Node {
-	data := &ObjectLiteralExpression{}
+	data := f.objectLiteralExpressionArena.New()
 	data.Properties = properties
 	data.MultiLine = multiLine
 	return f.newNode(KindObjectLiteralExpression, data.AsNode())
@@ -4854,11 +4923,11 @@ func IsSpreadAssignment(node *Node) bool {
 
 type PropertyAssignment struct {
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
-	Type        *TypeNode
+	Type        *TypeNode // Optional
 	Initializer *Expression
 }
 
@@ -4909,17 +4978,17 @@ func IsPropertyAssignment(node *Node) bool {
 
 type ShorthandPropertyAssignment struct {
 	ObjectLiteralElementBase
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	NamedMemberBase
-	CompositeBase
-	Type                        *TypeNode
+	Type                        *TypeNode    // Optional
 	EqualsToken                 *EqualsToken // Optional
 	ObjectAssignmentInitializer *Expression  // Optional
 }
 
 func (f *NodeFactory) NewShorthandPropertyAssignment(modifiers *ModifierList, name *PropertyName, postfixToken *TokenNode, typeNode *TypeNode, equalsToken *EqualsToken, objectAssignmentInitializer *Expression) *Node {
-	data := &ShorthandPropertyAssignment{}
+	data := f.shorthandPropertyAssignmentArena.New()
 	data.modifiers = modifiers
 	data.name = name
 	data.PostfixToken = postfixToken
@@ -5013,7 +5082,7 @@ type TypeOfExpression struct {
 }
 
 func (f *NodeFactory) NewTypeOfExpression(expression *Expression) *Node {
-	data := &TypeOfExpression{}
+	data := f.typeOfExpressionArena.New()
 	data.Expression = expression
 	return f.newNode(KindTypeOfExpression, data.AsNode())
 }
@@ -5097,7 +5166,7 @@ type AwaitExpression struct {
 }
 
 func (f *NodeFactory) NewAwaitExpression(expression *Expression) *Node {
-	data := &AwaitExpression{}
+	data := f.awaitExpressionArena.New()
 	data.Expression = expression
 	return f.newNode(KindAwaitExpression, data.AsNode())
 }
@@ -5283,7 +5352,7 @@ type ConditionalTypeNode struct {
 }
 
 func (f *NodeFactory) NewConditionalTypeNode(checkType *TypeNode, extendsType *TypeNode, trueType *TypeNode, falseType *TypeNode) *Node {
-	data := &ConditionalTypeNode{}
+	data := f.conditionalTypeNodeArena.New()
 	data.CheckType = checkType
 	data.ExtendsType = extendsType
 	data.TrueType = trueType
@@ -5367,7 +5436,7 @@ type InferTypeNode struct {
 }
 
 func (f *NodeFactory) NewInferTypeNode(typeParameter *TypeParameterDeclarationNode) *Node {
-	data := &InferTypeNode{}
+	data := f.inferTypeNodeArena.New()
 	data.TypeParameter = typeParameter
 	return f.newNode(KindInferType, data.AsNode())
 }
@@ -5517,8 +5586,8 @@ func IsTypeReferenceNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExpressionWithTypeArguments struct {
-	MemberExpressionBase
 	CompositeBase
+	MemberExpressionBase
 	Expression    *Expression
 	TypeArguments *TypeList // Optional
 }
@@ -5600,7 +5669,7 @@ type ThisTypeNode struct {
 }
 
 func (f *NodeFactory) NewThisTypeNode() *Node {
-	data := &ThisTypeNode{}
+	data := f.thisTypeNodeArena.New()
 	return f.newNode(KindThisType, data.AsNode())
 }
 
@@ -5659,8 +5728,8 @@ func IsTypePredicateNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportAttribute struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	name  *ImportAttributeName
 	Value *Expression
 }
@@ -5709,8 +5778,8 @@ func IsImportAttribute(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportAttributes struct {
-	NodeBase
 	CompositeBase
+	NodeBase
 	Token      Kind
 	Attributes *ImportAttributeList
 	MultiLine  bool
@@ -5761,7 +5830,7 @@ type TypeQueryNode struct {
 }
 
 func (f *NodeFactory) NewTypeQueryNode(exprName *EntityName, typeArguments *TypeList) *Node {
-	data := &TypeQueryNode{}
+	data := f.typeQueryNodeArena.New()
 	data.ExprName = exprName
 	data.TypeArguments = typeArguments
 	return f.newNode(KindTypeQuery, data.AsNode())
@@ -5894,7 +5963,7 @@ type TupleTypeNode struct {
 }
 
 func (f *NodeFactory) NewTupleTypeNode(elements *TypeList) *Node {
-	data := &TupleTypeNode{}
+	data := f.tupleTypeNodeArena.New()
 	data.Elements = elements
 	return f.newNode(KindTupleType, data.AsNode())
 }
@@ -6022,7 +6091,7 @@ type RestTypeNode struct {
 }
 
 func (f *NodeFactory) NewRestTypeNode(typeNode *TypeNode) *Node {
-	data := &RestTypeNode{}
+	data := f.restTypeNodeArena.New()
 	data.Type = typeNode
 	return f.newNode(KindRestType, data.AsNode())
 }
@@ -6180,7 +6249,7 @@ type TemplateHead struct {
 }
 
 func (f *NodeFactory) NewTemplateHead(text string, rawText string, templateFlags TokenFlags) *Node {
-	data := &TemplateHead{}
+	data := f.templateHeadArena.New()
 	data.Text = text
 	data.RawText = rawText
 	data.TemplateFlags = templateFlags & TokenFlagsTemplateLiteralLikeFlags
@@ -6206,7 +6275,7 @@ type TemplateMiddle struct {
 }
 
 func (f *NodeFactory) NewTemplateMiddle(text string, rawText string, templateFlags TokenFlags) *Node {
-	data := &TemplateMiddle{}
+	data := f.templateMiddleArena.New()
 	data.Text = text
 	data.RawText = rawText
 	data.TemplateFlags = templateFlags & TokenFlagsTemplateLiteralLikeFlags
@@ -6232,7 +6301,7 @@ type TemplateTail struct {
 }
 
 func (f *NodeFactory) NewTemplateTail(text string, rawText string, templateFlags TokenFlags) *Node {
-	data := &TemplateTail{}
+	data := f.templateTailArena.New()
 	data.Text = text
 	data.RawText = rawText
 	data.TemplateFlags = templateFlags & TokenFlagsTemplateLiteralLikeFlags
@@ -6259,7 +6328,7 @@ type TemplateLiteralTypeNode struct {
 }
 
 func (f *NodeFactory) NewTemplateLiteralTypeNode(head *TemplateHeadNode, templateSpans *TemplateLiteralTypeSpanList) *Node {
-	data := &TemplateLiteralTypeNode{}
+	data := f.templateLiteralTypeNodeArena.New()
 	data.Head = head
 	data.TemplateSpans = templateSpans
 	return f.newNode(KindTemplateLiteralType, data.AsNode())
@@ -6299,7 +6368,7 @@ type TemplateLiteralTypeSpan struct {
 }
 
 func (f *NodeFactory) NewTemplateLiteralTypeSpan(typeNode *TypeNode, literal *TemplateMiddleOrTail) *Node {
-	data := &TemplateLiteralTypeSpan{}
+	data := f.templateLiteralTypeSpanArena.New()
 	data.Type = typeNode
 	data.Literal = literal
 	return f.newNode(KindTemplateLiteralTypeSpan, data.AsNode())
@@ -6417,8 +6486,8 @@ func IsPartiallyEmittedExpression(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxElement struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	OpeningElement *JsxOpeningElementNode
 	Children       *JsxChildList
 	ClosingElement *JsxClosingElementNode
@@ -6460,9 +6529,9 @@ func IsJsxElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxAttributes struct {
+	CompositeBase
 	PrimaryExpressionBase
 	DeclarationBase
-	CompositeBase
 	Properties *JsxAttributeList
 }
 
@@ -6500,8 +6569,8 @@ func IsJsxAttributes(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxNamespacedName struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	Namespace *IdentifierNode
 	name      *IdentifierNode
 }
@@ -6545,8 +6614,8 @@ func IsJsxNamespacedName(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxOpeningElement struct {
-	ExpressionBase
 	CompositeBase
+	ExpressionBase
 	TagName       *JsxTagNameExpression
 	TypeArguments *TypeList // Optional
 	Attributes    *JsxAttributesNode
@@ -6588,8 +6657,8 @@ func IsJsxOpeningElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxSelfClosingElement struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	TagName       *JsxTagNameExpression
 	TypeArguments *TypeList // Optional
 	Attributes    *JsxAttributesNode
@@ -6631,8 +6700,8 @@ func IsJsxSelfClosingElement(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxFragment struct {
-	PrimaryExpressionBase
 	CompositeBase
+	PrimaryExpressionBase
 	OpeningFragment *JsxOpeningFragmentNode
 	Children        *JsxChildList
 	ClosingFragment *JsxClosingFragmentNode
@@ -6716,9 +6785,9 @@ func IsJsxClosingFragment(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type JsxAttribute struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
-	CompositeBase
 	name        *JsxAttributeName
 	Initializer *JsxAttributeValue // Optional
 }
@@ -7275,7 +7344,7 @@ func IsJSDocUnknownTag(node *Node) bool {
 
 type JSDocTemplateTag struct {
 	JSDocTagBase
-	Constraint     *Node
+	Constraint     *Node // Optional
 	TypeParameters *TypeParameterList
 }
 
@@ -7588,7 +7657,7 @@ func IsJSDocDeprecatedTag(node *Node) bool {
 
 type JSDocSeeTag struct {
 	JSDocTagBase
-	NameExpression *TypeNode
+	NameExpression *TypeNode // Optional
 }
 
 func (f *NodeFactory) NewJSDocSeeTag(tagName *IdentifierNode, nameExpression *TypeNode, comment *NodeList) *Node {
@@ -8105,13 +8174,13 @@ func IsSourceFile(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ModuleDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
 	LocalsContainerBase
 	BodyBase
-	CompositeBase
 	Keyword    Kind
 	name       *ModuleName
 	Attributes *TypeLiteralNodeNode // Optional
@@ -8162,11 +8231,11 @@ func IsModuleDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportEqualsDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ExportableBase
 	ModifiersBase
-	CompositeBase
 	IsTypeOnly      bool
 	name            *IdentifierNode
 	ModuleReference *ModuleReference
@@ -8213,10 +8282,10 @@ func IsImportEqualsDeclaration(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ExportDeclaration struct {
+	CompositeBase
 	StatementBase
 	DeclarationBase
 	ModifiersBase
-	CompositeBase
 	IsTypeOnly      bool
 	ExportClause    *NamedExportBindings  // Optional
 	ModuleSpecifier *Expression           // Optional
@@ -8272,7 +8341,7 @@ type ImportTypeNode struct {
 }
 
 func (f *NodeFactory) NewImportTypeNode(isTypeOf bool, argument *TypeNode, attributes *ImportAttributesNode, qualifier *EntityName, typeArguments *TypeList) *Node {
-	data := &ImportTypeNode{}
+	data := f.importTypeNodeArena.New()
 	data.IsTypeOf = isTypeOf
 	data.Argument = argument
 	data.Attributes = attributes
@@ -8312,17 +8381,17 @@ func IsImportTypeNode(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportClause struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	PhaseModifier ImportPhaseModifierSyntaxKind // Optional
 	name          *IdentifierNode               // Optional
 	NamedBindings *NamedImportBindings          // Optional
 }
 
 func (f *NodeFactory) NewImportClause(phaseModifier ImportPhaseModifierSyntaxKind, name *IdentifierNode, namedBindings *NamedImportBindings) *Node {
-	data := &ImportClause{}
+	data := f.importClauseArena.New()
 	data.PhaseModifier = phaseModifier
 	data.name = name
 	data.NamedBindings = namedBindings
@@ -8361,10 +8430,10 @@ func IsImportClause(node *Node) bool {
 // ──────────────────────────────────────────────────────────────────────
 
 type ImportSpecifier struct {
+	CompositeBase
 	NodeBase
 	DeclarationBase
 	ExportableBase
-	CompositeBase
 	IsTypeOnly   bool
 	PropertyName *ModuleExportName // Optional
 	name         *IdentifierNode
@@ -8810,9 +8879,12 @@ func (n *Node) ForEachChild(v Visitor) bool {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).ForEachChild(v)
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).ForEachChild(v)
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).ForEachChild(v)
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).ForEachChild(v)
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).ForEachChild(v)
@@ -9322,9 +9394,12 @@ func (n *Node) VisitEachChild(v *NodeVisitor) *Node {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).VisitEachChild(v)
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).VisitEachChild(v)
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).VisitEachChild(v)
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).VisitEachChild(v)
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).VisitEachChild(v)
@@ -9881,9 +9956,12 @@ func (n *Node) Clone(f NodeFactoryCoercible) *Node {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).Clone(f)
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).Clone(f)
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).Clone(f)
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).Clone(f)
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).Clone(f)
@@ -10453,9 +10531,12 @@ func (n *Node) SubtreeFacts() SubtreeFacts {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).subtreeFactsWorker(n)
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).subtreeFactsWorker(n)
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).subtreeFactsWorker(n)
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).subtreeFactsWorker(n)
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).subtreeFactsWorker(n)
@@ -10933,9 +11014,12 @@ func (n *Node) computeSubtreeFacts() SubtreeFacts {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).computeSubtreeFacts()
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).computeSubtreeFacts()
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).computeSubtreeFacts()
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).computeSubtreeFacts()
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).computeSubtreeFacts()
@@ -11516,9 +11600,12 @@ func (n *Node) propagateSubtreeFacts() SubtreeFacts {
 	case KindCaseBlock:
 		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
 		return (*CaseBlock)(unsafe.Pointer(n)).propagateSubtreeFacts()
-	case KindCaseClause, KindDefaultClause:
-		// SAFETY: This case only matches kinds allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-		return (*CaseOrDefaultClause)(unsafe.Pointer(n)).propagateSubtreeFacts()
+	case KindCaseClause:
+		// SAFETY: This case only matches kinds allocated as a CaseClause, which embeds its Node header at offset zero.
+		return (*CaseClause)(unsafe.Pointer(n)).propagateSubtreeFacts()
+	case KindDefaultClause:
+		// SAFETY: This case only matches kinds allocated as a DefaultClause, which embeds its Node header at offset zero.
+		return (*DefaultClause)(unsafe.Pointer(n)).propagateSubtreeFacts()
 	case KindThrowStatement:
 		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
 		return (*ThrowStatement)(unsafe.Pointer(n)).propagateSubtreeFacts()
@@ -12014,807 +12101,307 @@ func (n *Node) propagateSubtreeFacts() SubtreeFacts {
 // Node accessor dispatch
 // ──────────────────────────────────────────────────────────────────────
 
+var nodeCaseOrDefaultClauseDataDispatch = [kindFlowReduceLabelData + 1]uint8{
+	KindCaseClause:    uint8(unsafe.Offsetof(CaseClause{}.CaseOrDefaultClauseBase)),
+	KindDefaultClause: uint8(unsafe.Offsetof(DefaultClause{}.CaseOrDefaultClauseBase)),
+}
+
+func (n *Node) CaseOrDefaultClauseData() *CaseOrDefaultClauseBase {
+	if offset := nodeCaseOrDefaultClauseDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeCaseOrDefaultClauseDataDispatch stores the byte offset of CaseOrDefaultClauseBase within the concrete node struct for n.Kind.
+		return (*CaseOrDefaultClauseBase)(unsafe.Add(unsafe.Pointer(n), offset))
+	}
+	return nil
+}
+
 var nodeFlowNodeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindIdentifier:                 1,
-	KindQualifiedName:              2,
-	KindEmptyStatement:             3,
-	KindIfStatement:                4,
-	KindDoStatement:                5,
-	KindWhileStatement:             6,
-	KindForStatement:               7,
-	KindForInStatement:             8,
-	KindForOfStatement:             8,
-	KindBreakStatement:             9,
-	KindContinueStatement:          10,
-	KindReturnStatement:            11,
-	KindWithStatement:              12,
-	KindSwitchStatement:            13,
-	KindThrowStatement:             14,
-	KindTryStatement:               15,
-	KindDebuggerStatement:          16,
-	KindLabeledStatement:           17,
-	KindExpressionStatement:        18,
-	KindBlock:                      19,
-	KindVariableStatement:          20,
-	KindBindingElement:             21,
-	KindMissingDeclaration:         22,
-	KindFunctionDeclaration:        23,
-	KindClassDeclaration:           24,
-	KindInterfaceDeclaration:       25,
-	KindTypeAliasDeclaration:       26,
-	KindJSTypeAliasDeclaration:     26,
-	KindEnumDeclaration:            27,
-	KindModuleBlock:                28,
-	KindNotEmittedStatement:        29,
-	KindImportDeclaration:          30,
-	KindJSImportDeclaration:        30,
-	KindExportAssignment:           31,
-	KindNamespaceExportDeclaration: 32,
-	KindGetAccessor:                33,
-	KindSetAccessor:                34,
-	KindMethodDeclaration:          35,
-	KindNullKeyword:                36,
-	KindTrueKeyword:                36,
-	KindFalseKeyword:               36,
-	KindThisKeyword:                36,
-	KindSuperKeyword:               36,
-	KindImportKeyword:              36,
-	KindArrowFunction:              37,
-	KindFunctionExpression:         38,
-	KindPropertyAccessExpression:   39,
-	KindElementAccessExpression:    40,
-	KindMetaProperty:               41,
-	KindModuleDeclaration:          42,
-	KindImportEqualsDeclaration:    43,
-	KindExportDeclaration:          44,
+	KindIdentifier:                 uint8(unsafe.Offsetof(Identifier{}.FlowNodeBase)),
+	KindQualifiedName:              uint8(unsafe.Offsetof(QualifiedName{}.FlowNodeBase)),
+	KindEmptyStatement:             uint8(unsafe.Offsetof(EmptyStatement{}.FlowNodeBase)),
+	KindIfStatement:                uint8(unsafe.Offsetof(IfStatement{}.FlowNodeBase)),
+	KindDoStatement:                uint8(unsafe.Offsetof(DoStatement{}.FlowNodeBase)),
+	KindWhileStatement:             uint8(unsafe.Offsetof(WhileStatement{}.FlowNodeBase)),
+	KindForStatement:               uint8(unsafe.Offsetof(ForStatement{}.FlowNodeBase)),
+	KindForInStatement:             uint8(unsafe.Offsetof(ForInOrOfStatement{}.FlowNodeBase)),
+	KindForOfStatement:             uint8(unsafe.Offsetof(ForInOrOfStatement{}.FlowNodeBase)),
+	KindBreakStatement:             uint8(unsafe.Offsetof(BreakStatement{}.FlowNodeBase)),
+	KindContinueStatement:          uint8(unsafe.Offsetof(ContinueStatement{}.FlowNodeBase)),
+	KindReturnStatement:            uint8(unsafe.Offsetof(ReturnStatement{}.FlowNodeBase)),
+	KindWithStatement:              uint8(unsafe.Offsetof(WithStatement{}.FlowNodeBase)),
+	KindSwitchStatement:            uint8(unsafe.Offsetof(SwitchStatement{}.FlowNodeBase)),
+	KindThrowStatement:             uint8(unsafe.Offsetof(ThrowStatement{}.FlowNodeBase)),
+	KindTryStatement:               uint8(unsafe.Offsetof(TryStatement{}.FlowNodeBase)),
+	KindDebuggerStatement:          uint8(unsafe.Offsetof(DebuggerStatement{}.FlowNodeBase)),
+	KindLabeledStatement:           uint8(unsafe.Offsetof(LabeledStatement{}.FlowNodeBase)),
+	KindExpressionStatement:        uint8(unsafe.Offsetof(ExpressionStatement{}.FlowNodeBase)),
+	KindBlock:                      uint8(unsafe.Offsetof(Block{}.FlowNodeBase)),
+	KindVariableStatement:          uint8(unsafe.Offsetof(VariableStatement{}.FlowNodeBase)),
+	KindBindingElement:             uint8(unsafe.Offsetof(BindingElement{}.FlowNodeBase)),
+	KindMissingDeclaration:         uint8(unsafe.Offsetof(MissingDeclaration{}.FlowNodeBase)),
+	KindFunctionDeclaration:        uint8(unsafe.Offsetof(FunctionDeclaration{}.FlowNodeBase)),
+	KindClassDeclaration:           uint8(unsafe.Offsetof(ClassDeclaration{}.FlowNodeBase)),
+	KindInterfaceDeclaration:       uint8(unsafe.Offsetof(InterfaceDeclaration{}.FlowNodeBase)),
+	KindTypeAliasDeclaration:       uint8(unsafe.Offsetof(TypeAliasDeclaration{}.FlowNodeBase)),
+	KindJSTypeAliasDeclaration:     uint8(unsafe.Offsetof(TypeAliasDeclaration{}.FlowNodeBase)),
+	KindEnumDeclaration:            uint8(unsafe.Offsetof(EnumDeclaration{}.FlowNodeBase)),
+	KindModuleBlock:                uint8(unsafe.Offsetof(ModuleBlock{}.FlowNodeBase)),
+	KindNotEmittedStatement:        uint8(unsafe.Offsetof(NotEmittedStatement{}.FlowNodeBase)),
+	KindImportDeclaration:          uint8(unsafe.Offsetof(ImportDeclaration{}.FlowNodeBase)),
+	KindJSImportDeclaration:        uint8(unsafe.Offsetof(ImportDeclaration{}.FlowNodeBase)),
+	KindExportAssignment:           uint8(unsafe.Offsetof(ExportAssignment{}.FlowNodeBase)),
+	KindNamespaceExportDeclaration: uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.FlowNodeBase)),
+	KindGetAccessor:                uint8(unsafe.Offsetof(GetAccessorDeclaration{}.FlowNodeBase)),
+	KindSetAccessor:                uint8(unsafe.Offsetof(SetAccessorDeclaration{}.FlowNodeBase)),
+	KindMethodDeclaration:          uint8(unsafe.Offsetof(MethodDeclaration{}.FlowNodeBase)),
+	KindNullKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindTrueKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindFalseKeyword:               uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindThisKeyword:                uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindSuperKeyword:               uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindImportKeyword:              uint8(unsafe.Offsetof(KeywordExpression{}.FlowNodeBase)),
+	KindArrowFunction:              uint8(unsafe.Offsetof(ArrowFunction{}.FlowNodeBase)),
+	KindFunctionExpression:         uint8(unsafe.Offsetof(FunctionExpression{}.FlowNodeBase)),
+	KindPropertyAccessExpression:   uint8(unsafe.Offsetof(PropertyAccessExpression{}.FlowNodeBase)),
+	KindElementAccessExpression:    uint8(unsafe.Offsetof(ElementAccessExpression{}.FlowNodeBase)),
+	KindMetaProperty:               uint8(unsafe.Offsetof(MetaProperty{}.FlowNodeBase)),
+	KindModuleDeclaration:          uint8(unsafe.Offsetof(ModuleDeclaration{}.FlowNodeBase)),
+	KindImportEqualsDeclaration:    uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.FlowNodeBase)),
+	KindExportDeclaration:          uint8(unsafe.Offsetof(ExportDeclaration{}.FlowNodeBase)),
 }
 
 func (n *Node) FlowNodeData() *FlowNodeBase {
-	switch nodeFlowNodeDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a Identifier, which embeds its Node header at offset zero.
-		return (*Identifier)(unsafe.Pointer(n)).FlowNodeData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a QualifiedName, which embeds its Node header at offset zero.
-		return (*QualifiedName)(unsafe.Pointer(n)).FlowNodeData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a EmptyStatement, which embeds its Node header at offset zero.
-		return (*EmptyStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a IfStatement, which embeds its Node header at offset zero.
-		return (*IfStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a DoStatement, which embeds its Node header at offset zero.
-		return (*DoStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a WhileStatement, which embeds its Node header at offset zero.
-		return (*WhileStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a ForStatement, which embeds its Node header at offset zero.
-		return (*ForStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a ForInOrOfStatement, which embeds its Node header at offset zero.
-		return (*ForInOrOfStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a BreakStatement, which embeds its Node header at offset zero.
-		return (*BreakStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a ContinueStatement, which embeds its Node header at offset zero.
-		return (*ContinueStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a ReturnStatement, which embeds its Node header at offset zero.
-		return (*ReturnStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a WithStatement, which embeds its Node header at offset zero.
-		return (*WithStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a SwitchStatement, which embeds its Node header at offset zero.
-		return (*SwitchStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a ThrowStatement, which embeds its Node header at offset zero.
-		return (*ThrowStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 15:
-		// SAFETY: This case only matches kinds allocated as a TryStatement, which embeds its Node header at offset zero.
-		return (*TryStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 16:
-		// SAFETY: This case only matches kinds allocated as a DebuggerStatement, which embeds its Node header at offset zero.
-		return (*DebuggerStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 17:
-		// SAFETY: This case only matches kinds allocated as a LabeledStatement, which embeds its Node header at offset zero.
-		return (*LabeledStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 18:
-		// SAFETY: This case only matches kinds allocated as a ExpressionStatement, which embeds its Node header at offset zero.
-		return (*ExpressionStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 19:
-		// SAFETY: This case only matches kinds allocated as a Block, which embeds its Node header at offset zero.
-		return (*Block)(unsafe.Pointer(n)).FlowNodeData()
-	case 20:
-		// SAFETY: This case only matches kinds allocated as a VariableStatement, which embeds its Node header at offset zero.
-		return (*VariableStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 21:
-		// SAFETY: This case only matches kinds allocated as a BindingElement, which embeds its Node header at offset zero.
-		return (*BindingElement)(unsafe.Pointer(n)).FlowNodeData()
-	case 22:
-		// SAFETY: This case only matches kinds allocated as a MissingDeclaration, which embeds its Node header at offset zero.
-		return (*MissingDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 23:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 24:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 25:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 26:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 27:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		return (*EnumDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 28:
-		// SAFETY: This case only matches kinds allocated as a ModuleBlock, which embeds its Node header at offset zero.
-		return (*ModuleBlock)(unsafe.Pointer(n)).FlowNodeData()
-	case 29:
-		// SAFETY: This case only matches kinds allocated as a NotEmittedStatement, which embeds its Node header at offset zero.
-		return (*NotEmittedStatement)(unsafe.Pointer(n)).FlowNodeData()
-	case 30:
-		// SAFETY: This case only matches kinds allocated as a ImportDeclaration, which embeds its Node header at offset zero.
-		return (*ImportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 31:
-		// SAFETY: This case only matches kinds allocated as a ExportAssignment, which embeds its Node header at offset zero.
-		return (*ExportAssignment)(unsafe.Pointer(n)).FlowNodeData()
-	case 32:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExportDeclaration, which embeds its Node header at offset zero.
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 33:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 34:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 35:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 36:
-		// SAFETY: This case only matches kinds allocated as a KeywordExpression, which embeds its Node header at offset zero.
-		return (*KeywordExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 37:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).FlowNodeData()
-	case 38:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 39:
-		// SAFETY: This case only matches kinds allocated as a PropertyAccessExpression, which embeds its Node header at offset zero.
-		return (*PropertyAccessExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 40:
-		// SAFETY: This case only matches kinds allocated as a ElementAccessExpression, which embeds its Node header at offset zero.
-		return (*ElementAccessExpression)(unsafe.Pointer(n)).FlowNodeData()
-	case 41:
-		// SAFETY: This case only matches kinds allocated as a MetaProperty, which embeds its Node header at offset zero.
-		return (*MetaProperty)(unsafe.Pointer(n)).FlowNodeData()
-	case 42:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 43:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	case 44:
-		// SAFETY: This case only matches kinds allocated as a ExportDeclaration, which embeds its Node header at offset zero.
-		return (*ExportDeclaration)(unsafe.Pointer(n)).FlowNodeData()
-	default:
-		return nil
+	if offset := nodeFlowNodeDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeFlowNodeDataDispatch stores the byte offset of FlowNodeBase within the concrete node struct for n.Kind.
+		return (*FlowNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeDeclarationDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:           1,
-	KindParameter:                     2,
-	KindBindingElement:                3,
-	KindMissingDeclaration:            4,
-	KindFunctionDeclaration:           5,
-	KindClassDeclaration:              6,
-	KindClassExpression:               7,
-	KindInterfaceDeclaration:          8,
-	KindTypeAliasDeclaration:          9,
-	KindJSTypeAliasDeclaration:        9,
-	KindEnumMember:                    10,
-	KindEnumDeclaration:               11,
-	KindNotEmittedTypeElement:         12,
-	KindImportDeclaration:             13,
-	KindJSImportDeclaration:           13,
-	KindNamespaceImport:               14,
-	KindExportAssignment:              15,
-	KindNamespaceExportDeclaration:    16,
-	KindNamespaceExport:               17,
-	KindExportSpecifier:               18,
-	KindCallSignature:                 19,
-	KindConstructSignature:            20,
-	KindConstructor:                   21,
-	KindGetAccessor:                   22,
-	KindSetAccessor:                   23,
-	KindIndexSignature:                24,
-	KindMethodSignature:               25,
-	KindMethodDeclaration:             26,
-	KindPropertySignature:             27,
-	KindPropertyDeclaration:           28,
-	KindSemicolonClassElement:         29,
-	KindClassStaticBlockDeclaration:   30,
-	KindNoSubstitutionTemplateLiteral: 31,
-	KindBinaryExpression:              32,
-	KindArrowFunction:                 33,
-	KindFunctionExpression:            34,
-	KindCallExpression:                35,
-	KindObjectLiteralExpression:       36,
-	KindSpreadAssignment:              37,
-	KindPropertyAssignment:            38,
-	KindShorthandPropertyAssignment:   39,
-	KindMappedType:                    40,
-	KindTypeLiteral:                   41,
-	KindNamedTupleMember:              42,
-	KindFunctionType:                  43,
-	KindConstructorType:               44,
-	KindJsxAttributes:                 45,
-	KindJsxAttribute:                  46,
-	KindJsxSpreadAttribute:            47,
-	KindJSDocSignature:                48,
-	KindSourceFile:                    49,
-	KindModuleDeclaration:             50,
-	KindImportEqualsDeclaration:       51,
-	KindExportDeclaration:             52,
-	KindImportClause:                  53,
-	KindImportSpecifier:               54,
-	KindTypeParameter:                 55,
-	KindJSDocTypeLiteral:              56,
+	KindVariableDeclaration:           uint8(unsafe.Offsetof(VariableDeclaration{}.DeclarationBase)),
+	KindParameter:                     uint8(unsafe.Offsetof(ParameterDeclaration{}.DeclarationBase)),
+	KindBindingElement:                uint8(unsafe.Offsetof(BindingElement{}.DeclarationBase)),
+	KindMissingDeclaration:            uint8(unsafe.Offsetof(MissingDeclaration{}.DeclarationBase)),
+	KindFunctionDeclaration:           uint8(unsafe.Offsetof(FunctionDeclaration{}.DeclarationBase)),
+	KindClassDeclaration:              uint8(unsafe.Offsetof(ClassDeclaration{}.DeclarationBase)),
+	KindClassExpression:               uint8(unsafe.Offsetof(ClassExpression{}.DeclarationBase)),
+	KindInterfaceDeclaration:          uint8(unsafe.Offsetof(InterfaceDeclaration{}.DeclarationBase)),
+	KindTypeAliasDeclaration:          uint8(unsafe.Offsetof(TypeAliasDeclaration{}.DeclarationBase)),
+	KindJSTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.DeclarationBase)),
+	KindEnumMember:                    uint8(unsafe.Offsetof(EnumMember{}.DeclarationBase)),
+	KindEnumDeclaration:               uint8(unsafe.Offsetof(EnumDeclaration{}.DeclarationBase)),
+	KindNotEmittedTypeElement:         uint8(unsafe.Offsetof(NotEmittedTypeElement{}.DeclarationBase)),
+	KindImportDeclaration:             uint8(unsafe.Offsetof(ImportDeclaration{}.DeclarationBase)),
+	KindJSImportDeclaration:           uint8(unsafe.Offsetof(ImportDeclaration{}.DeclarationBase)),
+	KindNamespaceImport:               uint8(unsafe.Offsetof(NamespaceImport{}.DeclarationBase)),
+	KindExportAssignment:              uint8(unsafe.Offsetof(ExportAssignment{}.DeclarationBase)),
+	KindNamespaceExportDeclaration:    uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.DeclarationBase)),
+	KindNamespaceExport:               uint8(unsafe.Offsetof(NamespaceExport{}.DeclarationBase)),
+	KindExportSpecifier:               uint8(unsafe.Offsetof(ExportSpecifier{}.DeclarationBase)),
+	KindCallSignature:                 uint8(unsafe.Offsetof(CallSignatureDeclaration{}.DeclarationBase)),
+	KindConstructSignature:            uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.DeclarationBase)),
+	KindConstructor:                   uint8(unsafe.Offsetof(ConstructorDeclaration{}.DeclarationBase)),
+	KindGetAccessor:                   uint8(unsafe.Offsetof(GetAccessorDeclaration{}.DeclarationBase)),
+	KindSetAccessor:                   uint8(unsafe.Offsetof(SetAccessorDeclaration{}.DeclarationBase)),
+	KindIndexSignature:                uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.DeclarationBase)),
+	KindMethodSignature:               uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.DeclarationBase)),
+	KindMethodDeclaration:             uint8(unsafe.Offsetof(MethodDeclaration{}.DeclarationBase)),
+	KindPropertySignature:             uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.DeclarationBase)),
+	KindPropertyDeclaration:           uint8(unsafe.Offsetof(PropertyDeclaration{}.DeclarationBase)),
+	KindSemicolonClassElement:         uint8(unsafe.Offsetof(SemicolonClassElement{}.DeclarationBase)),
+	KindClassStaticBlockDeclaration:   uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.DeclarationBase)),
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.DeclarationBase)),
+	KindBinaryExpression:              uint8(unsafe.Offsetof(BinaryExpression{}.DeclarationBase)),
+	KindArrowFunction:                 uint8(unsafe.Offsetof(ArrowFunction{}.DeclarationBase)),
+	KindFunctionExpression:            uint8(unsafe.Offsetof(FunctionExpression{}.DeclarationBase)),
+	KindCallExpression:                uint8(unsafe.Offsetof(CallExpression{}.DeclarationBase)),
+	KindObjectLiteralExpression:       uint8(unsafe.Offsetof(ObjectLiteralExpression{}.DeclarationBase)),
+	KindSpreadAssignment:              uint8(unsafe.Offsetof(SpreadAssignment{}.DeclarationBase)),
+	KindPropertyAssignment:            uint8(unsafe.Offsetof(PropertyAssignment{}.DeclarationBase)),
+	KindShorthandPropertyAssignment:   uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.DeclarationBase)),
+	KindMappedType:                    uint8(unsafe.Offsetof(MappedTypeNode{}.DeclarationBase)),
+	KindTypeLiteral:                   uint8(unsafe.Offsetof(TypeLiteralNode{}.DeclarationBase)),
+	KindNamedTupleMember:              uint8(unsafe.Offsetof(NamedTupleMember{}.DeclarationBase)),
+	KindFunctionType:                  uint8(unsafe.Offsetof(FunctionTypeNode{}.DeclarationBase)),
+	KindConstructorType:               uint8(unsafe.Offsetof(ConstructorTypeNode{}.DeclarationBase)),
+	KindJsxAttributes:                 uint8(unsafe.Offsetof(JsxAttributes{}.DeclarationBase)),
+	KindJsxAttribute:                  uint8(unsafe.Offsetof(JsxAttribute{}.DeclarationBase)),
+	KindJsxSpreadAttribute:            uint8(unsafe.Offsetof(JsxSpreadAttribute{}.DeclarationBase)),
+	KindJSDocSignature:                uint8(unsafe.Offsetof(JSDocSignature{}.DeclarationBase)),
+	KindSourceFile:                    uint8(unsafe.Offsetof(SourceFile{}.DeclarationBase)),
+	KindModuleDeclaration:             uint8(unsafe.Offsetof(ModuleDeclaration{}.DeclarationBase)),
+	KindImportEqualsDeclaration:       uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.DeclarationBase)),
+	KindExportDeclaration:             uint8(unsafe.Offsetof(ExportDeclaration{}.DeclarationBase)),
+	KindImportClause:                  uint8(unsafe.Offsetof(ImportClause{}.DeclarationBase)),
+	KindImportSpecifier:               uint8(unsafe.Offsetof(ImportSpecifier{}.DeclarationBase)),
+	KindTypeParameter:                 uint8(unsafe.Offsetof(TypeParameterDeclaration{}.DeclarationBase)),
+	KindJSDocTypeLiteral:              uint8(unsafe.Offsetof(JSDocTypeLiteral{}.DeclarationBase)),
 }
 
 func (n *Node) DeclarationData() *DeclarationBase {
-	switch nodeDeclarationDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a VariableDeclaration, which embeds its Node header at offset zero.
-		return (*VariableDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a ParameterDeclaration, which embeds its Node header at offset zero.
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a BindingElement, which embeds its Node header at offset zero.
-		return (*BindingElement)(unsafe.Pointer(n)).DeclarationData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a MissingDeclaration, which embeds its Node header at offset zero.
-		return (*MissingDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a EnumMember, which embeds its Node header at offset zero.
-		return (*EnumMember)(unsafe.Pointer(n)).DeclarationData()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		return (*EnumDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a NotEmittedTypeElement, which embeds its Node header at offset zero.
-		return (*NotEmittedTypeElement)(unsafe.Pointer(n)).DeclarationData()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a ImportDeclaration, which embeds its Node header at offset zero.
-		return (*ImportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a NamespaceImport, which embeds its Node header at offset zero.
-		return (*NamespaceImport)(unsafe.Pointer(n)).DeclarationData()
-	case 15:
-		// SAFETY: This case only matches kinds allocated as a ExportAssignment, which embeds its Node header at offset zero.
-		return (*ExportAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 16:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExportDeclaration, which embeds its Node header at offset zero.
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 17:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExport, which embeds its Node header at offset zero.
-		return (*NamespaceExport)(unsafe.Pointer(n)).DeclarationData()
-	case 18:
-		// SAFETY: This case only matches kinds allocated as a ExportSpecifier, which embeds its Node header at offset zero.
-		return (*ExportSpecifier)(unsafe.Pointer(n)).DeclarationData()
-	case 19:
-		// SAFETY: This case only matches kinds allocated as a CallSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 20:
-		// SAFETY: This case only matches kinds allocated as a ConstructSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 21:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 22:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 23:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 24:
-		// SAFETY: This case only matches kinds allocated as a IndexSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 25:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 26:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 27:
-		// SAFETY: This case only matches kinds allocated as a PropertySignatureDeclaration, which embeds its Node header at offset zero.
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 28:
-		// SAFETY: This case only matches kinds allocated as a PropertyDeclaration, which embeds its Node header at offset zero.
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 29:
-		// SAFETY: This case only matches kinds allocated as a SemicolonClassElement, which embeds its Node header at offset zero.
-		return (*SemicolonClassElement)(unsafe.Pointer(n)).DeclarationData()
-	case 30:
-		// SAFETY: This case only matches kinds allocated as a ClassStaticBlockDeclaration, which embeds its Node header at offset zero.
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 31:
-		// SAFETY: This case only matches kinds allocated as a NoSubstitutionTemplateLiteral, which embeds its Node header at offset zero.
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).DeclarationData()
-	case 32:
-		// SAFETY: This case only matches kinds allocated as a BinaryExpression, which embeds its Node header at offset zero.
-		return (*BinaryExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 33:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).DeclarationData()
-	case 34:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 35:
-		// SAFETY: This case only matches kinds allocated as a CallExpression, which embeds its Node header at offset zero.
-		return (*CallExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 36:
-		// SAFETY: This case only matches kinds allocated as a ObjectLiteralExpression, which embeds its Node header at offset zero.
-		return (*ObjectLiteralExpression)(unsafe.Pointer(n)).DeclarationData()
-	case 37:
-		// SAFETY: This case only matches kinds allocated as a SpreadAssignment, which embeds its Node header at offset zero.
-		return (*SpreadAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 38:
-		// SAFETY: This case only matches kinds allocated as a PropertyAssignment, which embeds its Node header at offset zero.
-		return (*PropertyAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 39:
-		// SAFETY: This case only matches kinds allocated as a ShorthandPropertyAssignment, which embeds its Node header at offset zero.
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).DeclarationData()
-	case 40:
-		// SAFETY: This case only matches kinds allocated as a MappedTypeNode, which embeds its Node header at offset zero.
-		return (*MappedTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 41:
-		// SAFETY: This case only matches kinds allocated as a TypeLiteralNode, which embeds its Node header at offset zero.
-		return (*TypeLiteralNode)(unsafe.Pointer(n)).DeclarationData()
-	case 42:
-		// SAFETY: This case only matches kinds allocated as a NamedTupleMember, which embeds its Node header at offset zero.
-		return (*NamedTupleMember)(unsafe.Pointer(n)).DeclarationData()
-	case 43:
-		// SAFETY: This case only matches kinds allocated as a FunctionTypeNode, which embeds its Node header at offset zero.
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 44:
-		// SAFETY: This case only matches kinds allocated as a ConstructorTypeNode, which embeds its Node header at offset zero.
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).DeclarationData()
-	case 45:
-		// SAFETY: This case only matches kinds allocated as a JsxAttributes, which embeds its Node header at offset zero.
-		return (*JsxAttributes)(unsafe.Pointer(n)).DeclarationData()
-	case 46:
-		// SAFETY: This case only matches kinds allocated as a JsxAttribute, which embeds its Node header at offset zero.
-		return (*JsxAttribute)(unsafe.Pointer(n)).DeclarationData()
-	case 47:
-		// SAFETY: This case only matches kinds allocated as a JsxSpreadAttribute, which embeds its Node header at offset zero.
-		return (*JsxSpreadAttribute)(unsafe.Pointer(n)).DeclarationData()
-	case 48:
-		// SAFETY: This case only matches kinds allocated as a JSDocSignature, which embeds its Node header at offset zero.
-		return (*JSDocSignature)(unsafe.Pointer(n)).DeclarationData()
-	case 49:
-		// SAFETY: This case only matches kinds allocated as a SourceFile, which embeds its Node header at offset zero.
-		return (*SourceFile)(unsafe.Pointer(n)).DeclarationData()
-	case 50:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 51:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 52:
-		// SAFETY: This case only matches kinds allocated as a ExportDeclaration, which embeds its Node header at offset zero.
-		return (*ExportDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 53:
-		// SAFETY: This case only matches kinds allocated as a ImportClause, which embeds its Node header at offset zero.
-		return (*ImportClause)(unsafe.Pointer(n)).DeclarationData()
-	case 54:
-		// SAFETY: This case only matches kinds allocated as a ImportSpecifier, which embeds its Node header at offset zero.
-		return (*ImportSpecifier)(unsafe.Pointer(n)).DeclarationData()
-	case 55:
-		// SAFETY: This case only matches kinds allocated as a TypeParameterDeclaration, which embeds its Node header at offset zero.
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).DeclarationData()
-	case 56:
-		// SAFETY: This case only matches kinds allocated as a JSDocTypeLiteral, which embeds its Node header at offset zero.
-		return (*JSDocTypeLiteral)(unsafe.Pointer(n)).DeclarationData()
-	default:
-		return nil
+	if offset := nodeDeclarationDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeDeclarationDataDispatch stores the byte offset of DeclarationBase within the concrete node struct for n.Kind.
+		return (*DeclarationBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeExportableDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:     1,
-	KindBindingElement:          2,
-	KindFunctionDeclaration:     3,
-	KindClassDeclaration:        4,
-	KindClassExpression:         5,
-	KindInterfaceDeclaration:    6,
-	KindTypeAliasDeclaration:    7,
-	KindJSTypeAliasDeclaration:  7,
-	KindEnumDeclaration:         8,
-	KindNamespaceImport:         9,
-	KindExportSpecifier:         10,
-	KindModuleDeclaration:       11,
-	KindImportEqualsDeclaration: 12,
-	KindImportClause:            13,
-	KindImportSpecifier:         14,
+	KindVariableDeclaration:     uint8(unsafe.Offsetof(VariableDeclaration{}.ExportableBase)),
+	KindBindingElement:          uint8(unsafe.Offsetof(BindingElement{}.ExportableBase)),
+	KindFunctionDeclaration:     uint8(unsafe.Offsetof(FunctionDeclaration{}.ExportableBase)),
+	KindClassDeclaration:        uint8(unsafe.Offsetof(ClassDeclaration{}.ExportableBase)),
+	KindClassExpression:         uint8(unsafe.Offsetof(ClassExpression{}.ExportableBase)),
+	KindInterfaceDeclaration:    uint8(unsafe.Offsetof(InterfaceDeclaration{}.ExportableBase)),
+	KindTypeAliasDeclaration:    uint8(unsafe.Offsetof(TypeAliasDeclaration{}.ExportableBase)),
+	KindJSTypeAliasDeclaration:  uint8(unsafe.Offsetof(TypeAliasDeclaration{}.ExportableBase)),
+	KindEnumDeclaration:         uint8(unsafe.Offsetof(EnumDeclaration{}.ExportableBase)),
+	KindNamespaceImport:         uint8(unsafe.Offsetof(NamespaceImport{}.ExportableBase)),
+	KindExportSpecifier:         uint8(unsafe.Offsetof(ExportSpecifier{}.ExportableBase)),
+	KindModuleDeclaration:       uint8(unsafe.Offsetof(ModuleDeclaration{}.ExportableBase)),
+	KindImportEqualsDeclaration: uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.ExportableBase)),
+	KindImportClause:            uint8(unsafe.Offsetof(ImportClause{}.ExportableBase)),
+	KindImportSpecifier:         uint8(unsafe.Offsetof(ImportSpecifier{}.ExportableBase)),
 }
 
 func (n *Node) ExportableData() *ExportableBase {
-	switch nodeExportableDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a VariableDeclaration, which embeds its Node header at offset zero.
-		return (*VariableDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a BindingElement, which embeds its Node header at offset zero.
-		return (*BindingElement)(unsafe.Pointer(n)).ExportableData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).ExportableData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		return (*EnumDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a NamespaceImport, which embeds its Node header at offset zero.
-		return (*NamespaceImport)(unsafe.Pointer(n)).ExportableData()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a ExportSpecifier, which embeds its Node header at offset zero.
-		return (*ExportSpecifier)(unsafe.Pointer(n)).ExportableData()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).ExportableData()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a ImportClause, which embeds its Node header at offset zero.
-		return (*ImportClause)(unsafe.Pointer(n)).ExportableData()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a ImportSpecifier, which embeds its Node header at offset zero.
-		return (*ImportSpecifier)(unsafe.Pointer(n)).ExportableData()
-	default:
-		return nil
+	if offset := nodeExportableDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeExportableDataDispatch stores the byte offset of ExportableBase within the concrete node struct for n.Kind.
+		return (*ExportableBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeLocalsContainerDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindForStatement:                1,
-	KindForInStatement:              2,
-	KindForOfStatement:              2,
-	KindCaseBlock:                   3,
-	KindCatchClause:                 4,
-	KindBlock:                       5,
-	KindFunctionDeclaration:         6,
-	KindClassDeclaration:            7,
-	KindClassExpression:             8,
-	KindTypeAliasDeclaration:        9,
-	KindJSTypeAliasDeclaration:      9,
-	KindCallSignature:               10,
-	KindConstructSignature:          11,
-	KindConstructor:                 12,
-	KindGetAccessor:                 13,
-	KindSetAccessor:                 14,
-	KindIndexSignature:              15,
-	KindMethodSignature:             16,
-	KindMethodDeclaration:           17,
-	KindClassStaticBlockDeclaration: 18,
-	KindArrowFunction:               19,
-	KindFunctionExpression:          20,
-	KindConditionalType:             21,
-	KindMappedType:                  22,
-	KindFunctionType:                23,
-	KindConstructorType:             24,
-	KindJSDocSignature:              25,
-	KindSourceFile:                  26,
-	KindModuleDeclaration:           27,
+	KindForStatement:                uint8(unsafe.Offsetof(ForStatement{}.LocalsContainerBase)),
+	KindForInStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.LocalsContainerBase)),
+	KindForOfStatement:              uint8(unsafe.Offsetof(ForInOrOfStatement{}.LocalsContainerBase)),
+	KindCaseBlock:                   uint8(unsafe.Offsetof(CaseBlock{}.LocalsContainerBase)),
+	KindCatchClause:                 uint8(unsafe.Offsetof(CatchClause{}.LocalsContainerBase)),
+	KindBlock:                       uint8(unsafe.Offsetof(Block{}.LocalsContainerBase)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.LocalsContainerBase)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.LocalsContainerBase)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.LocalsContainerBase)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.LocalsContainerBase)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.LocalsContainerBase)),
+	KindCallSignature:               uint8(unsafe.Offsetof(CallSignatureDeclaration{}.LocalsContainerBase)),
+	KindConstructSignature:          uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.LocalsContainerBase)),
+	KindConstructor:                 uint8(unsafe.Offsetof(ConstructorDeclaration{}.LocalsContainerBase)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.LocalsContainerBase)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.LocalsContainerBase)),
+	KindIndexSignature:              uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.LocalsContainerBase)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.LocalsContainerBase)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.LocalsContainerBase)),
+	KindClassStaticBlockDeclaration: uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.LocalsContainerBase)),
+	KindArrowFunction:               uint8(unsafe.Offsetof(ArrowFunction{}.LocalsContainerBase)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.LocalsContainerBase)),
+	KindConditionalType:             uint8(unsafe.Offsetof(ConditionalTypeNode{}.LocalsContainerBase)),
+	KindMappedType:                  uint8(unsafe.Offsetof(MappedTypeNode{}.LocalsContainerBase)),
+	KindFunctionType:                uint8(unsafe.Offsetof(FunctionTypeNode{}.LocalsContainerBase)),
+	KindConstructorType:             uint8(unsafe.Offsetof(ConstructorTypeNode{}.LocalsContainerBase)),
+	KindJSDocSignature:              uint8(unsafe.Offsetof(JSDocSignature{}.LocalsContainerBase)),
+	KindSourceFile:                  uint8(unsafe.Offsetof(SourceFile{}.LocalsContainerBase)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.LocalsContainerBase)),
 }
 
 func (n *Node) LocalsContainerData() *LocalsContainerBase {
-	switch nodeLocalsContainerDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a ForStatement, which embeds its Node header at offset zero.
-		return (*ForStatement)(unsafe.Pointer(n)).LocalsContainerData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a ForInOrOfStatement, which embeds its Node header at offset zero.
-		return (*ForInOrOfStatement)(unsafe.Pointer(n)).LocalsContainerData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a CaseBlock, which embeds its Node header at offset zero.
-		return (*CaseBlock)(unsafe.Pointer(n)).LocalsContainerData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a CatchClause, which embeds its Node header at offset zero.
-		return (*CatchClause)(unsafe.Pointer(n)).LocalsContainerData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a Block, which embeds its Node header at offset zero.
-		return (*Block)(unsafe.Pointer(n)).LocalsContainerData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).LocalsContainerData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a CallSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a ConstructSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 15:
-		// SAFETY: This case only matches kinds allocated as a IndexSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 16:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 17:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 18:
-		// SAFETY: This case only matches kinds allocated as a ClassStaticBlockDeclaration, which embeds its Node header at offset zero.
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	case 19:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).LocalsContainerData()
-	case 20:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).LocalsContainerData()
-	case 21:
-		// SAFETY: This case only matches kinds allocated as a ConditionalTypeNode, which embeds its Node header at offset zero.
-		return (*ConditionalTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 22:
-		// SAFETY: This case only matches kinds allocated as a MappedTypeNode, which embeds its Node header at offset zero.
-		return (*MappedTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 23:
-		// SAFETY: This case only matches kinds allocated as a FunctionTypeNode, which embeds its Node header at offset zero.
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 24:
-		// SAFETY: This case only matches kinds allocated as a ConstructorTypeNode, which embeds its Node header at offset zero.
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).LocalsContainerData()
-	case 25:
-		// SAFETY: This case only matches kinds allocated as a JSDocSignature, which embeds its Node header at offset zero.
-		return (*JSDocSignature)(unsafe.Pointer(n)).LocalsContainerData()
-	case 26:
-		// SAFETY: This case only matches kinds allocated as a SourceFile, which embeds its Node header at offset zero.
-		return (*SourceFile)(unsafe.Pointer(n)).LocalsContainerData()
-	case 27:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).LocalsContainerData()
-	default:
-		return nil
+	if offset := nodeLocalsContainerDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeLocalsContainerDataDispatch stores the byte offset of LocalsContainerBase within the concrete node struct for n.Kind.
+		return (*LocalsContainerBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeFunctionLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindFunctionDeclaration: 1,
-	KindCallSignature:       2,
-	KindConstructSignature:  3,
-	KindConstructor:         4,
-	KindGetAccessor:         5,
-	KindSetAccessor:         6,
-	KindIndexSignature:      7,
-	KindMethodSignature:     8,
-	KindMethodDeclaration:   9,
-	KindArrowFunction:       10,
-	KindFunctionExpression:  11,
-	KindFunctionType:        12,
-	KindConstructorType:     13,
-	KindJSDocSignature:      14,
+	KindFunctionDeclaration: uint8(unsafe.Offsetof(FunctionDeclaration{}.FunctionLikeBase)),
+	KindCallSignature:       uint8(unsafe.Offsetof(CallSignatureDeclaration{}.FunctionLikeBase)),
+	KindConstructSignature:  uint8(unsafe.Offsetof(ConstructSignatureDeclaration{}.FunctionLikeBase)),
+	KindConstructor:         uint8(unsafe.Offsetof(ConstructorDeclaration{}.FunctionLikeBase)),
+	KindGetAccessor:         uint8(unsafe.Offsetof(GetAccessorDeclaration{}.FunctionLikeBase)),
+	KindSetAccessor:         uint8(unsafe.Offsetof(SetAccessorDeclaration{}.FunctionLikeBase)),
+	KindIndexSignature:      uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.FunctionLikeBase)),
+	KindMethodSignature:     uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.FunctionLikeBase)),
+	KindMethodDeclaration:   uint8(unsafe.Offsetof(MethodDeclaration{}.FunctionLikeBase)),
+	KindArrowFunction:       uint8(unsafe.Offsetof(ArrowFunction{}.FunctionLikeBase)),
+	KindFunctionExpression:  uint8(unsafe.Offsetof(FunctionExpression{}.FunctionLikeBase)),
+	KindFunctionType:        uint8(unsafe.Offsetof(FunctionTypeNode{}.FunctionLikeBase)),
+	KindConstructorType:     uint8(unsafe.Offsetof(ConstructorTypeNode{}.FunctionLikeBase)),
+	KindJSDocSignature:      uint8(unsafe.Offsetof(JSDocSignature{}.FunctionLikeBase)),
 }
 
 func (n *Node) FunctionLikeData() *FunctionLikeBase {
-	switch nodeFunctionLikeDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a CallSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*CallSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a ConstructSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a IndexSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).FunctionLikeData()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).FunctionLikeData()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).FunctionLikeData()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a FunctionTypeNode, which embeds its Node header at offset zero.
-		return (*FunctionTypeNode)(unsafe.Pointer(n)).FunctionLikeData()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a ConstructorTypeNode, which embeds its Node header at offset zero.
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).FunctionLikeData()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a JSDocSignature, which embeds its Node header at offset zero.
-		return (*JSDocSignature)(unsafe.Pointer(n)).FunctionLikeData()
-	default:
-		return nil
+	if offset := nodeFunctionLikeDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeFunctionLikeDataDispatch stores the byte offset of FunctionLikeBase within the concrete node struct for n.Kind.
+		return (*FunctionLikeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
+}
+
+var nodeClassLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
+	KindClassDeclaration: uint8(unsafe.Offsetof(ClassDeclaration{}.ClassLikeBase)),
+	KindClassExpression:  uint8(unsafe.Offsetof(ClassExpression{}.ClassLikeBase)),
 }
 
 func (n *Node) ClassLikeData() *ClassLikeBase {
-	switch n.Kind {
-	case KindClassDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).ClassLikeData()
-	case KindClassExpression:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).ClassLikeData()
-	default:
-		return nil
+	if offset := nodeClassLikeDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeClassLikeDataDispatch stores the byte offset of ClassLikeBase within the concrete node struct for n.Kind.
+		return (*ClassLikeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeBodyDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindFunctionDeclaration: 1,
-	KindConstructor:         2,
-	KindGetAccessor:         3,
-	KindSetAccessor:         4,
-	KindMethodDeclaration:   5,
-	KindArrowFunction:       6,
-	KindFunctionExpression:  7,
-	KindModuleDeclaration:   8,
+	KindFunctionDeclaration: uint8(unsafe.Offsetof(FunctionDeclaration{}.BodyBase)),
+	KindConstructor:         uint8(unsafe.Offsetof(ConstructorDeclaration{}.BodyBase)),
+	KindGetAccessor:         uint8(unsafe.Offsetof(GetAccessorDeclaration{}.BodyBase)),
+	KindSetAccessor:         uint8(unsafe.Offsetof(SetAccessorDeclaration{}.BodyBase)),
+	KindMethodDeclaration:   uint8(unsafe.Offsetof(MethodDeclaration{}.BodyBase)),
+	KindArrowFunction:       uint8(unsafe.Offsetof(ArrowFunction{}.BodyBase)),
+	KindFunctionExpression:  uint8(unsafe.Offsetof(FunctionExpression{}.BodyBase)),
+	KindModuleDeclaration:   uint8(unsafe.Offsetof(ModuleDeclaration{}.BodyBase)),
 }
 
 func (n *Node) BodyData() *BodyBase {
-	switch nodeBodyDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).BodyData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).BodyData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).BodyData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).BodyData()
-	default:
-		return nil
+	if offset := nodeBodyDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeBodyDataDispatch stores the byte offset of BodyBase within the concrete node struct for n.Kind.
+		return (*BodyBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeLiteralLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindStringLiteral:                 1,
-	KindNumericLiteral:                2,
-	KindBigIntLiteral:                 3,
-	KindRegularExpressionLiteral:      4,
-	KindNoSubstitutionTemplateLiteral: 5,
-	KindTemplateHead:                  6,
-	KindTemplateMiddle:                7,
-	KindTemplateTail:                  8,
-	KindJsxText:                       9,
+	KindStringLiteral:                 uint8(unsafe.Offsetof(StringLiteral{}.LiteralLikeNodeBase)),
+	KindNumericLiteral:                uint8(unsafe.Offsetof(NumericLiteral{}.LiteralLikeNodeBase)),
+	KindBigIntLiteral:                 uint8(unsafe.Offsetof(BigIntLiteral{}.LiteralLikeNodeBase)),
+	KindRegularExpressionLiteral:      uint8(unsafe.Offsetof(RegularExpressionLiteral{}.LiteralLikeNodeBase)),
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.LiteralLikeNodeBase)),
+	KindTemplateHead:                  uint8(unsafe.Offsetof(TemplateHead{}.LiteralLikeNodeBase)),
+	KindTemplateMiddle:                uint8(unsafe.Offsetof(TemplateMiddle{}.LiteralLikeNodeBase)),
+	KindTemplateTail:                  uint8(unsafe.Offsetof(TemplateTail{}.LiteralLikeNodeBase)),
+	KindJsxText:                       uint8(unsafe.Offsetof(JsxText{}.LiteralLikeNodeBase)),
 }
 
 func (n *Node) LiteralLikeData() *LiteralLikeNodeBase {
-	switch nodeLiteralLikeDataDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a StringLiteral, which embeds its Node header at offset zero.
-		return (*StringLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a NumericLiteral, which embeds its Node header at offset zero.
-		return (*NumericLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a BigIntLiteral, which embeds its Node header at offset zero.
-		return (*BigIntLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a RegularExpressionLiteral, which embeds its Node header at offset zero.
-		return (*RegularExpressionLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a NoSubstitutionTemplateLiteral, which embeds its Node header at offset zero.
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).LiteralLikeData()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a TemplateHead, which embeds its Node header at offset zero.
-		return (*TemplateHead)(unsafe.Pointer(n)).LiteralLikeData()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a TemplateMiddle, which embeds its Node header at offset zero.
-		return (*TemplateMiddle)(unsafe.Pointer(n)).LiteralLikeData()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a TemplateTail, which embeds its Node header at offset zero.
-		return (*TemplateTail)(unsafe.Pointer(n)).LiteralLikeData()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a JsxText, which embeds its Node header at offset zero.
-		return (*JsxText)(unsafe.Pointer(n)).LiteralLikeData()
-	default:
-		return nil
+	if offset := nodeLiteralLikeDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeLiteralLikeDataDispatch stores the byte offset of LiteralLikeNodeBase within the concrete node struct for n.Kind.
+		return (*LiteralLikeNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
+}
+
+var nodeTemplateLiteralLikeDataDispatch = [kindFlowReduceLabelData + 1]uint8{
+	KindNoSubstitutionTemplateLiteral: uint8(unsafe.Offsetof(NoSubstitutionTemplateLiteral{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateHead:                  uint8(unsafe.Offsetof(TemplateHead{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateMiddle:                uint8(unsafe.Offsetof(TemplateMiddle{}.TemplateLiteralLikeNodeBase)),
+	KindTemplateTail:                  uint8(unsafe.Offsetof(TemplateTail{}.TemplateLiteralLikeNodeBase)),
 }
 
 func (n *Node) TemplateLiteralLikeData() *TemplateLiteralLikeNodeBase {
-	switch n.Kind {
-	case KindNoSubstitutionTemplateLiteral:
-		// SAFETY: This case only matches kinds allocated as a NoSubstitutionTemplateLiteral, which embeds its Node header at offset zero.
-		return (*NoSubstitutionTemplateLiteral)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateHead:
-		// SAFETY: This case only matches kinds allocated as a TemplateHead, which embeds its Node header at offset zero.
-		return (*TemplateHead)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateMiddle:
-		// SAFETY: This case only matches kinds allocated as a TemplateMiddle, which embeds its Node header at offset zero.
-		return (*TemplateMiddle)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	case KindTemplateTail:
-		// SAFETY: This case only matches kinds allocated as a TemplateTail, which embeds its Node header at offset zero.
-		return (*TemplateTail)(unsafe.Pointer(n)).TemplateLiteralLikeData()
-	default:
-		return nil
+	if offset := nodeTemplateLiteralLikeDataDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeTemplateLiteralLikeDataDispatch stores the byte offset of TemplateLiteralLikeNodeBase within the concrete node struct for n.Kind.
+		return (*TemplateLiteralLikeNodeBase)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -12822,412 +12409,107 @@ func (n *Node) TemplateLiteralLikeData() *TemplateLiteralLikeNodeBase {
 // ──────────────────────────────────────────────────────────────────────
 
 var nodeNameDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableDeclaration:         1,
-	KindParameter:                   2,
-	KindBindingElement:              3,
-	KindFunctionDeclaration:         4,
-	KindClassDeclaration:            5,
-	KindClassExpression:             6,
-	KindInterfaceDeclaration:        7,
-	KindTypeAliasDeclaration:        8,
-	KindJSTypeAliasDeclaration:      8,
-	KindEnumMember:                  9,
-	KindEnumDeclaration:             10,
-	KindNamespaceImport:             11,
-	KindNamespaceExportDeclaration:  12,
-	KindNamespaceExport:             13,
-	KindExportSpecifier:             14,
-	KindGetAccessor:                 15,
-	KindSetAccessor:                 16,
-	KindMethodSignature:             17,
-	KindMethodDeclaration:           18,
-	KindPropertySignature:           19,
-	KindPropertyDeclaration:         20,
-	KindFunctionExpression:          21,
-	KindPropertyAccessExpression:    22,
-	KindMetaProperty:                23,
-	KindPropertyAssignment:          24,
-	KindShorthandPropertyAssignment: 25,
-	KindImportAttribute:             26,
-	KindNamedTupleMember:            27,
-	KindJsxNamespacedName:           28,
-	KindJsxAttribute:                29,
-	KindJSDocCallbackTag:            30,
-	KindJSDocTypedefTag:             31,
-	KindJSDocNameReference:          32,
-	KindModuleDeclaration:           33,
-	KindImportEqualsDeclaration:     34,
-	KindImportClause:                35,
-	KindImportSpecifier:             36,
-	KindJSDocLink:                   37,
-	KindJSDocLinkPlain:              38,
-	KindJSDocLinkCode:               39,
-	KindTypeParameter:               40,
-	KindJSDocParameterTag:           41,
-	KindJSDocPropertyTag:            41,
+	KindVariableDeclaration:         uint8(unsafe.Offsetof(VariableDeclaration{}.name)),
+	KindParameter:                   uint8(unsafe.Offsetof(ParameterDeclaration{}.name)),
+	KindBindingElement:              uint8(unsafe.Offsetof(BindingElement{}.name)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.name)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.name)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.name)),
+	KindInterfaceDeclaration:        uint8(unsafe.Offsetof(InterfaceDeclaration{}.name)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.name)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.name)),
+	KindEnumMember:                  uint8(unsafe.Offsetof(EnumMember{}.name)),
+	KindEnumDeclaration:             uint8(unsafe.Offsetof(EnumDeclaration{}.name)),
+	KindNamespaceImport:             uint8(unsafe.Offsetof(NamespaceImport{}.name)),
+	KindNamespaceExportDeclaration:  uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.name)),
+	KindNamespaceExport:             uint8(unsafe.Offsetof(NamespaceExport{}.name)),
+	KindExportSpecifier:             uint8(unsafe.Offsetof(ExportSpecifier{}.name)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.name)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.name)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.name)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.name)),
+	KindPropertySignature:           uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.name)),
+	KindPropertyDeclaration:         uint8(unsafe.Offsetof(PropertyDeclaration{}.name)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.name)),
+	KindPropertyAccessExpression:    uint8(unsafe.Offsetof(PropertyAccessExpression{}.name)),
+	KindMetaProperty:                uint8(unsafe.Offsetof(MetaProperty{}.name)),
+	KindPropertyAssignment:          uint8(unsafe.Offsetof(PropertyAssignment{}.name)),
+	KindShorthandPropertyAssignment: uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.name)),
+	KindImportAttribute:             uint8(unsafe.Offsetof(ImportAttribute{}.name)),
+	KindNamedTupleMember:            uint8(unsafe.Offsetof(NamedTupleMember{}.name)),
+	KindJsxNamespacedName:           uint8(unsafe.Offsetof(JsxNamespacedName{}.name)),
+	KindJsxAttribute:                uint8(unsafe.Offsetof(JsxAttribute{}.name)),
+	KindJSDocCallbackTag:            uint8(unsafe.Offsetof(JSDocCallbackTag{}.name)),
+	KindJSDocTypedefTag:             uint8(unsafe.Offsetof(JSDocTypedefTag{}.name)),
+	KindJSDocNameReference:          uint8(unsafe.Offsetof(JSDocNameReference{}.name)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.name)),
+	KindImportEqualsDeclaration:     uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.name)),
+	KindImportClause:                uint8(unsafe.Offsetof(ImportClause{}.name)),
+	KindImportSpecifier:             uint8(unsafe.Offsetof(ImportSpecifier{}.name)),
+	KindJSDocLink:                   uint8(unsafe.Offsetof(JSDocLink{}.name)),
+	KindJSDocLinkPlain:              uint8(unsafe.Offsetof(JSDocLinkPlain{}.name)),
+	KindJSDocLinkCode:               uint8(unsafe.Offsetof(JSDocLinkCode{}.name)),
+	KindTypeParameter:               uint8(unsafe.Offsetof(TypeParameterDeclaration{}.name)),
+	KindJSDocParameterTag:           uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.name)),
+	KindJSDocPropertyTag:            uint8(unsafe.Offsetof(JSDocParameterOrPropertyTag{}.name)),
 }
 
 func (n *Node) Name() *DeclarationName {
-	switch nodeNameDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a VariableDeclaration, which embeds its Node header at offset zero.
-		return (*VariableDeclaration)(unsafe.Pointer(n)).Name()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a ParameterDeclaration, which embeds its Node header at offset zero.
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).Name()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a BindingElement, which embeds its Node header at offset zero.
-		return (*BindingElement)(unsafe.Pointer(n)).Name()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).Name()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).Name()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).Name()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).Name()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).Name()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a EnumMember, which embeds its Node header at offset zero.
-		return (*EnumMember)(unsafe.Pointer(n)).Name()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		return (*EnumDeclaration)(unsafe.Pointer(n)).Name()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a NamespaceImport, which embeds its Node header at offset zero.
-		return (*NamespaceImport)(unsafe.Pointer(n)).Name()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExportDeclaration, which embeds its Node header at offset zero.
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).Name()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExport, which embeds its Node header at offset zero.
-		return (*NamespaceExport)(unsafe.Pointer(n)).Name()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a ExportSpecifier, which embeds its Node header at offset zero.
-		return (*ExportSpecifier)(unsafe.Pointer(n)).Name()
-	case 15:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).Name()
-	case 16:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).Name()
-	case 17:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).Name()
-	case 18:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).Name()
-	case 19:
-		// SAFETY: This case only matches kinds allocated as a PropertySignatureDeclaration, which embeds its Node header at offset zero.
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).Name()
-	case 20:
-		// SAFETY: This case only matches kinds allocated as a PropertyDeclaration, which embeds its Node header at offset zero.
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).Name()
-	case 21:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).Name()
-	case 22:
-		// SAFETY: This case only matches kinds allocated as a PropertyAccessExpression, which embeds its Node header at offset zero.
-		return (*PropertyAccessExpression)(unsafe.Pointer(n)).Name()
-	case 23:
-		// SAFETY: This case only matches kinds allocated as a MetaProperty, which embeds its Node header at offset zero.
-		return (*MetaProperty)(unsafe.Pointer(n)).Name()
-	case 24:
-		// SAFETY: This case only matches kinds allocated as a PropertyAssignment, which embeds its Node header at offset zero.
-		return (*PropertyAssignment)(unsafe.Pointer(n)).Name()
-	case 25:
-		// SAFETY: This case only matches kinds allocated as a ShorthandPropertyAssignment, which embeds its Node header at offset zero.
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).Name()
-	case 26:
-		// SAFETY: This case only matches kinds allocated as a ImportAttribute, which embeds its Node header at offset zero.
-		return (*ImportAttribute)(unsafe.Pointer(n)).Name()
-	case 27:
-		// SAFETY: This case only matches kinds allocated as a NamedTupleMember, which embeds its Node header at offset zero.
-		return (*NamedTupleMember)(unsafe.Pointer(n)).Name()
-	case 28:
-		// SAFETY: This case only matches kinds allocated as a JsxNamespacedName, which embeds its Node header at offset zero.
-		return (*JsxNamespacedName)(unsafe.Pointer(n)).Name()
-	case 29:
-		// SAFETY: This case only matches kinds allocated as a JsxAttribute, which embeds its Node header at offset zero.
-		return (*JsxAttribute)(unsafe.Pointer(n)).Name()
-	case 30:
-		// SAFETY: This case only matches kinds allocated as a JSDocCallbackTag, which embeds its Node header at offset zero.
-		return (*JSDocCallbackTag)(unsafe.Pointer(n)).Name()
-	case 31:
-		// SAFETY: This case only matches kinds allocated as a JSDocTypedefTag, which embeds its Node header at offset zero.
-		return (*JSDocTypedefTag)(unsafe.Pointer(n)).Name()
-	case 32:
-		// SAFETY: This case only matches kinds allocated as a JSDocNameReference, which embeds its Node header at offset zero.
-		return (*JSDocNameReference)(unsafe.Pointer(n)).Name()
-	case 33:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).Name()
-	case 34:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).Name()
-	case 35:
-		// SAFETY: This case only matches kinds allocated as a ImportClause, which embeds its Node header at offset zero.
-		return (*ImportClause)(unsafe.Pointer(n)).Name()
-	case 36:
-		// SAFETY: This case only matches kinds allocated as a ImportSpecifier, which embeds its Node header at offset zero.
-		return (*ImportSpecifier)(unsafe.Pointer(n)).Name()
-	case 37:
-		// SAFETY: This case only matches kinds allocated as a JSDocLink, which embeds its Node header at offset zero.
-		return (*JSDocLink)(unsafe.Pointer(n)).Name()
-	case 38:
-		// SAFETY: This case only matches kinds allocated as a JSDocLinkPlain, which embeds its Node header at offset zero.
-		return (*JSDocLinkPlain)(unsafe.Pointer(n)).Name()
-	case 39:
-		// SAFETY: This case only matches kinds allocated as a JSDocLinkCode, which embeds its Node header at offset zero.
-		return (*JSDocLinkCode)(unsafe.Pointer(n)).Name()
-	case 40:
-		// SAFETY: This case only matches kinds allocated as a TypeParameterDeclaration, which embeds its Node header at offset zero.
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).Name()
-	case 41:
-		// SAFETY: This case only matches kinds allocated as a JSDocParameterOrPropertyTag, which embeds its Node header at offset zero.
-		return (*JSDocParameterOrPropertyTag)(unsafe.Pointer(n)).Name()
-	default:
-		return nil
+	if offset := nodeNameDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeNameDispatch stores the byte offset of name within the concrete node struct for n.Kind.
+		return *(**DeclarationName)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 var nodeModifiersDispatch = [kindFlowReduceLabelData + 1]uint8{
-	KindVariableStatement:           1,
-	KindParameter:                   2,
-	KindMissingDeclaration:          3,
-	KindFunctionDeclaration:         4,
-	KindClassDeclaration:            5,
-	KindClassExpression:             6,
-	KindInterfaceDeclaration:        7,
-	KindTypeAliasDeclaration:        8,
-	KindJSTypeAliasDeclaration:      8,
-	KindEnumDeclaration:             9,
-	KindImportDeclaration:           10,
-	KindJSImportDeclaration:         10,
-	KindExportAssignment:            11,
-	KindNamespaceExportDeclaration:  12,
-	KindConstructor:                 13,
-	KindGetAccessor:                 14,
-	KindSetAccessor:                 15,
-	KindIndexSignature:              16,
-	KindMethodSignature:             17,
-	KindMethodDeclaration:           18,
-	KindPropertySignature:           19,
-	KindPropertyDeclaration:         20,
-	KindClassStaticBlockDeclaration: 21,
-	KindBinaryExpression:            22,
-	KindArrowFunction:               23,
-	KindFunctionExpression:          24,
-	KindPropertyAssignment:          25,
-	KindShorthandPropertyAssignment: 26,
-	KindConstructorType:             27,
-	KindModuleDeclaration:           28,
-	KindImportEqualsDeclaration:     29,
-	KindExportDeclaration:           30,
-	KindTypeParameter:               31,
+	KindVariableStatement:           uint8(unsafe.Offsetof(VariableStatement{}.modifiers)),
+	KindParameter:                   uint8(unsafe.Offsetof(ParameterDeclaration{}.modifiers)),
+	KindMissingDeclaration:          uint8(unsafe.Offsetof(MissingDeclaration{}.modifiers)),
+	KindFunctionDeclaration:         uint8(unsafe.Offsetof(FunctionDeclaration{}.modifiers)),
+	KindClassDeclaration:            uint8(unsafe.Offsetof(ClassDeclaration{}.modifiers)),
+	KindClassExpression:             uint8(unsafe.Offsetof(ClassExpression{}.modifiers)),
+	KindInterfaceDeclaration:        uint8(unsafe.Offsetof(InterfaceDeclaration{}.modifiers)),
+	KindTypeAliasDeclaration:        uint8(unsafe.Offsetof(TypeAliasDeclaration{}.modifiers)),
+	KindJSTypeAliasDeclaration:      uint8(unsafe.Offsetof(TypeAliasDeclaration{}.modifiers)),
+	KindEnumDeclaration:             uint8(unsafe.Offsetof(EnumDeclaration{}.modifiers)),
+	KindImportDeclaration:           uint8(unsafe.Offsetof(ImportDeclaration{}.modifiers)),
+	KindJSImportDeclaration:         uint8(unsafe.Offsetof(ImportDeclaration{}.modifiers)),
+	KindExportAssignment:            uint8(unsafe.Offsetof(ExportAssignment{}.modifiers)),
+	KindNamespaceExportDeclaration:  uint8(unsafe.Offsetof(NamespaceExportDeclaration{}.modifiers)),
+	KindConstructor:                 uint8(unsafe.Offsetof(ConstructorDeclaration{}.modifiers)),
+	KindGetAccessor:                 uint8(unsafe.Offsetof(GetAccessorDeclaration{}.modifiers)),
+	KindSetAccessor:                 uint8(unsafe.Offsetof(SetAccessorDeclaration{}.modifiers)),
+	KindIndexSignature:              uint8(unsafe.Offsetof(IndexSignatureDeclaration{}.modifiers)),
+	KindMethodSignature:             uint8(unsafe.Offsetof(MethodSignatureDeclaration{}.modifiers)),
+	KindMethodDeclaration:           uint8(unsafe.Offsetof(MethodDeclaration{}.modifiers)),
+	KindPropertySignature:           uint8(unsafe.Offsetof(PropertySignatureDeclaration{}.modifiers)),
+	KindPropertyDeclaration:         uint8(unsafe.Offsetof(PropertyDeclaration{}.modifiers)),
+	KindClassStaticBlockDeclaration: uint8(unsafe.Offsetof(ClassStaticBlockDeclaration{}.modifiers)),
+	KindBinaryExpression:            uint8(unsafe.Offsetof(BinaryExpression{}.modifiers)),
+	KindArrowFunction:               uint8(unsafe.Offsetof(ArrowFunction{}.modifiers)),
+	KindFunctionExpression:          uint8(unsafe.Offsetof(FunctionExpression{}.modifiers)),
+	KindPropertyAssignment:          uint8(unsafe.Offsetof(PropertyAssignment{}.modifiers)),
+	KindShorthandPropertyAssignment: uint8(unsafe.Offsetof(ShorthandPropertyAssignment{}.modifiers)),
+	KindConstructorType:             uint8(unsafe.Offsetof(ConstructorTypeNode{}.modifiers)),
+	KindModuleDeclaration:           uint8(unsafe.Offsetof(ModuleDeclaration{}.modifiers)),
+	KindImportEqualsDeclaration:     uint8(unsafe.Offsetof(ImportEqualsDeclaration{}.modifiers)),
+	KindExportDeclaration:           uint8(unsafe.Offsetof(ExportDeclaration{}.modifiers)),
+	KindTypeParameter:               uint8(unsafe.Offsetof(TypeParameterDeclaration{}.modifiers)),
 }
 
 func (n *Node) Modifiers() *ModifierList {
-	switch nodeModifiersDispatch[n.Kind] {
-	case 1:
-		// SAFETY: This case only matches kinds allocated as a VariableStatement, which embeds its Node header at offset zero.
-		return (*VariableStatement)(unsafe.Pointer(n)).Modifiers()
-	case 2:
-		// SAFETY: This case only matches kinds allocated as a ParameterDeclaration, which embeds its Node header at offset zero.
-		return (*ParameterDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 3:
-		// SAFETY: This case only matches kinds allocated as a MissingDeclaration, which embeds its Node header at offset zero.
-		return (*MissingDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 4:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		return (*FunctionDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 5:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		return (*ClassDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 6:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		return (*ClassExpression)(unsafe.Pointer(n)).Modifiers()
-	case 7:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		return (*InterfaceDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 8:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		return (*TypeAliasDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 9:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		return (*EnumDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 10:
-		// SAFETY: This case only matches kinds allocated as a ImportDeclaration, which embeds its Node header at offset zero.
-		return (*ImportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 11:
-		// SAFETY: This case only matches kinds allocated as a ExportAssignment, which embeds its Node header at offset zero.
-		return (*ExportAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 12:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExportDeclaration, which embeds its Node header at offset zero.
-		return (*NamespaceExportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 13:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		return (*ConstructorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 14:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*GetAccessorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 15:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		return (*SetAccessorDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 16:
-		// SAFETY: This case only matches kinds allocated as a IndexSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*IndexSignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 17:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		return (*MethodSignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 18:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		return (*MethodDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 19:
-		// SAFETY: This case only matches kinds allocated as a PropertySignatureDeclaration, which embeds its Node header at offset zero.
-		return (*PropertySignatureDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 20:
-		// SAFETY: This case only matches kinds allocated as a PropertyDeclaration, which embeds its Node header at offset zero.
-		return (*PropertyDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 21:
-		// SAFETY: This case only matches kinds allocated as a ClassStaticBlockDeclaration, which embeds its Node header at offset zero.
-		return (*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 22:
-		// SAFETY: This case only matches kinds allocated as a BinaryExpression, which embeds its Node header at offset zero.
-		return (*BinaryExpression)(unsafe.Pointer(n)).Modifiers()
-	case 23:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		return (*ArrowFunction)(unsafe.Pointer(n)).Modifiers()
-	case 24:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		return (*FunctionExpression)(unsafe.Pointer(n)).Modifiers()
-	case 25:
-		// SAFETY: This case only matches kinds allocated as a PropertyAssignment, which embeds its Node header at offset zero.
-		return (*PropertyAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 26:
-		// SAFETY: This case only matches kinds allocated as a ShorthandPropertyAssignment, which embeds its Node header at offset zero.
-		return (*ShorthandPropertyAssignment)(unsafe.Pointer(n)).Modifiers()
-	case 27:
-		// SAFETY: This case only matches kinds allocated as a ConstructorTypeNode, which embeds its Node header at offset zero.
-		return (*ConstructorTypeNode)(unsafe.Pointer(n)).Modifiers()
-	case 28:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		return (*ModuleDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 29:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		return (*ImportEqualsDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 30:
-		// SAFETY: This case only matches kinds allocated as a ExportDeclaration, which embeds its Node header at offset zero.
-		return (*ExportDeclaration)(unsafe.Pointer(n)).Modifiers()
-	case 31:
-		// SAFETY: This case only matches kinds allocated as a TypeParameterDeclaration, which embeds its Node header at offset zero.
-		return (*TypeParameterDeclaration)(unsafe.Pointer(n)).Modifiers()
-	default:
-		return nil
+	if offset := nodeModifiersDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeModifiersDispatch stores the byte offset of modifiers within the concrete node struct for n.Kind.
+		return *(**ModifierList)(unsafe.Add(unsafe.Pointer(n), offset))
 	}
+	return nil
 }
 
 func (n *MutableNode) SetModifiers(modifiers *ModifierList) {
-	switch n.Kind {
-	case KindVariableStatement:
-		// SAFETY: This case only matches kinds allocated as a VariableStatement, which embeds its Node header at offset zero.
-		(*VariableStatement)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindParameter:
-		// SAFETY: This case only matches kinds allocated as a ParameterDeclaration, which embeds its Node header at offset zero.
-		(*ParameterDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMissingDeclaration:
-		// SAFETY: This case only matches kinds allocated as a MissingDeclaration, which embeds its Node header at offset zero.
-		(*MissingDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindFunctionDeclaration:
-		// SAFETY: This case only matches kinds allocated as a FunctionDeclaration, which embeds its Node header at offset zero.
-		(*FunctionDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ClassDeclaration, which embeds its Node header at offset zero.
-		(*ClassDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassExpression:
-		// SAFETY: This case only matches kinds allocated as a ClassExpression, which embeds its Node header at offset zero.
-		(*ClassExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindInterfaceDeclaration:
-		// SAFETY: This case only matches kinds allocated as a InterfaceDeclaration, which embeds its Node header at offset zero.
-		(*InterfaceDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindTypeAliasDeclaration, KindJSTypeAliasDeclaration:
-		// SAFETY: This case only matches kinds allocated as a TypeAliasDeclaration, which embeds its Node header at offset zero.
-		(*TypeAliasDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindEnumDeclaration:
-		// SAFETY: This case only matches kinds allocated as a EnumDeclaration, which embeds its Node header at offset zero.
-		(*EnumDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindImportDeclaration, KindJSImportDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ImportDeclaration, which embeds its Node header at offset zero.
-		(*ImportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindExportAssignment:
-		// SAFETY: This case only matches kinds allocated as a ExportAssignment, which embeds its Node header at offset zero.
-		(*ExportAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindNamespaceExportDeclaration:
-		// SAFETY: This case only matches kinds allocated as a NamespaceExportDeclaration, which embeds its Node header at offset zero.
-		(*NamespaceExportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindConstructor:
-		// SAFETY: This case only matches kinds allocated as a ConstructorDeclaration, which embeds its Node header at offset zero.
-		(*ConstructorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindGetAccessor:
-		// SAFETY: This case only matches kinds allocated as a GetAccessorDeclaration, which embeds its Node header at offset zero.
-		(*GetAccessorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindSetAccessor:
-		// SAFETY: This case only matches kinds allocated as a SetAccessorDeclaration, which embeds its Node header at offset zero.
-		(*SetAccessorDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindIndexSignature:
-		// SAFETY: This case only matches kinds allocated as a IndexSignatureDeclaration, which embeds its Node header at offset zero.
-		(*IndexSignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMethodSignature:
-		// SAFETY: This case only matches kinds allocated as a MethodSignatureDeclaration, which embeds its Node header at offset zero.
-		(*MethodSignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindMethodDeclaration:
-		// SAFETY: This case only matches kinds allocated as a MethodDeclaration, which embeds its Node header at offset zero.
-		(*MethodDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertySignature:
-		// SAFETY: This case only matches kinds allocated as a PropertySignatureDeclaration, which embeds its Node header at offset zero.
-		(*PropertySignatureDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertyDeclaration:
-		// SAFETY: This case only matches kinds allocated as a PropertyDeclaration, which embeds its Node header at offset zero.
-		(*PropertyDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindClassStaticBlockDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ClassStaticBlockDeclaration, which embeds its Node header at offset zero.
-		(*ClassStaticBlockDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindBinaryExpression:
-		// SAFETY: This case only matches kinds allocated as a BinaryExpression, which embeds its Node header at offset zero.
-		(*BinaryExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindArrowFunction:
-		// SAFETY: This case only matches kinds allocated as a ArrowFunction, which embeds its Node header at offset zero.
-		(*ArrowFunction)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindFunctionExpression:
-		// SAFETY: This case only matches kinds allocated as a FunctionExpression, which embeds its Node header at offset zero.
-		(*FunctionExpression)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindPropertyAssignment:
-		// SAFETY: This case only matches kinds allocated as a PropertyAssignment, which embeds its Node header at offset zero.
-		(*PropertyAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindShorthandPropertyAssignment:
-		// SAFETY: This case only matches kinds allocated as a ShorthandPropertyAssignment, which embeds its Node header at offset zero.
-		(*ShorthandPropertyAssignment)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindConstructorType:
-		// SAFETY: This case only matches kinds allocated as a ConstructorTypeNode, which embeds its Node header at offset zero.
-		(*ConstructorTypeNode)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindModuleDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ModuleDeclaration, which embeds its Node header at offset zero.
-		(*ModuleDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindImportEqualsDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ImportEqualsDeclaration, which embeds its Node header at offset zero.
-		(*ImportEqualsDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindExportDeclaration:
-		// SAFETY: This case only matches kinds allocated as a ExportDeclaration, which embeds its Node header at offset zero.
-		(*ExportDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
-	case KindTypeParameter:
-		// SAFETY: This case only matches kinds allocated as a TypeParameterDeclaration, which embeds its Node header at offset zero.
-		(*TypeParameterDeclaration)(unsafe.Pointer(n)).setModifiers(modifiers)
+	if offset := nodeModifiersDispatch[n.Kind]; offset != 0 {
+		// SAFETY: nodeModifiersDispatch stores the byte offset of modifiers within the concrete node struct for n.Kind.
+		*(**ModifierList)(unsafe.Add(unsafe.Pointer(n), offset)) = modifiers
 	}
 }
 
@@ -13255,7 +12537,8 @@ var (
 	_ [0 - unsafe.Offsetof(WithStatement{}.Node)]byte
 	_ [0 - unsafe.Offsetof(SwitchStatement{}.Node)]byte
 	_ [0 - unsafe.Offsetof(CaseBlock{}.Node)]byte
-	_ [0 - unsafe.Offsetof(CaseOrDefaultClause{}.Node)]byte
+	_ [0 - unsafe.Offsetof(CaseClause{}.Node)]byte
+	_ [0 - unsafe.Offsetof(DefaultClause{}.Node)]byte
 	_ [0 - unsafe.Offsetof(ThrowStatement{}.Node)]byte
 	_ [0 - unsafe.Offsetof(TryStatement{}.Node)]byte
 	_ [0 - unsafe.Offsetof(CatchClause{}.Node)]byte
@@ -13579,14 +12862,20 @@ func (n *Node) AsCaseBlock() *CaseBlock {
 	return (*CaseBlock)(unsafe.Pointer(n))
 }
 
-func (n *Node) AsCaseOrDefaultClause() *CaseOrDefaultClause {
-	switch n.Kind {
-	case KindCaseClause, KindDefaultClause:
-	default:
-		panic("Invalid node cast to CaseOrDefaultClause")
+func (n *Node) AsCaseClause() *CaseClause {
+	if n.Kind != KindCaseClause {
+		panic("Invalid node cast to CaseClause")
 	}
-	// SAFETY: The kind check guarantees n was allocated as a CaseOrDefaultClause, which embeds its Node header at offset zero.
-	return (*CaseOrDefaultClause)(unsafe.Pointer(n))
+	// SAFETY: The kind check guarantees n was allocated as a CaseClause, which embeds its Node header at offset zero.
+	return (*CaseClause)(unsafe.Pointer(n))
+}
+
+func (n *Node) AsDefaultClause() *DefaultClause {
+	if n.Kind != KindDefaultClause {
+		panic("Invalid node cast to DefaultClause")
+	}
+	// SAFETY: The kind check guarantees n was allocated as a DefaultClause, which embeds its Node header at offset zero.
+	return (*DefaultClause)(unsafe.Pointer(n))
 }
 
 func (n *Node) AsThrowStatement() *ThrowStatement {
