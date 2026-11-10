@@ -27,10 +27,19 @@ const (
 // FlowNode
 
 type FlowNode struct {
-	Flags       FlowFlags
-	Node        *Node     // Associated AST node
-	Antecedent  *FlowNode // Antecedent for all but FlowLabel
-	Antecedents *FlowList // Linked list of antecedents for FlowLabel
+	Flags      FlowFlags
+	Node       *Node     // Associated AST node
+	Antecedent *FlowNode // Antecedent for all but FlowLabel; for FlowLabel, stores *FlowList
+}
+
+func (f *FlowNode) Antecedents() *FlowList {
+	// SAFETY: On FlowLabel nodes, Antecedent stores a *FlowList pointer.
+	return (*FlowList)(unsafe.Pointer(f.Antecedent))
+}
+
+func (f *FlowNode) SetAntecedents(list *FlowList) {
+	// SAFETY: On FlowLabel nodes, Antecedent stores a *FlowList pointer.
+	f.Antecedent = (*FlowNode)(unsafe.Pointer(list))
 }
 
 type FlowList struct {

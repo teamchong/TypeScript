@@ -14,53 +14,149 @@ import (
 const maxPageLinkCount = 0x100_0000 // 16M
 
 type nodeLinkStore[V any] struct {
-	gen   ast.NodeIdGenerator
-	links core.LinkStore[uint64, V]
-	pages core.PagedLinkStore[V]
+	gen      *ast.NodeIdGenerator
+	localGen ast.NodeIdGenerator
+	links    core.LinkStore[uint64, V]
+	pages    core.PagedLinkStore[V]
+}
+
+func (s *nodeLinkStore[V]) getNodeId(node *ast.Node) uint64 {
+	if s.gen != nil {
+		return uint64(s.gen.GetNodeId(node))
+	}
+	return uint64(s.localGen.GetNodeId(node))
 }
 
 func (s *nodeLinkStore[V]) Get(node *ast.Node) *V {
-	id := uint64(s.gen.GetNodeId(node))
-	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
-		return s.pages.Get(id - ast.BlockIdOffset)
+	if off := uint64(ast.PeekNodeId(node)) - ast.BlockIdOffset; off < maxPageLinkCount {
+		if v := s.pages.TryGet(off); v != nil {
+			return v
+		}
+	}
+	return s.getSlow(node)
+}
+
+func (s *nodeLinkStore[V]) getSlow(node *ast.Node) *V {
+	id := s.getNodeId(node)
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.Get(off)
 	}
 	return s.links.Get(id)
 }
 
 func (s *nodeLinkStore[V]) Has(node *ast.Node) bool {
-	return s.TryGet(node) != nil
+	id := uint64(ast.PeekNodeId(node))
+	if id == 0 {
+		return false
+	}
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.Has(off)
+	}
+	return s.links.Has(id)
 }
 
 func (s *nodeLinkStore[V]) TryGet(node *ast.Node) *V {
-	id := uint64(s.gen.GetNodeId(node))
-	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
-		return s.pages.TryGet(id - ast.BlockIdOffset)
+	id := uint64(ast.PeekNodeId(node))
+	if id == 0 {
+		return nil
+	}
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.TryGet(off)
+	}
+	return s.links.TryGet(id)
+}
+
+type directNodeLinkStore[V any] struct {
+	gen      *ast.NodeIdGenerator
+	localGen ast.NodeIdGenerator
+	links    core.LinkStore[uint64, V]
+	pages    core.PagedValueLinkStore[V]
+}
+
+func (s *directNodeLinkStore[V]) getNodeId(node *ast.Node) uint64 {
+	if s.gen != nil {
+		return uint64(s.gen.GetNodeId(node))
+	}
+	return uint64(s.localGen.GetNodeId(node))
+}
+
+func (s *directNodeLinkStore[V]) Get(node *ast.Node) *V {
+	if off := uint64(ast.PeekNodeId(node)) - ast.BlockIdOffset; off < maxPageLinkCount {
+		if v := s.pages.TryGet(off); v != nil {
+			return v
+		}
+	}
+	return s.getSlow(node)
+}
+
+func (s *directNodeLinkStore[V]) getSlow(node *ast.Node) *V {
+	id := s.getNodeId(node)
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.Get(off)
+	}
+	return s.links.Get(id)
+}
+
+func (s *directNodeLinkStore[V]) TryGet(node *ast.Node) *V {
+	id := uint64(ast.PeekNodeId(node))
+	if id == 0 {
+		return nil
+	}
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.TryGet(off)
 	}
 	return s.links.TryGet(id)
 }
 
 type symbolLinkStore[V any] struct {
-	gen   ast.SymbolIdGenerator
-	links core.LinkStore[uint64, V]
-	pages core.PagedLinkStore[V]
+	gen      *ast.SymbolIdGenerator
+	localGen ast.SymbolIdGenerator
+	links    core.LinkStore[uint64, V]
+	pages    core.PagedLinkStore[V]
+}
+
+func (s *symbolLinkStore[V]) getSymbolId(symbol *ast.Symbol) uint64 {
+	if s.gen != nil {
+		return uint64(s.gen.GetSymbolId(symbol))
+	}
+	return uint64(s.localGen.GetSymbolId(symbol))
 }
 
 func (s *symbolLinkStore[V]) Get(symbol *ast.Symbol) *V {
-	id := uint64(s.gen.GetSymbolId(symbol))
-	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
-		return s.pages.Get(id - ast.BlockIdOffset)
+	if off := uint64(ast.PeekSymbolId(symbol)) - ast.BlockIdOffset; off < maxPageLinkCount {
+		if v := s.pages.TryGet(off); v != nil {
+			return v
+		}
+	}
+	return s.getSlow(symbol)
+}
+
+func (s *symbolLinkStore[V]) getSlow(symbol *ast.Symbol) *V {
+	id := s.getSymbolId(symbol)
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.Get(off)
 	}
 	return s.links.Get(id)
 }
 
 func (s *symbolLinkStore[V]) Has(symbol *ast.Symbol) bool {
-	return s.TryGet(symbol) != nil
+	id := uint64(ast.PeekSymbolId(symbol))
+	if id == 0 {
+		return false
+	}
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.Has(off)
+	}
+	return s.links.Has(id)
 }
 
 func (s *symbolLinkStore[V]) TryGet(symbol *ast.Symbol) *V {
-	id := uint64(s.gen.GetSymbolId(symbol))
-	if id >= ast.BlockIdOffset && id < ast.BlockIdOffset+maxPageLinkCount {
-		return s.pages.TryGet(id - ast.BlockIdOffset)
+	id := uint64(ast.PeekSymbolId(symbol))
+	if id == 0 {
+		return nil
+	}
+	if off := id - ast.BlockIdOffset; off < maxPageLinkCount {
+		return s.pages.TryGet(off)
 	}
 	return s.links.TryGet(id)
 }

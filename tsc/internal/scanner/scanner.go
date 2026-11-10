@@ -540,6 +540,12 @@ func (s *Scanner) Scan() ast.Kind {
 		case '\t', '\v', '\f', ' ':
 			s.pos++
 			if s.skipTrivia {
+				text := s.text
+				pos := s.pos
+				for pos < s.end && (text[pos] == ' ' || text[pos] == '\t') {
+					pos++
+				}
+				s.pos = pos
 				continue
 			}
 			for {
@@ -1543,13 +1549,15 @@ func (s *Scanner) scanIdentifier(prefixLength int, variant identifierVariant) bo
 	ch := s.char()
 	// Fast path for simple ASCII identifiers
 	if variant != identifierVariantJSX && (stringutil.IsASCIILetter(ch) || ch == '_' || ch == '$') {
-		s.pos++
-		s.scanASCIIWhile(func(b byte) bool {
-			return isASCIIIdentifierPart[b]
-		})
+		text := s.text
+		pos := s.pos + 1
+		for pos < s.end && isASCIIIdentifierPart[text[pos]] {
+			pos++
+		}
+		s.pos = pos
 		ch = s.char()
 		if ch < utf8.RuneSelf && ch != '\\' {
-			s.tokenValue = s.text[start:s.pos]
+			s.tokenValue = text[start:pos]
 			return true
 		}
 		s.pos = identifierStart

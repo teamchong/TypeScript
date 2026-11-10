@@ -2,6 +2,7 @@ package core
 
 import (
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -95,51 +96,58 @@ func BreadthFirstSearchParallelEx[K comparable, N any](
 		next := make([][]*breadthFirstSearchJob[N], jobs.Size())
 		var wg sync.WaitGroup
 		i := 0
+		runJob := func(i int, j *breadthFirstSearchJob[N]) {
+			if int64(i) >= lowestGoal.Load() {
+				return // Stop processing if we already found a lower result
+			}
+
+			// If we have already visited this node, skip it.
+			if !visited.AddIfAbsent(getKey(j.node)) {
+				// Note that if we are here, we already visited this node at a
+				// previous *level*, which means `visit` must have returned false,
+				// so we don't need to update our result indices. This holds true
+				// because we deduplicated jobs before queuing the level.
+				return
+			}
+
+			isResult, stop := visit(j.node)
+			if isResult {
+				// We found a result, so we will stop at this level, but an
+				// earlier job may still find a true result at a lower index.
+				if stop {
+					updateMin(&lowestGoal, int64(i))
+					return
+				}
+				if fallback == nil {
+					updateMin(&lowestFallback, int64(i))
+				}
+			}
+
+			if int64(i) >= lowestGoal.Load() {
+				// If `visit` is expensive, it's likely that by the time we get here,
+				// a different job has already found a lower index result, so we
+				// don't even need to collect the next jobs.
+				return
+			}
+			// Add the next level jobs
+			neighborNodes := neighbors(j.node)
+			if len(neighborNodes) > 0 {
+				nextJobCount.Add(int64(len(neighborNodes)))
+				next[i] = Map(neighborNodes, func(child N) *breadthFirstSearchJob[N] {
+					return &breadthFirstSearchJob[N]{node: child, parent: j}
+				})
+			}
+		}
 		for j := range jobs.Values() {
-			wg.Add(1)
-			go func(i int, j *breadthFirstSearchJob[N]) {
-				defer wg.Done()
-				if int64(i) >= lowestGoal.Load() {
-					return // Stop processing if we already found a lower result
-				}
-
-				// If we have already visited this node, skip it.
-				if !visited.AddIfAbsent(getKey(j.node)) {
-					// Note that if we are here, we already visited this node at a
-					// previous *level*, which means `visit` must have returned false,
-					// so we don't need to update our result indices. This holds true
-					// because we deduplicated jobs before queuing the level.
-					return
-				}
-
-				isResult, stop := visit(j.node)
-				if isResult {
-					// We found a result, so we will stop at this level, but an
-					// earlier job may still find a true result at a lower index.
-					if stop {
-						updateMin(&lowestGoal, int64(i))
-						return
-					}
-					if fallback == nil {
-						updateMin(&lowestFallback, int64(i))
-					}
-				}
-
-				if int64(i) >= lowestGoal.Load() {
-					// If `visit` is expensive, it's likely that by the time we get here,
-					// a different job has already found a lower index result, so we
-					// don't even need to collect the next jobs.
-					return
-				}
-				// Add the next level jobs
-				neighborNodes := neighbors(j.node)
-				if len(neighborNodes) > 0 {
-					nextJobCount.Add(int64(len(neighborNodes)))
-					next[i] = Map(neighborNodes, func(child N) *breadthFirstSearchJob[N] {
-						return &breadthFirstSearchJob[N]{node: child, parent: j}
-					})
-				}
-			}(i, j)
+			if runtime.GOARCH == "wasm" {
+				runJob(i, j)
+			} else {
+				wg.Add(1)
+				go func(i int, j *breadthFirstSearchJob[N]) {
+					defer wg.Done()
+					runJob(i, j)
+				}(i, j)
+			}
 			i++
 		}
 		wg.Wait()

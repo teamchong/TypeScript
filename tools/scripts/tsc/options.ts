@@ -1701,6 +1701,17 @@ export const options: OptionsModel = {
                 minValue: 1,
             },
         },
+        {
+            name: "maxMemory",
+            type: "*int",
+            internal: true,
+            declaration: {
+                group: "commonOptionsWithBuild",
+                category: diagnostic("Command-line Options"),
+                description: diagnostic("Set the memory limit in MiB for recycling checkers during no-emit type checking."),
+                minValue: 1,
+            },
+        },
     ],
     // Preserve help and config output order independently of compiler fields.
     declarationOrder: {
@@ -1732,6 +1743,7 @@ export const options: OptionsModel = {
             "singleThreaded",
             "pprofDir",
             "checkers",
+            "maxMemory",
             "runExternalCode",
         ],
         optionsForCompiler: [
